@@ -1,0 +1,6 @@
+.env
+node_modules/
+dist/
+.wwebjs_auth
+auth_info_baileys
+upload/

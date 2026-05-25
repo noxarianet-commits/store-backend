@@ -42,7 +42,8 @@ app.use(globalLimiter); // Terapkan pembatasan dasar ke semua endpoint
 const allowedOrigins = [
     'http://localhost:5173',
     'https://noxarianet.vercel.app',
-    'https://noxarianet.com'
+    'https://www.noxarianet.web.id',
+'https://store.jualbelimusang.my.id'
 ];
 if (process.env.FRONTEND_URL) allowedOrigins.push(process.env.FRONTEND_URL);
 

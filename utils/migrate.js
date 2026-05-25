@@ -1,8 +1,8 @@
 const fs = require('fs');
 const path = require('path');
-const supabase = require('./supabase');
+const supabase = require('../supabase');
 
-const DB_FILE = path.join(__dirname, 'db.json');
+const DB_FILE = path.join(__dirname, '..', 'data', 'db.json');
 
 async function migrate() {
     console.log('Starting migration...');

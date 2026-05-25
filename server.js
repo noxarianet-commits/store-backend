@@ -193,9 +193,9 @@ app.get('/api/testimonials', async (req, res) => {
         if (error) throw error;
         
         if (!data || data.length === 0) {
-            // Fallback to db.json if Supabase is empty
+            // Fallback ke data/db.json jika Supabase kosong
             try {
-                const dbPath = path.join(__dirname, 'db.json');
+                const dbPath = path.join(__dirname, 'data', 'db.json');
                 const dbData = JSON.parse(fs.readFileSync(dbPath, 'utf8'));
                 if (dbData.testimonials && dbData.testimonials.length > 0) {
                     return res.json(dbData.testimonials);

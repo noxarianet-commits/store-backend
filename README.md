@@ -23,10 +23,10 @@
 
 ## Skrip Tambahan
 
-- `add_games.js` — menambahkan produk demo/game ke Supabase.
-- `migrate.js` — migrasi data dari `db.json` ke Supabase.
-- `check_db.js` — helper sederhana untuk memeriksa koneksi Supabase.
-- `test_cors.js` / `test_post.js` — skrip tes lokal untuk endpoint order.
+- `utils/add_games.js` — menambahkan produk demo/game ke Supabase.
+- `utils/migrate.js` — migrasi data dari `data/db.json` ke Supabase.
+- `utils/check_db.js` — helper sederhana untuk memeriksa koneksi Supabase.
+- `utils/test_cors.js` / `utils/test_post.js` — skrip tes lokal untuk endpoint order.
 
 ## Catatan
 

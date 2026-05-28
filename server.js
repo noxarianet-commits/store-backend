@@ -6,7 +6,12 @@ const path = require('path');
 const supabase = require('./supabase');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
+const cron = require('node-cron');
 require('dotenv').config();
+
+// Sekalipay integration
+const sekalipayRoutes = require('./routes/sekalipayRoutes');
+const syncService = require('./services/syncService');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -40,10 +45,10 @@ app.use(globalLimiter); // Terapkan pembatasan dasar ke semua endpoint
 
 // Setup CORS yang lebih ketat
 const allowedOrigins = [
-    'http://localhost:5173',
+    'http://localhost:5173/',
     'https://noxarianet.vercel.app',
     'https://www.noxarianet.web.id',
-'https://store.jualbelimusang.my.id'
+    'https://store.jualbelimusang.my.id'
 ];
 if (process.env.FRONTEND_URL) allowedOrigins.push(process.env.FRONTEND_URL);
 
@@ -101,6 +106,44 @@ if (process.env.NODE_ENV !== 'production') {
 const upload = multer({ storage: multer.memoryStorage() });
 
 // ══════════════════════════════════════════════════════════════════════════
+// SEKALIPAY ROUTES
+// ══════════════════════════════════════════════════════════════════════════
+
+// Public Sekalipay routes (no auth needed)
+app.use('/api/sekalipay', sekalipayRoutes);
+
+// Admin Sekalipay routes (auth required) — mounted on same router with /admin prefix
+app.use('/api/admin/sekalipay', verifyAdmin, sekalipayRoutes);
+
+// ══════════════════════════════════════════════════════════════════════════
+// SEKALIPAY CRON JOBS — Stock & Product Sync
+// ══════════════════════════════════════════════════════════════════════════
+
+// Delta sync every 3 hours (updates only changed items)
+cron.schedule('0 */3 * * *', async () => {
+    console.log('[CRON] Starting Sekalipay delta sync...');
+    try {
+        const result = await syncService.deltaSync();
+        console.log(`[CRON] Delta sync completed: ${result.productCount || 0} products updated.`);
+    } catch (err) {
+        console.error('[CRON] Delta sync failed:', err.message);
+    }
+});
+
+// Full sync daily at 3 AM (refreshes all products)
+cron.schedule('0 3 * * *', async () => {
+    console.log('[CRON] Starting Sekalipay full sync...');
+    try {
+        const result = await syncService.fullSync();
+        console.log(`[CRON] Full sync completed: ${result.productCount || 0} products synced.`);
+    } catch (err) {
+        console.error('[CRON] Full sync failed:', err.message);
+    }
+});
+
+console.log('[CRON] Sekalipay sync scheduled: delta every 3h, full daily at 03:00');
+
+// ══════════════════════════════════════════════════════════════════════════
 // API ROUTES
 // ══════════════════════════════════════════════════════════════════════════
 
@@ -153,6 +196,64 @@ app.delete('/api/products/:id', verifyAdmin, async (req, res) => {
         const { id } = req.params;
         const { error } = await supabase
             .from('products')
+            .delete()
+            .eq('id', id);
+        if (error) throw error;
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// GET Services
+app.get('/api/services', async (req, res) => {
+    try {
+        const { data, error } = await supabase
+            .from('services')
+            .select('*')
+            .order('created_at', { ascending: true });
+
+        if (error) throw error;
+        res.json(data);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// POST Service (Protected)
+app.post('/api/services', verifyAdmin, async (req, res) => {
+    try {
+        const { data, error } = await supabase
+            .from('services')
+            .insert([req.body]);
+        if (error) throw error;
+        res.json(data);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// UPDATE Service (Protected)
+app.put('/api/services/:id', verifyAdmin, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { error } = await supabase
+            .from('services')
+            .update(req.body)
+            .eq('id', id);
+        if (error) throw error;
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// DELETE Service (Protected)
+app.delete('/api/services/:id', verifyAdmin, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const { error } = await supabase
+            .from('services')
             .delete()
             .eq('id', id);
         if (error) throw error;

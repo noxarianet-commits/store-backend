@@ -7,7 +7,15 @@ const supabase = require('./supabase');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const cron = require('node-cron');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
 require('dotenv').config();
+
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) {
+    console.error('FATAL: JWT_SECRET tidak ditemukan di environment variables!');
+    process.exit(1);
+}
 
 // Sekalipay integration
 const sekalipayRoutes = require('./routes/sekalipayRoutes');
@@ -37,21 +45,16 @@ const orderLimiter = rateLimit({
     message: { error: 'Terlalu banyak pesanan dibuat. Harap tunggu 1 jam sebelum memesan lagi.' },
 });
 
-// Middleware
-app.use(helmet({
-    contentSecurityPolicy: false,
-}));
-app.use(globalLimiter); // Terapkan pembatasan dasar ke semua endpoint
-
 // Setup CORS yang lebih ketat
 const allowedOrigins = [
-    'http://localhost:5173/',
+    'http://localhost:5173',
     'https://noxarianet.vercel.app',
     'https://www.noxarianet.web.id',
     'https://store.jualbelimusang.my.id'
 ];
 if (process.env.FRONTEND_URL) allowedOrigins.push(process.env.FRONTEND_URL);
 
+// PENTING: cors HARUS dipanggil sebelum rate limiter agar response rate limit memiliki header CORS
 app.use(cors({
     origin: function (origin, callback) {
         if (!origin || allowedOrigins.includes(origin) || origin.includes('vercel.app') || origin.startsWith('http://localhost:')) {
@@ -63,32 +66,35 @@ app.use(cors({
     methods: ['GET', 'POST', 'PUT', 'DELETE'],
     allowedHeaders: ['Content-Type', 'Authorization', 'x-admin-token']
 }));
+
+// Setup Trust Proxy agar rate limiter mengambil IP pengguna dengan benar di belakang Cloudflare/Vercel
+app.set('trust proxy', 1);
+
+// Middleware
+app.use(helmet({
+    contentSecurityPolicy: false,
+}));
+app.use(globalLimiter); // Terapkan pembatasan dasar ke semua endpoint
 app.use(express.json());
 
 // Security Middleware for Admin Routes
-const verifyAdmin = async (req, res, next) => {
+// Memverifikasi JWT Bearer token yang diterbitkan saat login
+const verifyAdmin = (req, res, next) => {
     try {
-        const token = req.headers['x-admin-token'];
-        if (!token) return res.status(401).json({ error: 'Akses ditolak. Token tidak ditemukan.' });
+        const authHeader = req.headers['authorization'] || req.headers['x-admin-token'];
+        if (!authHeader) return res.status(401).json({ error: 'Akses ditolak. Token tidak ditemukan.' });
 
-        const { data, error } = await supabase
-            .from('settings')
-            .select('value')
-            .eq('key', 'admin_auth')
-            .maybeSingle();
+        // Support kedua format: "Bearer <token>" atau raw token (backward compat)
+        const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : authHeader;
 
-        const auth = data ? data.value : { username: 'ANDIKA K.A', password: 'ANDIKAGANTENG.' };
-        
-        // Simple token: base64 of username:password
-        const expectedToken = Buffer.from(`${auth.username}:${auth.password}`).toString('base64');
-        
-        if (token === expectedToken) {
-            next();
-        } else {
-            res.status(403).json({ error: 'Token tidak valid atau kadaluarsa.' });
-        }
+        const decoded = jwt.verify(token, JWT_SECRET);
+        req.admin = { id: decoded.id, username: decoded.username };
+        next();
     } catch (err) {
-        res.status(500).json({ error: 'Gagal memverifikasi admin.' });
+        if (err.name === 'TokenExpiredError') {
+            return res.status(401).json({ error: 'Sesi telah berakhir. Silakan login kembali.' });
+        }
+        res.status(403).json({ error: 'Token tidak valid.' });
     }
 };
 
@@ -263,7 +269,7 @@ app.delete('/api/services/:id', verifyAdmin, async (req, res) => {
     }
 });
 
-// GET Settings
+// GET Settings (Public — hanya data non-sensitif)
 app.get('/api/settings', async (req, res) => {
     try {
         const { data, error } = await supabase
@@ -273,10 +279,15 @@ app.get('/api/settings', async (req, res) => {
 
         const settingsMap = {
             shop_status: { isOpen: true, message: 'Selamat datang!' },
-            banners: [],
-            admin_auth: { username: 'ANDIKA K.A', password: 'ANDIKAGANTENG.' } // Default jika belum ada di DB
+            banners: []
+            // CATATAN: admin_auth TIDAK lagi ada di settings — sudah dipindah ke tabel admins
         };
-        data.forEach(s => settingsMap[s.key] = s.value);
+        data.forEach(s => {
+            // Pastikan kunci sensitif tidak pernah ter-expose ke publik
+            if (s.key !== 'admin_auth') {
+                settingsMap[s.key] = s.value;
+            }
+        });
         res.json(settingsMap);
     } catch (err) {
         console.error('GET Settings Error:', err);
@@ -313,34 +324,98 @@ app.get('/api/testimonials', async (req, res) => {
     }
 });
 
-// ADMIN LOGIN (Secure)
+// ADMIN LOGIN — Menggunakan bcrypt + JWT
 app.post('/api/admin/login', loginLimiter, async (req, res) => {
     try {
         const { username, password } = req.body;
-        console.log('Login attempt for username:', username);
 
-        const { data, error } = await supabase
-            .from('settings')
-            .select('value')
-            .eq('key', 'admin_auth')
-            .maybeSingle(); // Pakai maybeSingle agar tidak error kalau kosong
-
-        // Gunakan data dari DB jika ada, kalau tidak pakai default ini
-        const auth = data ? data.value : {
-            username: 'ANDIKA K.A',
-            password: 'ANDIKAGANTENG.'
-        };
-
-        if (username === auth.username && password === auth.password) {
-            console.log('Login SUCCESS for:', username);
-            const token = Buffer.from(`${username}:${password}`).toString('base64');
-            res.json({ success: true, token });
-        } else {
-            console.log('Login FAILED for:', username);
-            res.status(401).json({ success: false, error: 'Username atau Password salah!' });
+        if (!username || !password) {
+            return res.status(400).json({ success: false, error: 'Username dan password wajib diisi.' });
         }
+
+        // 1. Ambil admin dari tabel dedicated (bukan settings)
+        const { data: admin, error } = await supabase
+            .from('admins')
+            .select('id, username, password, is_active')
+            .eq('username', username)
+            .maybeSingle();
+
+        if (error) {
+            console.error('Login DB Error:', error);
+            return res.status(500).json({ success: false, error: 'Terjadi kesalahan server.' });
+        }
+
+        // 2. Jika admin tidak ditemukan, kembalikan pesan generik
+        //    (hindari memberitahu bahwa username tidak ada)
+        if (!admin || !admin.is_active) {
+            return res.status(401).json({ success: false, error: 'Username atau password salah.' });
+        }
+
+        // 3. Verifikasi password menggunakan bcrypt (konstan time)
+        const isPasswordValid = await bcrypt.compare(password, admin.password);
+        if (!isPasswordValid) {
+            return res.status(401).json({ success: false, error: 'Username atau password salah.' });
+        }
+
+        // 4. Buat JWT token — password TIDAK dimasukkan ke dalam payload
+        const token = jwt.sign(
+            { id: admin.id, username: admin.username },
+            JWT_SECRET,
+            { expiresIn: '8h' }
+        );
+
+        console.log(`[AUTH] Login sukses untuk: ${admin.username}`);
+        res.json({ success: true, token });
     } catch (err) {
         console.error('Login Error:', err);
+        res.status(500).json({ success: false, error: 'Terjadi kesalahan server.' });
+    }
+});
+
+// ADMIN CHANGE PASSWORD (Protected)
+app.put('/api/admin/password', verifyAdmin, async (req, res) => {
+    try {
+        const { current_password, new_password } = req.body;
+        const adminId = req.admin.id;
+
+        if (!current_password || !new_password) {
+            return res.status(400).json({ error: 'current_password dan new_password wajib diisi.' });
+        }
+
+        if (new_password.length < 8) {
+            return res.status(400).json({ error: 'Password baru minimal 8 karakter.' });
+        }
+
+        // Ambil hash password saat ini
+        const { data: admin, error } = await supabase
+            .from('admins')
+            .select('password')
+            .eq('id', adminId)
+            .single();
+
+        if (error || !admin) {
+            return res.status(404).json({ error: 'Admin tidak ditemukan.' });
+        }
+
+        // Verifikasi password lama
+        const isValid = await bcrypt.compare(current_password, admin.password);
+        if (!isValid) {
+            return res.status(401).json({ error: 'Password saat ini tidak cocok.' });
+        }
+
+        // Hash password baru & simpan
+        const newHash = await bcrypt.hash(new_password, 12);
+        const { error: updateError } = await supabase
+            .from('admins')
+            .update({ password: newHash })
+            .eq('id', adminId);
+
+        if (updateError) throw updateError;
+
+        console.log(`[AUTH] Password berhasil diubah untuk admin id: ${adminId}`);
+        res.json({ success: true, message: 'Password berhasil diubah.' });
+    } catch (err) {
+        console.error('Change Password Error:', err);
         res.status(500).json({ error: err.message });
     }
 });

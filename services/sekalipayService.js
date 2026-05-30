@@ -16,6 +16,7 @@ class SekalipayService {
             headers: {
                 'Accept': 'application/json',
                 'X-APIKEY': this.apiKey,
+                'User-Agent': 'PostmanRuntime/7.32.3',
             },
             timeout: 30000,
         });

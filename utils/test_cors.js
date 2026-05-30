@@ -1,6 +1,5 @@
 const axios = require('axios');
 const FormData = require('form-data');
-const fs = require('fs');
 
 const form = new FormData();
 form.append('id', `NX-TEST${Date.now()}`);

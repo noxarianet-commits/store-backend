@@ -42,7 +42,6 @@ router.get('/items', async (req, res) => {
         const publicProducts = (data || []).map(p => ({
             ...p,
             variants: (p.variants || [])
-                .filter(v => p.sekalipay_product_id ? v.stock > 0 : true) // Only filter stock for Sekalipay products
                 .map(v => ({
                     id: v.id,
                     sku: v.sku,

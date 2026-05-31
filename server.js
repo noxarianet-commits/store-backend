@@ -1,13 +1,11 @@
 const express = require('express');
 const cors = require('cors');
-const multer = require('multer');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const cron = require('node-cron');
 require('dotenv').config();
 
 const syncService = require('./services/syncService');
-const orderController = require('./controllers/orderController');
 
 // Routes
 const sekalipayRoutes = require('./routes/sekalipayRoutes');
@@ -19,6 +17,8 @@ const settingsRoutes = require('./routes/settingsRoutes');
 const adminRoutes = require('./routes/adminRoutes');
 const bannerRoutes = require('./routes/bannerRoutes');
 const testimonialRoutes = require('./routes/testimonialRoutes');
+const paymentRoutes = require('./routes/paymentRoutes');
+const webhookRoutes = require('./routes/webhookRoutes');
 
 const verifyAdmin = require('./middleware/verifyAdmin');
 
@@ -32,14 +32,9 @@ const PORT = process.env.PORT || 3000;
 
 // Rate Limiters
 const globalLimiter = rateLimit({
-    windowMs: 15 * 60 * 1000, max: 100,
+    windowMs: 10 * 60 * 1000, max: 300,
     message: { error: 'Terlalu banyak request, silakan coba lagi nanti.' },
     standardHeaders: true, legacyHeaders: false,
-});
-
-const orderLimiter = rateLimit({
-    windowMs: 60 * 60 * 1000, max: 50,
-    message: { error: 'Terlalu banyak pesanan dibuat. Harap tunggu 1 jam sebelum memesan lagi.' },
 });
 
 // CORS
@@ -47,7 +42,7 @@ const allowedOrigins = [
     'http://localhost:5173',
     'https://noxarianet.vercel.app',
     'https://www.noxarianet.web.id',
-    'https://store.jualbelimusang.my.id'
+    'https://sekalipay.com/'
 ];
 if (process.env.FRONTEND_URL) allowedOrigins.push(process.env.FRONTEND_URL);
 
@@ -59,13 +54,22 @@ app.use(cors({
             callback(new Error('Akses ditolak oleh CORS'));
         }
     },
-    methods: ['GET', 'POST', 'PUT', 'DELETE'],
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization', 'x-admin-token']
 }));
 
 // Middleware
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(globalLimiter);
+
+// ══════════════════════════════════════════════════════════════════════════
+// WEBHOOK ROUTES — Harus di-mount SEBELUM express.json()
+// agar raw body bisa dibaca untuk verifikasi signature
+// ══════════════════════════════════════════════════════════════════════════
+
+app.use('/api/webhooks', webhookRoutes);
+
+// Global JSON body parser (hanya untuk non-webhook routes)
 app.use(express.json());
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -77,10 +81,7 @@ app.use('/api/products', productRoutes);
 app.use('/api/services', serviceRoutes);
 app.use('/api/settings', settingsRoutes);
 app.use('/api/testimonials', testimonialRoutes);
-
-// Public order creation (with file upload and rate limiter)
-const upload = multer({ storage: multer.memoryStorage() });
-app.post('/api/order', orderLimiter, upload.single('proof_image'), orderController.create);
+app.use('/api/payments', paymentRoutes);
 
 // ══════════════════════════════════════════════════════════════════════════
 // ROUTES — Protected (Admin)

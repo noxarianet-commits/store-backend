@@ -1,38 +1,41 @@
-/* eslint-disable no-unused-vars */
 const axios = require('axios');
 const crypto = require('crypto');
 
 /**
- * PaymentGatewayService — Stub for Sekalipay Payment Gateway API.
- * 
+ * PaymentGatewayService — Client untuk Sekalipay Payment Gateway API.
+ *
  * Base URL: https://sekalipay.com/api/v1/gateway
- * Auth: X-API-Key header + X-Signature (HMAC-SHA256 of request body)
- * 
- * TODO: Implement when ready to accept customer payments.
- * See Payment_Gateway_MCH-B8ISMW.json for full endpoint details.
+ * Auth: X-API-Key header + X-Signature (HMAC-SHA256 dari raw JSON body) untuk POST
  */
 class PaymentGatewayService {
     constructor() {
-        this.baseURL = process.env.SEKALIPAY_GATEWAY_BASE_URL || 'https://sekalipay.com/api/v1/gateway';
-        this.apiKey = process.env.SEKALIPAY_GATEWAY_API_KEY || '';
-        this.secretKey = process.env.SEKALIPAY_GATEWAY_SECRET_KEY || '';
-        this.merchantCode = process.env.SEKALIPAY_MERCHANT_CODE || 'MCH-B8ISMW';
+        this.baseURL =
+            process.env.SEKALIPAY_GATEWAY_BASE_URL ||
+            'https://sekalipay.com/api/v1/gateway';
+        this.apiKey = (process.env.SEKALIPAY_GATEWAY_API_KEY || '').trim();
+        this.secretKey = (process.env.SEKALIPAY_GATEWAY_SECRET_KEY || '').trim();
+        this.merchantCode =
+            process.env.SEKALIPAY_MERCHANT_CODE || 'MCH-B8ISMW';
 
         this.client = axios.create({
             baseURL: this.baseURL,
             headers: {
-                'Accept': 'application/json',
+                Accept: 'application/json',
                 'X-API-Key': this.apiKey,
             },
             timeout: 30000,
         });
     }
 
+    // ══════════════════════════════════════════════════════════════
+    // SIGNATURE
+    // ══════════════════════════════════════════════════════════════
+
     /**
-     * Generate HMAC-SHA256 signature from request body JSON string.
-     * Required for POST endpoints (Create Payment, Withdrawal).
-     * 
-     * @param {string} bodyString - Raw JSON string of request body
+     * Generate HMAC-SHA256 signature dari raw JSON string body.
+     * Wajib untuk semua POST request.
+     *
+     * @param {string} bodyString - Raw JSON string
      * @returns {string} HMAC-SHA256 hex digest
      */
     generateSignature(bodyString) {
@@ -43,86 +46,175 @@ class PaymentGatewayService {
     }
 
     /**
-     * Get merchant account info (balance, status, etc.).
-     * Auth: X-API-Key only (no signature needed).
-     * 
-     * @returns {Promise<object>}
+     * Verifikasi HMAC-SHA256 signature dari webhook callback PG.
+     * Digunakan di webhookController untuk memastikan request sah.
+     *
+     * @param {string|Buffer} rawBody - Raw body string dari request
+     * @param {string} receivedSignature - Nilai header X-Signature
+     * @returns {boolean}
+     */
+    verifyWebhookSignature(rawBody, receivedSignature) {
+        if (!receivedSignature) {
+            console.error('[PaymentGatewayService] No X-Signature header received');
+            return false;
+        }
+        const bodyString =
+            typeof rawBody === 'string' ? rawBody : rawBody.toString('utf8');
+        
+        const expected = this.generateSignature(bodyString);
+        const bufA = Buffer.from(expected, 'utf8');
+        const bufB = Buffer.from(receivedSignature, 'utf8');
+        
+        if (bufA.length !== bufB.length) {
+            console.error(`[PaymentGatewayService] Signature length mismatch. Expected: ${expected} | Received: ${receivedSignature}`);
+            return false;
+        }
+        const isValid = crypto.timingSafeEqual(bufA, bufB);
+        if (!isValid) {
+            console.error(`[PaymentGatewayService] Signature mismatch!`);
+            console.error(`  Expected (with SecretKey): ${expected}`);
+            console.error(`  Received:                  ${receivedSignature}`);
+            
+            // Try with alternative keys for debugging
+            const sigApiKey = crypto.createHmac('sha256', this.apiKey).update(bodyString).digest('hex');
+            const webhookSecret = (process.env.SEKALIPAY_WEBHOOK_SECRET || '').trim();
+            const sigWebhookSecret = webhookSecret ? crypto.createHmac('sha256', webhookSecret).update(bodyString).digest('hex') : 'N/A';
+            
+            console.error(`  With API Key:              ${sigApiKey}`);
+            console.error(`  With Webhook Secret:       ${sigWebhookSecret}`);
+            
+            console.error(`  Raw body length: ${bodyString.length}`);
+            console.error(`  Raw body sample: ${bodyString.substring(0, 100)}...${bodyString.substring(bodyString.length - 20)}`);
+        }
+        return isValid;
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // ERROR HANDLER
+    // ══════════════════════════════════════════════════════════════
+
+    _handleError(error, context) {
+        if (error.response) {
+            const { status, data } = error.response;
+            console.error(
+                `[PaymentGatewayService] ${context} — HTTP ${status}:`,
+                data
+            );
+            return {
+                success: false,
+                status,
+                message: data?.message || 'UNKNOWN_ERROR',
+                errors: data?.errors || null,
+            };
+        }
+        console.error(
+            `[PaymentGatewayService] ${context} — Network error:`,
+            error.message
+        );
+        return {
+            success: false,
+            status: 0,
+            message: 'NETWORK_ERROR',
+            errors: { network: [error.message] },
+        };
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // MERCHANT INFO
+    // ══════════════════════════════════════════════════════════════
+
+    /**
+     * GET /merchant/info
+     * Ambil info merchant (saldo, status, sandbox mode).
+     *
+     * @returns {{ success: boolean, data?: object }}
      */
     async getMerchantInfo() {
-        // TODO: Implement
-        // GET /merchant/info
-        throw new Error('PaymentGatewayService.getMerchantInfo() not yet implemented');
+        try {
+            const res = await this.client.get('/merchant/info');
+            return { success: true, data: res.data.data };
+        } catch (error) {
+            return this._handleError(error, 'getMerchantInfo');
+        }
     }
 
+    // ══════════════════════════════════════════════════════════════
+    // PAYMENT METHODS
+    // ══════════════════════════════════════════════════════════════
+
     /**
-     * Get available payment methods (QRIS, VA, etc.).
-     * No signature required.
-     * 
-     * @returns {Promise<object>}
+     * GET /payment-methods
+     * Ambil daftar metode pembayaran aktif (QRIS, VA, dll).
+     * Tidak butuh signature.
+     *
+     * @returns {{ success: boolean, data?: Array }}
      */
     async getPaymentMethods() {
-        // TODO: Implement
-        // GET /payment-methods
-        throw new Error('PaymentGatewayService.getPaymentMethods() not yet implemented');
+        try {
+            const res = await this.client.get('/payment-methods');
+            return { success: true, data: res.data.data };
+        } catch (error) {
+            return this._handleError(error, 'getPaymentMethods');
+        }
     }
 
+    // ══════════════════════════════════════════════════════════════
+    // CREATE PAYMENT
+    // ══════════════════════════════════════════════════════════════
+
     /**
-     * Create a new payment.
-     * Requires X-Signature header (HMAC-SHA256 of body).
-     * 
+     * POST /payment
+     * Buat transaksi pembayaran baru.
+     * Otomatis menambahkan X-Signature HMAC-SHA256 dari body.
+     *
      * @param {object} paymentData
-     * @param {string} paymentData.merchant_ref_id - Unique reference ID
-     * @param {number} paymentData.amount - Amount in IDR
-     * @param {string} paymentData.payment_code - e.g. "QRIS", "BCAVA"
+     * @param {string} paymentData.merchant_ref_id - ID unik dari sistem kita (= order.id)
+     * @param {number} paymentData.amount          - Harga produk (tanpa fee)
+     * @param {string} paymentData.payment_code    - Kode metode bayar (QRIS, BCAVA, dll)
      * @param {string} paymentData.customer_name
      * @param {string} paymentData.customer_email
      * @param {string} paymentData.customer_phone
-     * @param {string} paymentData.callback_url - Webhook URL for payment status
-     * @param {string} paymentData.return_url - Redirect URL after payment
-     * @param {object} [paymentData.metadata] - Optional metadata
-     * @returns {Promise<object>}
+     * @param {string} paymentData.callback_url   - URL webhook backend
+     * @param {string} paymentData.return_url      - Redirect setelah bayar
+     * @param {object} [paymentData.metadata]      - Data tambahan (opsional)
+     * @returns {{ success: boolean, data?: object }}
      */
     async createPayment(paymentData) {
-        // TODO: Implement
-        // POST /payment
-        // Headers: Content-Type: application/json, X-Signature: <hmac>
-        //
-        // const bodyString = JSON.stringify(paymentData);
-        // const signature = this.generateSignature(bodyString);
-        // const res = await this.client.post('/payment', bodyString, {
-        //     headers: {
-        //         'Content-Type': 'application/json',
-        //         'X-Signature': signature,
-        //     },
-        // });
-        // return res.data;
-        throw new Error('PaymentGatewayService.createPayment() not yet implemented');
+        try {
+            const bodyString = JSON.stringify(paymentData);
+            const signature = this.generateSignature(bodyString);
+
+            const res = await this.client.post('/payment', bodyString, {
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-Signature': signature,
+                },
+            });
+
+            return { success: true, data: res.data.data };
+        } catch (error) {
+            return this._handleError(error, 'createPayment');
+        }
     }
 
+    // ══════════════════════════════════════════════════════════════
+    // CHECK PAYMENT STATUS
+    // ══════════════════════════════════════════════════════════════
+
     /**
-     * Check payment status by merchant_ref_id.
-     * No signature required.
-     * 
-     * @param {string} merchantRefId
-     * @returns {Promise<object>}
+     * GET /payment/{merchant_ref_id}
+     * Cek status pembayaran. Berguna saat webhook belum diterima.
+     *
+     * @param {string} merchantRefId - merchant_ref_id yang dipakai saat createPayment
+     * @returns {{ success: boolean, data?: object }}
      */
     async checkPaymentStatus(merchantRefId) {
-        // TODO: Implement
-        // GET /payment/{merchant_ref_id}
-        throw new Error('PaymentGatewayService.checkPaymentStatus() not yet implemented');
-    }
-
-    /**
-     * Request a withdrawal.
-     * Requires X-Signature header.
-     * 
-     * @param {number} amount - Withdrawal amount in IDR
-     * @returns {Promise<object>}
-     */
-    async requestWithdrawal(amount) {
-        // TODO: Implement
-        // POST /withdrawal
-        throw new Error('PaymentGatewayService.requestWithdrawal() not yet implemented');
+        try {
+            const res = await this.client.get(`/payment/${merchantRefId}`);
+            return { success: true, data: res.data.data };
+        } catch (error) {
+            return this._handleError(error, `checkPaymentStatus(${merchantRefId})`);
+        }
     }
 }
 

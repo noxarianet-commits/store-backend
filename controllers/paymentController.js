@@ -1,5 +1,6 @@
 const supabase = require('../supabase');
 const paymentGatewayService = require('../services/paymentGatewayService');
+const paymentPollingService = require('../services/paymentPollingService');
 
 // ══════════════════════════════════════════════════════════════════════════
 // HELPER
@@ -12,39 +13,20 @@ function generateOrderId() {
 }
 
 // ══════════════════════════════════════════════════════════════════════════
-// GET /api/payments/methods
-// Ambil daftar metode pembayaran aktif dari Sekalipay PG.
-// ══════════════════════════════════════════════════════════════════════════
-
-async function getPaymentMethods(req, res) {
-    try {
-        const result = await paymentGatewayService.getPaymentMethods();
-        if (!result.success) {
-            return res
-                .status(result.status || 500)
-                .json({ error: result.message });
-        }
-        return res.json({ data: result.data });
-    } catch (err) {
-        console.error('[paymentController] getPaymentMethods error:', err.message);
-        return res.status(500).json({ error: err.message });
-    }
-}
-
-// ══════════════════════════════════════════════════════════════════════════
 // POST /api/payments/create
-// Buat order baru + payment di PG.
+// Buat order baru + invoice QRIS di FinCloud.
 //
 // Body:
 //   product_id       (string)  — ID produk di DB kita
-//   variant_id       (integer) — ID variant Sekalipay
+//   variant_id       (integer) — ID variant Sekalipay Reseller
 //   variant_name     (string)
 //   product_name     (string)
 //   amount           (integer) — Harga jual (sell_price)
-//   payment_code     (string)  — Kode metode bayar (QRIS, BCAVA, dll)
 //   customer_name    (string)
 //   wa_number        (string)
 //   email            (string)
+//
+// Note: payment_code tidak diperlukan lagi (selalu QRIS via FinCloud).
 // ══════════════════════════════════════════════════════════════════════════
 
 async function createPayment(req, res) {
@@ -55,62 +37,45 @@ async function createPayment(req, res) {
             variant_name,
             product_name,
             amount,
-            payment_code,
             customer_name,
             wa_number,
             email,
         } = req.body;
 
         // ── Validasi input ──────────────────────────────────────
-        if (!variant_id || !amount || !payment_code || !wa_number || !email) {
+        if (!variant_id || !amount || !wa_number || !email) {
             return res.status(400).json({
-                error: 'variant_id, amount, payment_code, wa_number, dan email wajib diisi',
+                error: 'variant_id, amount, wa_number, dan email wajib diisi',
             });
         }
         if (typeof amount !== 'number' || amount <= 0) {
             return res.status(400).json({ error: 'amount harus berupa angka positif' });
         }
+        if (amount < 1000) {
+            return res.status(400).json({ error: 'Minimal pembayaran Rp 1.000' });
+        }
 
         // ── Generate order ID ───────────────────────────────────
         const orderId = generateOrderId();
 
-        // ── Build callback & return URL ─────────────────────────
-        const backendUrl = (
-            process.env.BACKEND_URL ||
-            `http://localhost:${process.env.PORT || 3000}`
-        ).replace(/\/+$/, '');
-        const frontendUrl = (
-            process.env.FRONTEND_URL || 'http://localhost:5173'
-        ).replace(/\/+$/, '');
-
-        const callbackUrl = `${backendUrl}/api/webhooks/payment-gateway`;
-        const returnUrl = `${frontendUrl}/checkout/success?order_id=${orderId}`;
-
-        // ── Buat payment di PG ──────────────────────────────────
-        const pgResult = await paymentGatewayService.createPayment({
-            merchant_ref_id: orderId,
-            amount,
-            payment_code,
-            customer_name: customer_name || wa_number,
-            customer_email: email,
-            customer_phone: wa_number,
-            callback_url: callbackUrl,
-            return_url: returnUrl,
-            metadata: {
-                source: 'noxarianet_store',
-                product_id: product_id || null,
-                variant_id,
-            },
+        // ── Buat invoice QRIS di FinCloud ───────────────────────
+        const pgResult = await paymentGatewayService.createInvoice({
+            reffId: orderId,
+            nominal: amount,
         });
 
         if (!pgResult.success) {
-            console.error('[paymentController] PG createPayment failed:', pgResult);
+            console.error('[paymentController] FinCloud createInvoice failed:', pgResult);
             return res.status(pgResult.status || 502).json({
                 error: `Gagal membuat pembayaran: ${pgResult.message}`,
             });
         }
 
         const pgData = pgResult.data;
+
+        // ── Map response FinCloud → kolom Supabase ──────────────
+        const pgFee = (pgData.nominal_total || amount) - (pgData.nominal_asli || amount);
+        const pgTotal = pgData.nominal_total || amount;
 
         // ── Simpan order ke Supabase ────────────────────────────
         const { error: dbError } = await supabase.from('orders').insert([
@@ -122,21 +87,21 @@ async function createPayment(req, res) {
                 wa_number,
                 email,
                 customer_name: customer_name || wa_number,
-                payment_method: payment_code,
+                payment_method: 'QRIS',
                 status: 'PENDING',
 
-                // Data PG
-                pg_invoice: pgData.invoice || null,
-                pg_payment_link: pgData.payment_link || null,
-                pg_qr_link: pgData.qr_link || null,
-                pg_virtual_account: pgData.virtual_account || null,
-                pg_payment_code: payment_code,
-                pg_fee: pgData.fee || 0,
-                pg_total: pgData.total || amount,
-                pg_expired_at: pgData.expired_at || null,
+                // Data PG (FinCloud)
+                pg_invoice: String(pgData.id_depo || ''),
+                pg_payment_link: pgData.invoice_url || null,
+                pg_qr_link: pgData.qr_url || null,
+                pg_virtual_account: null,
+                pg_payment_code: 'QRIS',
+                pg_fee: pgFee,
+                pg_total: pgTotal,
+                pg_expired_at: null, // FinCloud tidak return expired_at
 
-                // Sekalipay Reseller
-                sekalipay_ref_id: orderId, // ref_id = order id
+                // Sekalipay Reseller (untuk auto-order setelah bayar)
+                sekalipay_ref_id: orderId,
                 sekalipay_variant_id: variant_id,
 
                 timestamp: new Date().toISOString(),
@@ -150,22 +115,23 @@ async function createPayment(req, res) {
                 .json({ error: `Gagal menyimpan order: ${dbError.message}` });
         }
 
-        console.log(`[paymentController] Order ${orderId} created, PG invoice: ${pgData.invoice}`);
+        console.log(`[paymentController] Order ${orderId} created, FinCloud id_depo: ${pgData.id_depo}`);
 
         // ── Response ke frontend ────────────────────────────────
+        // Mapping field names agar frontend tetap kompatibel
         return res.status(201).json({
             success: true,
             data: {
                 order_id: orderId,
-                invoice: pgData.invoice,
+                invoice: String(pgData.id_depo || ''),
                 amount,
-                fee: pgData.fee || 0,
-                total: pgData.total || amount,
-                payment_code,
-                payment_link: pgData.payment_link || null,
-                qr_link: pgData.qr_link || null,
-                virtual_account: pgData.virtual_account || null,
-                expired_at: pgData.expired_at || null,
+                fee: pgFee,
+                total: pgTotal,
+                payment_code: 'QRIS',
+                payment_link: pgData.invoice_url || null,
+                qr_link: pgData.qr_url || null,
+                virtual_account: null,
+                expired_at: null,
                 status: 'PENDING',
             },
         });
@@ -187,7 +153,7 @@ async function getPaymentStatus(req, res) {
         const { data, error } = await supabase
             .from('orders')
             .select(
-                'id, status, pg_invoice, pg_paid_at, pg_qr_link, pg_virtual_account, account_details, error_message, pg_expired_at'
+                'id, status, pg_invoice, pg_paid_at, pg_qr_link, pg_virtual_account, account_details, error_message, pg_expired_at, sekalipay_variant_id'
             )
             .eq('id', orderId)
             .single();
@@ -196,6 +162,27 @@ async function getPaymentStatus(req, res) {
             return res.status(404).json({ error: 'Order tidak ditemukan' });
         }
 
+        // TRIGGER POLLING ON DEMAND JIKA MASIH PENDING
+        if (data.status === 'PENDING' && data.pg_invoice) {
+            console.log(`[paymentController] User requested status for ${orderId}, triggering manual poll...`);
+            await paymentPollingService.processOrder(data);
+            
+            // Re-fetch data terbaru jika ada perubahan dari proses polling
+            const { data: updatedData } = await supabase
+                .from('orders')
+                .select(
+                    'id, status, pg_invoice, pg_paid_at, pg_qr_link, pg_virtual_account, account_details, error_message, pg_expired_at'
+                )
+                .eq('id', orderId)
+                .single();
+                
+            if (updatedData) {
+                return res.json({ data: updatedData });
+            }
+        }
+
+        // Hapus sekalipay_variant_id dari response untuk keamanan (optional)
+        delete data.sekalipay_variant_id;
         return res.json({ data });
     } catch (err) {
         console.error('[paymentController] getPaymentStatus error:', err.message);
@@ -203,4 +190,59 @@ async function getPaymentStatus(req, res) {
     }
 }
 
-module.exports = { getPaymentMethods, createPayment, getPaymentStatus };
+// ══════════════════════════════════════════════════════════════════════════
+// POST /api/payments/cancel
+// Batalkan invoice FinCloud (status → expired).
+// ══════════════════════════════════════════════════════════════════════════
+
+async function cancelPayment(req, res) {
+    try {
+        const { order_id } = req.body;
+
+        if (!order_id) {
+            return res.status(400).json({ error: 'order_id wajib diisi' });
+        }
+
+        // Cek order di Supabase
+        const { data: order, error: fetchError } = await supabase
+            .from('orders')
+            .select('id, status')
+            .eq('id', order_id)
+            .single();
+
+        if (fetchError || !order) {
+            return res.status(404).json({ error: 'Order tidak ditemukan' });
+        }
+
+        if (order.status !== 'PENDING') {
+            return res.status(400).json({
+                error: `Order tidak bisa dibatalkan (status: ${order.status})`,
+            });
+        }
+
+        // Cancel di FinCloud
+        const cancelResult = await paymentGatewayService.cancelInvoice(order_id);
+
+        if (!cancelResult.success) {
+            console.error('[paymentController] FinCloud cancelInvoice failed:', cancelResult);
+            return res.status(502).json({
+                error: `Gagal membatalkan: ${cancelResult.message}`,
+            });
+        }
+
+        // Update status di Supabase
+        await supabase
+            .from('orders')
+            .update({ status: 'CANCELLED' })
+            .eq('id', order_id);
+
+        console.log(`[paymentController] Order ${order_id} cancelled via FinCloud`);
+
+        return res.json({ success: true, message: 'Invoice berhasil dibatalkan' });
+    } catch (err) {
+        console.error('[paymentController] cancelPayment error:', err.message);
+        return res.status(500).json({ error: err.message });
+    }
+}
+
+module.exports = { createPayment, getPaymentStatus, cancelPayment };

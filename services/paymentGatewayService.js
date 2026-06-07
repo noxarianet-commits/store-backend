@@ -1,92 +1,67 @@
-const axios = require('axios');
 const crypto = require('crypto');
 
 /**
- * PaymentGatewayService — Client untuk Sekalipay Payment Gateway API.
+ * PaymentGatewayService — Client untuk FinCloud Payment Gateway API (QRIS).
  *
- * Base URL: https://sekalipay.com/api/v1/gateway
- * Auth: X-API-Key header + X-Signature (HMAC-SHA256 dari raw JSON body) untuk POST
+ * Base URL: https://fincloud.my.id
+ * Auth: Body param `apikey` + IP Whitelist
+ * Content-Type: application/x-www-form-urlencoded (untuk create invoice)
+ * Signature: MD5(apikey + ...params)
+ *
+ * Endpoints:
+ *   POST /api/create_invoice  — Buat tagihan QRIS baru
+ *   POST /api/cek_status      — Cek status tagihan
+ *   POST /api/cancel_invoice   — Batalkan tagihan
+ *   POST /api/cek_saldo        — Cek saldo wallet
  */
 class PaymentGatewayService {
     constructor() {
-        this.baseURL =
-            process.env.SEKALIPAY_GATEWAY_BASE_URL ||
-            'https://sekalipay.com/api/v1/gateway';
-        this.apiKey = (process.env.SEKALIPAY_GATEWAY_API_KEY || '').trim();
-        this.secretKey = (process.env.SEKALIPAY_GATEWAY_SECRET_KEY || '').trim();
-        this.merchantCode =
-            process.env.SEKALIPAY_MERCHANT_CODE || 'MCH-B8ISMW';
+        this.baseURL = (
+            process.env.FINCLOUD_BASE_URL || 'https://fincloud.my.id'
+        ).replace(/\/+$/, '');
 
-        this.client = axios.create({
-            baseURL: this.baseURL,
-            headers: {
-                Accept: 'application/json',
-                'X-API-Key': this.apiKey,
-            },
-            timeout: 30000,
-        });
+        this.apiKey = (process.env.FINCLOUD_API_KEY || '').trim();
     }
 
     // ══════════════════════════════════════════════════════════════
-    // SIGNATURE
+    // SIGNATURE — MD5 hash dari gabungan string
     // ══════════════════════════════════════════════════════════════
 
     /**
-     * Generate HMAC-SHA256 signature dari raw JSON string body.
-     * Wajib untuk semua POST request.
-     *
-     * @param {string} bodyString - Raw JSON string
-     * @returns {string} HMAC-SHA256 hex digest
+     * Generate MD5 signature dari gabungan parameter.
+     * @param {...string} parts - Bagian-bagian yang digabung lalu di-hash.
+     * @returns {string} MD5 hex digest
      */
-    generateSignature(bodyString) {
-        return crypto
-            .createHmac('sha256', this.secretKey)
-            .update(bodyString)
-            .digest('hex');
+    generateSignature(...parts) {
+        const raw = parts.join('');
+        return crypto.createHash('md5').update(raw).digest('hex');
     }
 
     /**
-     * Verifikasi HMAC-SHA256 signature dari webhook callback PG.
-     * Digunakan di webhookController untuk memastikan request sah.
+     * Verifikasi webhook signature dari FinCloud callback.
+     * Format: MD5(apikey + reff_id + status)
      *
-     * @param {string|Buffer} rawBody - Raw body string dari request
-     * @param {string} receivedSignature - Nilai header X-Signature
+     * @param {string} reffId - reff_id dari callback
+     * @param {string} status - status dari callback (biasanya 'success')
+     * @param {string} receivedSignature - Nilai signature yang diterima
      * @returns {boolean}
      */
-    verifyWebhookSignature(rawBody, receivedSignature) {
+    verifyWebhookSignature(reffId, status, receivedSignature) {
         if (!receivedSignature) {
-            console.error('[PaymentGatewayService] No X-Signature header received');
+            console.error('[PaymentGatewayService] No signature received in webhook');
             return false;
         }
-        const bodyString =
-            typeof rawBody === 'string' ? rawBody : rawBody.toString('utf8');
-        
-        const expected = this.generateSignature(bodyString);
-        const bufA = Buffer.from(expected, 'utf8');
-        const bufB = Buffer.from(receivedSignature, 'utf8');
-        
-        if (bufA.length !== bufB.length) {
-            console.error(`[PaymentGatewayService] Signature length mismatch. Expected: ${expected} | Received: ${receivedSignature}`);
+
+        const expected = this.generateSignature(this.apiKey, reffId, status);
+
+        if (expected !== receivedSignature) {
+            console.error('[PaymentGatewayService] Webhook signature mismatch!');
+            console.error(`  Expected: ${expected}`);
+            console.error(`  Received: ${receivedSignature}`);
             return false;
         }
-        const isValid = crypto.timingSafeEqual(bufA, bufB);
-        if (!isValid) {
-            console.error(`[PaymentGatewayService] Signature mismatch!`);
-            console.error(`  Expected (with SecretKey): ${expected}`);
-            console.error(`  Received:                  ${receivedSignature}`);
-            
-            // Try with alternative keys for debugging
-            const sigApiKey = crypto.createHmac('sha256', this.apiKey).update(bodyString).digest('hex');
-            const webhookSecret = (process.env.SEKALIPAY_WEBHOOK_SECRET || '').trim();
-            const sigWebhookSecret = webhookSecret ? crypto.createHmac('sha256', webhookSecret).update(bodyString).digest('hex') : 'N/A';
-            
-            console.error(`  With API Key:              ${sigApiKey}`);
-            console.error(`  With Webhook Secret:       ${sigWebhookSecret}`);
-            
-            console.error(`  Raw body length: ${bodyString.length}`);
-            console.error(`  Raw body sample: ${bodyString.substring(0, 100)}...${bodyString.substring(bodyString.length - 20)}`);
-        }
-        return isValid;
+
+        return true;
     }
 
     // ══════════════════════════════════════════════════════════════
@@ -95,7 +70,15 @@ class PaymentGatewayService {
 
     _handleError(error, context) {
         if (error.response) {
-            const { status, data } = error.response;
+            const status = error.response.status;
+            let data;
+            try {
+                data = typeof error.response.data === 'string'
+                    ? JSON.parse(error.response.data)
+                    : error.response.data;
+            } catch {
+                data = { msg: error.response.data };
+            }
             console.error(
                 `[PaymentGatewayService] ${context} — HTTP ${status}:`,
                 data
@@ -103,8 +86,7 @@ class PaymentGatewayService {
             return {
                 success: false,
                 status,
-                message: data?.message || 'UNKNOWN_ERROR',
-                errors: data?.errors || null,
+                message: data?.msg || data?.message || 'UNKNOWN_ERROR',
             };
         }
         console.error(
@@ -115,105 +97,203 @@ class PaymentGatewayService {
             success: false,
             status: 0,
             message: 'NETWORK_ERROR',
-            errors: { network: [error.message] },
         };
     }
 
     // ══════════════════════════════════════════════════════════════
-    // MERCHANT INFO
+    // CREATE INVOICE (Buat Tagihan QRIS)
     // ══════════════════════════════════════════════════════════════
 
     /**
-     * GET /merchant/info
-     * Ambil info merchant (saldo, status, sandbox mode).
+     * POST /api/create_invoice
+     * Buat tagihan QRIS dinamis baru.
      *
-     * @returns {{ success: boolean, data?: object }}
+     * @param {object} params
+     * @param {string} params.reffId  - ID pesanan unik dari sistem kita (= orderId)
+     * @param {number} params.nominal - Nominal tagihan (min 1000, tanpa pemisah ribuan)
+     * @returns {Promise<{ success: boolean, data?: object, message?: string }>}
      */
-    async getMerchantInfo() {
+    async createInvoice({ reffId, nominal }) {
         try {
-            const res = await this.client.get('/merchant/info');
-            return { success: true, data: res.data.data };
-        } catch (error) {
-            return this._handleError(error, 'getMerchantInfo');
-        }
-    }
+            const signature = this.generateSignature(
+                this.apiKey,
+                String(nominal),
+                reffId
+            );
 
-    // ══════════════════════════════════════════════════════════════
-    // PAYMENT METHODS
-    // ══════════════════════════════════════════════════════════════
-
-    /**
-     * GET /payment-methods
-     * Ambil daftar metode pembayaran aktif (QRIS, VA, dll).
-     * Tidak butuh signature.
-     *
-     * @returns {{ success: boolean, data?: Array }}
-     */
-    async getPaymentMethods() {
-        try {
-            const res = await this.client.get('/payment-methods');
-            return { success: true, data: res.data.data };
-        } catch (error) {
-            return this._handleError(error, 'getPaymentMethods');
-        }
-    }
-
-    // ══════════════════════════════════════════════════════════════
-    // CREATE PAYMENT
-    // ══════════════════════════════════════════════════════════════
-
-    /**
-     * POST /payment
-     * Buat transaksi pembayaran baru.
-     * Otomatis menambahkan X-Signature HMAC-SHA256 dari body.
-     *
-     * @param {object} paymentData
-     * @param {string} paymentData.merchant_ref_id - ID unik dari sistem kita (= order.id)
-     * @param {number} paymentData.amount          - Harga produk (tanpa fee)
-     * @param {string} paymentData.payment_code    - Kode metode bayar (QRIS, BCAVA, dll)
-     * @param {string} paymentData.customer_name
-     * @param {string} paymentData.customer_email
-     * @param {string} paymentData.customer_phone
-     * @param {string} paymentData.callback_url   - URL webhook backend
-     * @param {string} paymentData.return_url      - Redirect setelah bayar
-     * @param {object} [paymentData.metadata]      - Data tambahan (opsional)
-     * @returns {{ success: boolean, data?: object }}
-     */
-    async createPayment(paymentData) {
-        try {
-            const bodyString = JSON.stringify(paymentData);
-            const signature = this.generateSignature(bodyString);
-
-            const res = await this.client.post('/payment', bodyString, {
-                headers: {
-                    'Content-Type': 'application/json',
-                    'X-Signature': signature,
-                },
+            const body = new URLSearchParams({
+                apikey: this.apiKey,
+                nominal: String(nominal),
+                reff_id: reffId,
+                signature,
             });
 
-            return { success: true, data: res.data.data };
+            const res = await fetch(`${this.baseURL}/api/create_invoice`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body: body.toString(),
+                signal: AbortSignal.timeout(30000),
+            });
+
+            const json = await res.json();
+
+            if (!res.ok || !json.status) {
+                console.error(
+                    `[PaymentGatewayService] createInvoice failed:`,
+                    json
+                );
+                return {
+                    success: false,
+                    status: res.status,
+                    message: json.msg || 'Gagal membuat invoice',
+                };
+            }
+
+            return { success: true, data: json.data };
         } catch (error) {
-            return this._handleError(error, 'createPayment');
+            return this._handleError(error, 'createInvoice');
         }
     }
 
     // ══════════════════════════════════════════════════════════════
-    // CHECK PAYMENT STATUS
+    // CHECK INVOICE STATUS (Cek Status Tagihan)
     // ══════════════════════════════════════════════════════════════
 
     /**
-     * GET /payment/{merchant_ref_id}
-     * Cek status pembayaran. Berguna saat webhook belum diterima.
+     * POST /api/cek_status
+     * Cek status tagihan QRIS via id_depo.
      *
-     * @param {string} merchantRefId - merchant_ref_id yang dipakai saat createPayment
-     * @returns {{ success: boolean, data?: object }}
+     * @param {number|string} idDepo - id_depo dari response create_invoice
+     * @returns {Promise<{ success: boolean, data?: object }>}
      */
-    async checkPaymentStatus(merchantRefId) {
+    async checkInvoiceStatus(idDepo) {
         try {
-            const res = await this.client.get(`/payment/${merchantRefId}`);
-            return { success: true, data: res.data.data };
+            const signature = this.generateSignature(
+                this.apiKey,
+                String(idDepo)
+            );
+
+            const body = new URLSearchParams({
+                apikey: this.apiKey,
+                id_depo: String(idDepo),
+                signature,
+            });
+
+            const res = await fetch(`${this.baseURL}/api/cek_status`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body: body.toString(),
+                signal: AbortSignal.timeout(30000),
+            });
+
+            const json = await res.json();
+
+            if (!res.ok || !json.status) {
+                console.error(
+                    `[PaymentGatewayService] checkInvoiceStatus failed:`,
+                    json
+                );
+                return {
+                    success: false,
+                    status: res.status,
+                    message: json.msg || 'Gagal cek status',
+                };
+            }
+
+            return { success: true, data: json.data };
         } catch (error) {
-            return this._handleError(error, `checkPaymentStatus(${merchantRefId})`);
+            return this._handleError(error, `checkInvoiceStatus(${idDepo})`);
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // CANCEL INVOICE (Batalkan Tagihan)
+    // ══════════════════════════════════════════════════════════════
+
+    /**
+     * POST /api/cancel_invoice
+     * Batalkan tagihan agar statusnya berubah menjadi expired.
+     *
+     * @param {string} reffId - reff_id tagihan yang ingin dibatalkan
+     * @returns {Promise<{ success: boolean, message?: string }>}
+     */
+    async cancelInvoice(reffId) {
+        try {
+            const signature = this.generateSignature(this.apiKey, reffId);
+
+            const body = new URLSearchParams({
+                apikey: this.apiKey,
+                reff_id: reffId,
+                signature,
+            });
+
+            const res = await fetch(`${this.baseURL}/api/cancel_invoice`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body: body.toString(),
+                signal: AbortSignal.timeout(30000),
+            });
+
+            const json = await res.json();
+
+            if (!res.ok || !json.status) {
+                console.error(
+                    `[PaymentGatewayService] cancelInvoice failed:`,
+                    json
+                );
+                return {
+                    success: false,
+                    status: res.status,
+                    message: json.msg || 'Gagal membatalkan invoice',
+                };
+            }
+
+            return { success: true, message: json.msg };
+        } catch (error) {
+            return this._handleError(error, `cancelInvoice(${reffId})`);
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════
+    // CHECK BALANCE (Cek Saldo Wallet)
+    // ══════════════════════════════════════════════════════════════
+
+    /**
+     * POST /api/cek_saldo
+     * Ambil saldo QRIS aktif di akun FinCloud.
+     *
+     * @returns {Promise<{ success: boolean, data?: object }>}
+     */
+    async checkBalance() {
+        try {
+            const body = new URLSearchParams({
+                apikey: this.apiKey,
+            });
+
+            const res = await fetch(`${this.baseURL}/api/cek_saldo`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                body: body.toString(),
+                signal: AbortSignal.timeout(30000),
+            });
+
+            const json = await res.json();
+
+            if (!res.ok || !json.status) {
+                console.error(
+                    `[PaymentGatewayService] checkBalance failed:`,
+                    json
+                );
+                return {
+                    success: false,
+                    status: res.status,
+                    message: json.msg || 'Gagal cek saldo',
+                };
+            }
+
+            return { success: true, data: json.data };
+        } catch (error) {
+            return this._handleError(error, 'checkBalance');
         }
     }
 }

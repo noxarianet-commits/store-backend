@@ -42,7 +42,6 @@ const allowedOrigins = [
     'http://localhost:5173',
     'https://noxarianet.vercel.app',
     'https://www.noxarianet.web.id',
-    'https://sekalipay.com/'
 ];
 if (process.env.FRONTEND_URL) allowedOrigins.push(process.env.FRONTEND_URL);
 
@@ -118,7 +117,19 @@ cron.schedule('0 3 * * *', async () => {
     }
 });
 
+// ══════════════════════════════════════════════════════════════════════════
+// PAYMENT POLLING CRON JOBS (Fallback for Webhooks)
+// ══════════════════════════════════════════════════════════════════════════
+
+const paymentPollingService = require('./services/paymentPollingService');
+
+cron.schedule('* * * * *', async () => {
+    // Run every minute
+    await paymentPollingService.pollPendingOrders();
+});
+
 console.log('[CRON] Sekalipay sync scheduled: delta every 3h, full daily at 03:00');
+console.log('[CRON] Payment polling scheduled: every 1 minute');
 
 // ══════════════════════════════════════════════════════════════════════════
 // START / EXPORT

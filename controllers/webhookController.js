@@ -24,86 +24,110 @@ function timingSafeCompare(a, b) {
 
 // ══════════════════════════════════════════════════════════════════════════
 // HANDLER 1 — POST /api/webhooks/payment-gateway
-// Dipanggil Sekalipay PG saat pembayaran user berhasil dikonfirmasi.
+// Dipanggil FinCloud saat pembayaran QRIS user berhasil dikonfirmasi.
+//
+// FinCloud mengirim callback via POST form-urlencoded dengan parameter:
+//   reff_id   — ID referensi invoice (= orderId kita)
+//   nominal   — Jumlah nominal yang dibayar
+//   status    — Status pembayaran ('success')
+//   signature — MD5(apikey + reff_id + status)
+//   is_test   — (opsional) true jika simulasi ping test dari dashboard
 //
 // Alur:
-//   1. Verifikasi HMAC-SHA256 signature dari raw body
-//   2. Cari order di Supabase via merchant_ref_id
-//   3. Jika status "paid", buat transaksi ke Sekalipay Reseller
-//   4. Update order: status=PROCESSING atau FAILED (jika Sekalipay error)
+//   1. Validasi signature MD5 dari FinCloud
+//   2. Handle ping test (is_test)
+//   3. Verify via API: panggil cek_status untuk konfirmasi ulang
+//   4. Cari order di Supabase via reff_id (= orderId)
+//   5. Jika status "success", buat transaksi ke Sekalipay Reseller
+//   6. Update order: status=PROCESSING atau FAILED (jika Sekalipay error)
 // ══════════════════════════════════════════════════════════════════════════
 
 async function handlePaymentGatewayWebhook(req, res) {
-    const payload = req.body || {};
-    
-    // Kadang payload ada di .data, kadang di luar (langsung di body)
-    const data = payload.data ? payload.data : payload;
-    const merchantRefId = data.merchant_ref_id || '';
-    const event = req.headers['x-event'] || data.event || '';
+    const reffId = req.body?.reff_id || '';
+    const nominal = req.body?.nominal || '';
+    const status = req.body?.status || '';
+    const signature = req.body?.signature || '';
+    const isTest = req.body?.is_test === 'true' || req.body?.is_test === true;
 
-    console.log(`[Webhook/PG] Received event for ${merchantRefId}`);
+    console.log(`[Webhook/PG-FinCloud] Received callback for reff_id=${reffId}, status=${status}`);
 
-    if (!merchantRefId) {
-        return res.status(400).json({ error: 'merchant_ref_id missing' });
+    // ── Validasi signature ────────────────────────────────────────────────
+    const isValidSig = paymentGatewayService.verifyWebhookSignature(
+        reffId,
+        status,
+        signature
+    );
+
+    if (!isValidSig) {
+        console.warn('[Webhook/PG-FinCloud] Invalid signature — request ditolak.');
+        return res.status(401).json({ error: 'Invalid signature' });
     }
 
-    // ── STRATEGI BARU: Webhook sbg Trigger, Verifikasi via API ────────────
-    // Daripada berurusan dengan signature webhook yang sering mismatch 
-    // (karena format JSON dari server PG), kita gunakan webhook ini HANYA
-    // sebagai "ping". Kita akan memanggil API Sekalipay langsung untuk
-    // mengecek status asli order ini. Ini 100% aman dan anti-spoofing.
-    
-    const checkResult = await paymentGatewayService.checkPaymentStatus(merchantRefId);
-    
-    if (!checkResult.success || !checkResult.data) {
-        console.error(`[Webhook/PG] Gagal mengecek status ke API Sekalipay untuk ${merchantRefId}`);
-        return res.status(500).json({ error: 'Failed to verify payment status via API' });
+    // ── Handle ping test dari FinCloud dashboard ──────────────────────────
+    if (isTest) {
+        console.log('[Webhook/PG-FinCloud] Test webhook OK (is_test=true).');
+        return res.status(200).send('TEST_OK');
     }
 
-    const pgData = checkResult.data;
-    const pgStatus = pgData.status || ''; // Biasanya 'paid'
-    const pgInvoice = pgData.invoice || '';
-
-    console.log(`[Webhook/PG] API Verification -> merchant_ref_id=${merchantRefId}, status=${pgStatus}`);
-
-    // ── Hanya proses jika status "paid" ──────────────────────────────────
-    if (pgStatus !== 'paid' && pgStatus !== 'completed') {
-        console.log(`[Webhook/PG] Status bukan "paid" (${pgStatus}), dilewati.`);
+    // ── Hanya proses jika status "success" ────────────────────────────────
+    if (status !== 'success') {
+        console.log(`[Webhook/PG-FinCloud] Status bukan "success" (${status}), dilewati.`);
         return res.sendStatus(200);
     }
 
-    // ── Ambil order dari Supabase ─────────────────────────────────────────
+    if (!reffId) {
+        return res.status(400).json({ error: 'reff_id missing' });
+    }
+
+    // ── Ambil order dari Supabase (reff_id = orderId) ─────────────────────
     const { data: order, error: fetchError } = await supabase
         .from('orders')
         .select('*')
-        .eq('id', merchantRefId)
+        .eq('id', reffId)
         .single();
 
     if (fetchError || !order) {
-        console.error(`[Webhook/PG] Order ${merchantRefId} tidak ditemukan:`, fetchError?.message);
+        console.error(`[Webhook/PG-FinCloud] Order ${reffId} tidak ditemukan:`, fetchError?.message);
         return res.status(404).json({ error: 'Order not found' });
     }
 
     // ── Idempotency check — jangan proses dua kali ────────────────────────
     if (order.status !== 'PENDING') {
-        console.log(`[Webhook/PG] Order ${merchantRefId} sudah diproses (status: ${order.status}), skip.`);
+        console.log(`[Webhook/PG-FinCloud] Order ${reffId} sudah diproses (status: ${order.status}), skip.`);
         return res.sendStatus(200);
+    }
+
+    // ── Verifikasi via API (opsional, untuk extra security) ───────────────
+    const idDepo = order.pg_invoice; // id_depo disimpan di pg_invoice saat create
+    if (idDepo) {
+        const checkResult = await paymentGatewayService.checkInvoiceStatus(idDepo);
+        if (checkResult.success && checkResult.data) {
+            const apiStatus = checkResult.data.status;
+            if (apiStatus !== 'success') {
+                console.warn(`[Webhook/PG-FinCloud] API verification says status=${apiStatus}, bukan success. Skip.`);
+                return res.sendStatus(200);
+            }
+            console.log(`[Webhook/PG-FinCloud] API verification OK: id_depo=${idDepo}, status=${apiStatus}`);
+        } else {
+            // API check gagal, tapi signature sudah valid — lanjut proses
+            console.warn(`[Webhook/PG-FinCloud] API verification gagal untuk id_depo=${idDepo}, lanjut dengan signature.`);
+        }
     }
 
     // ── Update pg_paid_at & tandai sedang diproses ────────────────────────
     await supabase
         .from('orders')
-        .update({ pg_paid_at: pgData.paid_at || new Date().toISOString() })
-        .eq('id', merchantRefId);
+        .update({ pg_paid_at: new Date().toISOString() })
+        .eq('id', reffId);
 
     // ── Buat transaksi ke Sekalipay Reseller API ──────────────────────────
     const variantId = order.sekalipay_variant_id;
     if (!variantId) {
-        console.error(`[Webhook/PG] Order ${merchantRefId} tidak punya sekalipay_variant_id.`);
+        console.error(`[Webhook/PG-FinCloud] Order ${reffId} tidak punya sekalipay_variant_id.`);
         await supabase
             .from('orders')
             .update({ status: 'FAILED', error_message: 'variant_id tidak ditemukan di order' })
-            .eq('id', merchantRefId);
+            .eq('id', reffId);
         return res.sendStatus(200);
     }
 
@@ -111,41 +135,38 @@ async function handlePaymentGatewayWebhook(req, res) {
         {
             item_id: variantId,
             quantity: 1,
-            note: '-', // produk auto, tidak butuh note
+            note: '-',
         },
     ];
 
-    const sekalipayResult = await sekalipayService.createTransaction(merchantRefId, carts);
+    const sekalipayResult = await sekalipayService.createTransaction(reffId, carts);
 
     if (!sekalipayResult.success) {
-        // Sekalipay gagal — simpan error agar bot bisa notif admin
         const errMsg = sekalipayResult.message || 'UNKNOWN_SEKALIPAY_ERROR';
-        console.error(`[Webhook/PG] Sekalipay order gagal untuk ${merchantRefId}:`, errMsg);
+        console.error(`[Webhook/PG-FinCloud] Sekalipay order gagal untuk ${reffId}:`, errMsg);
 
         await supabase
             .from('orders')
             .update({
                 status: 'FAILED',
                 error_message: errMsg,
-                pg_invoice: pgInvoice || order.pg_invoice,
             })
-            .eq('id', merchantRefId);
+            .eq('id', reffId);
 
-        return res.sendStatus(200); // Tetap 200 agar PG tidak retry
+        return res.sendStatus(200); // Tetap 200 agar FinCloud tidak retry
     }
 
     const sekalipayData = sekalipayResult.data;
-    console.log(`[Webhook/PG] Sekalipay order dibuat: invoice=${sekalipayData.invoice}, ref_id=${sekalipayData.ref_id}`);
+    console.log(`[Webhook/PG-FinCloud] Sekalipay order dibuat: invoice=${sekalipayData.invoice}, ref_id=${sekalipayData.ref_id}`);
 
     // ── Update order ke PROCESSING ────────────────────────────────────────
     await supabase
         .from('orders')
         .update({
             status: 'PROCESSING',
-            pg_invoice: pgInvoice || order.pg_invoice,
             sekalipay_invoice: sekalipayData.invoice || null,
         })
-        .eq('id', merchantRefId);
+        .eq('id', reffId);
 
     return res.sendStatus(200);
 }

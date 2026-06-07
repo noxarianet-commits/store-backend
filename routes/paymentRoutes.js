@@ -11,15 +11,8 @@ const createPaymentLimiter = rateLimit({
 });
 
 /**
- * GET /api/payments/methods
- * Ambil daftar metode pembayaran aktif dari Sekalipay PG.
- * Public, tidak butuh auth.
- */
-router.get('/methods', paymentController.getPaymentMethods);
-
-/**
  * POST /api/payments/create
- * Buat order baru + payment di Sekalipay PG.
+ * Buat order baru + invoice QRIS di FinCloud.
  * Public, rate-limited.
  */
 router.post('/create', createPaymentLimiter, paymentController.createPayment);
@@ -30,5 +23,12 @@ router.post('/create', createPaymentLimiter, paymentController.createPayment);
  * Public, tidak butuh auth.
  */
 router.get('/status/:orderId', paymentController.getPaymentStatus);
+
+/**
+ * POST /api/payments/cancel
+ * Batalkan invoice FinCloud (status → expired/cancelled).
+ * Public, rate-limited.
+ */
+router.post('/cancel', createPaymentLimiter, paymentController.cancelPayment);
 
 module.exports = router;

@@ -47,13 +47,13 @@ const sendOrderToAdmin = async (orderData) => {
         if (orderData.proof_image) {
             const response = await axios.get(orderData.proof_image, { responseType: 'arraybuffer' });
             const media = new MessageMedia(
-                'image/jpeg', 
+                'image/jpeg',
                 Buffer.from(response.data).toString('base64'),
                 'bukti-transfer.jpg'
             );
             await client.sendMessage(ADMIN_NUMBER, media);
         }
-        
+
         console.log(`✅ Laporan pesanan ${orderData.id} terkirim ke Admin/CS!`);
     } catch (err) {
         console.error('Gagal kirim laporan ke Admin:', err);
@@ -64,7 +64,7 @@ const sendOrderToAdmin = async (orderData) => {
 const japriCustomer = async (orderData) => {
     try {
         let number = orderData.wa_number.replace(/\D/g, ''); // Hapus semua karakter non-angka
-        
+
         // Pastikan format internasional (awali dengan 62)
         if (number.startsWith('0')) {
             number = '62' + number.slice(1);
@@ -73,7 +73,7 @@ const japriCustomer = async (orderData) => {
         }
 
         const chatId = number + "@c.us";
-        
+
         let message = `Halo Kak! 👋\n\n`;
         message += `Terima kasih telah berbelanja di *noxarianet store*. Pesanan Kakak dengan ID *${orderData.id}* sedang kami proses ya. Mohon ditunggu sebentar. ⏳\n\n`;
         message += `Jika ada kendala atau pertanyaan, jangan ragu untuk hubungi Admin segera dan jelaskan masalah Kakak.\n\n`;
@@ -91,10 +91,10 @@ console.log('⏳ Menunggu pesanan baru dari Supabase...');
 
 supabase
     .channel('public:orders')
-    .on('postgres_changes', { 
-        event: 'INSERT', 
-        schema: 'public', 
-        table: 'orders' 
+    .on('postgres_changes', {
+        event: 'INSERT',
+        schema: 'public',
+        table: 'orders'
     }, (payload) => {
         console.log('🔔 Ada Pesanan Baru Masuk ke DB!');
         // 1. Lapor ke Admin/CS
@@ -109,22 +109,22 @@ client.on('group_join', async (notification) => {
     try {
         const targetGroupId = '120363424077781671@g.us';
         const chat = await notification.getChat();
-        
+
         // Cek berdasarkan ID atau Nama Grup spesifik
         if (notification.chatId === targetGroupId || chat.name === 'noxarianet || offical comunity') {
             // Ambil nomor member baru (biasanya array)
             for (let participantId of notification.recipientIds) {
                 const contact = await client.getContactById(participantId);
                 const name = contact.pushname || 'Kak';
-                
+
                 let welcomeMsg = `Halo *${name}*! 👋 Selamat datang di grup *noxarianet || offical comunity*.\n\n`;
                 welcomeMsg += `Senang melihatmu bergabung! Cek produk digital premium & promo terbaru kami di sini:\n`;
                 welcomeMsg += `🌐 https://www.noxarianet.web.id\n\n`;
                 welcomeMsg += `Selamat berbelanja! 💙✨`;
-                
+
                 await client.sendMessage(notification.chatId, welcomeMsg);
             }
-        }
+        } ``
     } catch (err) {
         console.error('Gagal kirim pesan sambutan:', err);
     }

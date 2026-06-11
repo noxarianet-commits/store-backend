@@ -2,6 +2,7 @@ const crypto = require('crypto');
 const supabase = require('../supabase');
 const paymentGatewayService = require('../services/paymentGatewayService');
 const sekalipayService = require('../services/sekalipayService');
+const orderFulfillmentService = require('../services/orderFulfillmentService');
 
 // ══════════════════════════════════════════════════════════════════════════
 // HELPER — Sekalipay Reseller Webhook Signature Verification
@@ -120,53 +121,13 @@ async function handlePaymentGatewayWebhook(req, res) {
         .update({ pg_paid_at: new Date().toISOString() })
         .eq('id', reffId);
 
-    // ── Buat transaksi ke Sekalipay Reseller API ──────────────────────────
-    const variantId = order.sekalipay_variant_id;
-    if (!variantId) {
-        console.error(`[Webhook/PG-FinCloud] Order ${reffId} tidak punya sekalipay_variant_id.`);
-        await supabase
-            .from('orders')
-            .update({ status: 'FAILED', error_message: 'variant_id tidak ditemukan di order' })
-            .eq('id', reffId);
-        return res.sendStatus(200);
+    // ── Delegasi ke orderFulfillmentService untuk atomic claim & proses Sekalipay ──
+    const fulfillmentResult = await orderFulfillmentService.fulfillOrder(order);
+
+    if (fulfillmentResult && !fulfillmentResult.success && !fulfillmentResult.skipped) {
+        // Return 200 even on error so FinCloud doesn't infinitely retry unless it's a network issue
+        return res.sendStatus(200); 
     }
-
-    const carts = [
-        {
-            item_id: variantId,
-            quantity: 1,
-            note: '-',
-        },
-    ];
-
-    const sekalipayResult = await sekalipayService.createTransaction(reffId, carts);
-
-    if (!sekalipayResult.success) {
-        const errMsg = sekalipayResult.message || 'UNKNOWN_SEKALIPAY_ERROR';
-        console.error(`[Webhook/PG-FinCloud] Sekalipay order gagal untuk ${reffId}:`, errMsg);
-
-        await supabase
-            .from('orders')
-            .update({
-                status: 'FAILED',
-                error_message: errMsg,
-            })
-            .eq('id', reffId);
-
-        return res.sendStatus(200); // Tetap 200 agar FinCloud tidak retry
-    }
-
-    const sekalipayData = sekalipayResult.data;
-    console.log(`[Webhook/PG-FinCloud] Sekalipay order dibuat: invoice=${sekalipayData.invoice}, ref_id=${sekalipayData.ref_id}`);
-
-    // ── Update order ke PROCESSING ────────────────────────────────────────
-    await supabase
-        .from('orders')
-        .update({
-            status: 'PROCESSING',
-            sekalipay_invoice: sekalipayData.invoice || null,
-        })
-        .eq('id', reffId);
 
     return res.sendStatus(200);
 }

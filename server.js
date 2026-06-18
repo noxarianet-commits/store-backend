@@ -15,7 +15,6 @@ const serviceRoutes = require('./routes/serviceRoutes');
 const orderRoutes = require('./routes/orderRoutes');
 const settingsRoutes = require('./routes/settingsRoutes');
 const adminRoutes = require('./routes/adminRoutes');
-const bannerRoutes = require('./routes/bannerRoutes');
 const testimonialRoutes = require('./routes/testimonialRoutes');
 const paymentRoutes = require('./routes/paymentRoutes');
 const webhookRoutes = require('./routes/webhookRoutes');
@@ -88,7 +87,6 @@ app.use('/api/payments', paymentRoutes);
 
 app.use('/api/admin/sekalipay', verifyAdmin, sekalipayAdminRoutes);
 app.use('/api/orders', verifyAdmin, orderRoutes);
-app.use('/api/banners', verifyAdmin, bannerRoutes);
 
 // Admin auth: login limiter and verifyAdmin are defined in adminRoutes.js
 app.use('/api/admin', adminRoutes);

@@ -12,8 +12,7 @@ async function list(req, res) {
         if (error) throw error;
 
         const settingsMap = {
-            shop_status: { isOpen: true, message: 'Selamat datang!' },
-            banners: []
+            shop_status: { isOpen: true, message: 'Selamat datang!' }
             // CATATAN: admin_auth TIDAK lagi ada di settings — sudah dipindah ke tabel admins
         };
         data.forEach(s => {

@@ -162,11 +162,23 @@ async function getPaymentStatus(req, res) {
             return res.status(404).json({ error: 'Order tidak ditemukan' });
         }
 
-        // Removed on-demand trigger to paymentPollingService.processOrder
-        // Webhook and cron polling are the only systems responsible for 
-        // processing payments to prevent race conditions.
+        // TRIGGER POLLING ON DEMAND JIKA MASIH PENDING
         if (data.status === 'PENDING' && data.pg_invoice) {
-            console.log(`[paymentController] User requested status for ${orderId}, status is still PENDING.`);
+            console.log(`[paymentController] User requested status for ${orderId}, triggering manual poll...`);
+            await paymentPollingService.processOrder(data);
+            
+            // Re-fetch data terbaru jika ada perubahan dari proses polling
+            const { data: updatedData } = await supabase
+                .from('orders')
+                .select(
+                    'id, status, pg_invoice, pg_paid_at, pg_qr_link, pg_virtual_account, account_details, error_message, pg_expired_at'
+                )
+                .eq('id', orderId)
+                .single();
+                
+            if (updatedData) {
+                return res.json({ data: updatedData });
+            }
         }
 
         // Hapus sekalipay_variant_id dari response untuk keamanan (optional)

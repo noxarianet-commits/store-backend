@@ -1,6 +1,6 @@
 const supabase = require('../supabase');
 const paymentGatewayService = require('./paymentGatewayService');
-const orderFulfillmentService = require('./orderFulfillmentService');
+const sekalipayService = require('./sekalipayService');
 
 /**
  * Service untuk mem-polling status pembayaran dari FinCloud
@@ -52,18 +52,6 @@ class PaymentPollingService {
         const reffId = order.id;
 
         try {
-            // Pastikan belum diproses secara bersamaan oleh webhook (fast check awal)
-            const { data: currentOrder } = await supabase
-                .from('orders')
-                .select('status')
-                .eq('id', reffId)
-                .single();
-
-            if (currentOrder && currentOrder.status !== 'PENDING') {
-                console.log(`[Polling/PG-FinCloud] Order ${reffId} sudah diproses oleh webhook/proses lain. Skip.`);
-                return;
-            }
-
             // Cek status ke FinCloud API
             const checkResult = await paymentGatewayService.checkInvoiceStatus(idDepo);
             
@@ -81,15 +69,73 @@ class PaymentPollingService {
 
             console.log(`[Polling/PG-FinCloud] Order ${reffId} ternyata sudah sukses dibayar (id_depo=${idDepo}). Memproses...`);
 
+            // Pastikan belum diproses secara bersamaan oleh webhook
+            const { data: currentOrder } = await supabase
+                .from('orders')
+                .select('status')
+                .eq('id', reffId)
+                .single();
+
+            if (currentOrder && currentOrder.status !== 'PENDING') {
+                console.log(`[Polling/PG-FinCloud] Order ${reffId} sudah diproses oleh webhook. Skip.`);
+                return;
+            }
+
             // ── Update pg_paid_at ────────────────────────────────────────
             await supabase
                 .from('orders')
                 .update({ pg_paid_at: new Date().toISOString() })
                 .eq('id', reffId);
 
-            // ── Delegasi ke orderFulfillmentService untuk atomic claim & proses Sekalipay ──
-            await orderFulfillmentService.fulfillOrder(order);
+            // ── Buat transaksi ke Sekalipay Reseller API ─────────────────
+            const variantId = order.sekalipay_variant_id;
+            if (!variantId) {
+                console.error(`[Polling/PG-FinCloud] Order ${reffId} tidak punya sekalipay_variant_id.`);
+                await supabase
+                    .from('orders')
+                    .update({ status: 'FAILED', error_message: 'variant_id tidak ditemukan di order' })
+                    .eq('id', reffId);
+                return;
+            }
 
+            const carts = [
+                {
+                    item_id: variantId,
+                    quantity: 1,
+                    note: '-',
+                },
+            ];
+
+            const sekalipayResult = await sekalipayService.createTransaction(reffId, carts);
+
+            if (!sekalipayResult.success) {
+                const errMsg = sekalipayResult.message || 'UNKNOWN_SEKALIPAY_ERROR';
+                console.error(`[Polling/PG-FinCloud] Sekalipay order gagal untuk ${reffId}:`, errMsg);
+
+                await supabase
+                    .from('orders')
+                    .update({
+                        status: 'FAILED',
+                        error_message: errMsg,
+                    })
+                    .eq('id', reffId);
+
+                return;
+            }
+
+            const sekalipayData = sekalipayResult.data;
+            console.log(`[Polling/PG-FinCloud] Sekalipay order dibuat: invoice=${sekalipayData.invoice}, ref_id=${sekalipayData.ref_id}`);
+
+            // ── Update order ke PROCESSING ───────────────────────────────
+            await supabase
+                .from('orders')
+                .update({
+                    status: 'PROCESSING',
+                    sekalipay_invoice: sekalipayData.invoice || null,
+                })
+                .eq('id', reffId);
+
+            console.log(`[Polling/PG-FinCloud] Order ${reffId} berhasil diproses.`);
         } catch (err) {
             console.error(`[Polling/PG-FinCloud] Error memproses order ${reffId}:`, err);
         }

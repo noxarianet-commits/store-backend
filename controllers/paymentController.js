@@ -40,6 +40,8 @@ async function createPayment(req, res) {
             customer_name,
             wa_number,
             email,
+            note,           // string | json string (for sekalipay)
+            provider_qty,   // number (for open denom)
         } = req.body;
 
         // ── Validasi input ──────────────────────────────────────
@@ -51,7 +53,47 @@ async function createPayment(req, res) {
         if (typeof amount !== 'number' || amount <= 0) {
             return res.status(400).json({ error: 'amount harus berupa angka positif' });
         }
-        if (amount < 1000) {
+        // ── Ambil data produk dari DB untuk verifikasi harga ──────
+        const { data: dbProduct, error: fetchError } = await supabase
+            .from('products')
+            .select('*')
+            .eq('id', product_id)
+            .single();
+
+        if (fetchError || !dbProduct) {
+            return res.status(404).json({ error: 'Produk tidak ditemukan di sistem' });
+        }
+
+        // Cari variant yang sesuai
+        const variant = (dbProduct.variants || []).find(v => v.id === variant_id);
+        if (!variant) {
+            return res.status(404).json({ error: 'Variant tidak ditemukan' });
+        }
+
+        // Verifikasi Harga Secara Aman (Backend-side calculation)
+        let expectedAmount = 0;
+        if (variant.provider_meta && variant.provider_meta.open_denom) {
+            if (!provider_qty || typeof provider_qty !== 'number' || provider_qty <= 0) {
+                return res.status(400).json({ error: 'Nominal (provider_qty) wajib diisi untuk produk ini' });
+            }
+            if (variant.provider_meta.min_qty && provider_qty < variant.provider_meta.min_qty) {
+                return res.status(400).json({ error: `Nominal minimal adalah ${variant.provider_meta.min_qty}` });
+            }
+            if (variant.provider_meta.max_qty && provider_qty > variant.provider_meta.max_qty) {
+                return res.status(400).json({ error: `Nominal maksimal adalah ${variant.provider_meta.max_qty}` });
+            }
+            expectedAmount = Math.ceil(provider_qty + (variant.sell_price || 0));
+        } else {
+            expectedAmount = Math.ceil(variant.sell_price || 0);
+        }
+
+        // Jika harga dari frontend berbeda dengan perhitungan backend, tolak request
+        if (amount !== expectedAmount) {
+            console.error(`[paymentController] Price mismatch. Expected: ${expectedAmount}, Got: ${amount}`);
+            return res.status(400).json({ error: 'Terjadi ketidaksesuaian harga. Silakan refresh halaman.' });
+        }
+
+        if (expectedAmount < 1000) {
             return res.status(400).json({ error: 'Minimal pembayaran Rp 1.000' });
         }
 
@@ -103,6 +145,9 @@ async function createPayment(req, res) {
                 // Sekalipay Reseller (untuk auto-order setelah bayar)
                 sekalipay_ref_id: orderId,
                 sekalipay_variant_id: variant_id,
+
+                // Simpan note ke account_details
+                account_details: note ? { sekalipay_note: note } : null,
 
                 timestamp: new Date().toISOString(),
             },

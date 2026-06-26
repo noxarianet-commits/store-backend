@@ -102,7 +102,7 @@ class PaymentPollingService {
                 {
                     item_id: variantId,
                     quantity: 1,
-                    note: '-',
+                    note: order.account_details?.sekalipay_note || '-',
                 },
             ];
 

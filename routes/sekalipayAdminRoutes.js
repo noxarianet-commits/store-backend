@@ -3,6 +3,7 @@ const router = express.Router();
 const supabase = require('../supabase');
 const sekalipayService = require('../services/sekalipayService');
 const syncService = require('../services/syncService');
+const cacheService = require('../services/cacheService');
 
 /**
  * POST /api/admin/sekalipay/sync
@@ -207,6 +208,60 @@ router.post('/global-markup', async (req, res) => {
         } else {
             res.status(500).json({ success: false, error: result.error });
         }
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+/**
+ * PATCH /api/admin/sekalipay/products/:id/featured
+ * Toggle is_featured status of a product.
+ */
+router.patch('/products/:id/featured', async (req, res) => {
+    try {
+        const productId = parseInt(req.params.id);
+
+        const { data: product, error: fetchError } = await supabase
+            .from('products')
+            .select('is_featured')
+            .eq('id', productId)
+            .single();
+
+        if (fetchError || !product) {
+            return res.status(404).json({ error: 'Produk tidak ditemukan' });
+        }
+
+        const newValue = !product.is_featured;
+        const { error: updateError } = await supabase
+            .from('products')
+            .update({ is_featured: newValue })
+            .eq('id', productId);
+
+        if (updateError) throw updateError;
+
+        // Invalidate home cache so changes appear immediately
+        cacheService.invalidateHome();
+
+        res.json({ success: true, is_featured: newValue });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+/**
+ * GET /api/admin/sekalipay/featured
+ * List all featured products.
+ */
+router.get('/featured', async (req, res) => {
+    try {
+        const { data, error } = await supabase
+            .from('products')
+            .select('*')
+            .eq('is_featured', true)
+            .order('name', { ascending: true });
+
+        if (error) throw error;
+        res.json(data || []);
     } catch (err) {
         res.status(500).json({ error: err.message });
     }

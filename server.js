@@ -18,6 +18,7 @@ const adminRoutes = require('./routes/adminRoutes');
 const testimonialRoutes = require('./routes/testimonialRoutes');
 const paymentRoutes = require('./routes/paymentRoutes');
 const webhookRoutes = require('./routes/webhookRoutes');
+const homeRoutes = require('./routes/homeRoutes');
 
 const verifyAdmin = require('./middleware/verifyAdmin');
 
@@ -41,6 +42,7 @@ const allowedOrigins = [
     'http://localhost:5173',
     'https://noxarianet.vercel.app',
     'https://www.noxarianet.web.id',
+    'https://test.noxarianet.web.id'
 ];
 if (process.env.FRONTEND_URL) allowedOrigins.push(process.env.FRONTEND_URL);
 
@@ -74,6 +76,7 @@ app.use(express.json());
 // ROUTES — Public
 // ══════════════════════════════════════════════════════════════════════════
 
+app.use('/api/home', homeRoutes);
 app.use('/api/sekalipay', sekalipayRoutes);
 app.use('/api/products', productRoutes);
 app.use('/api/services', serviceRoutes);

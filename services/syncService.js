@@ -1,5 +1,6 @@
 const supabase = require('../supabase');
 const sekalipayService = require('./sekalipayService');
+const cacheService = require('./cacheService');
 
 /**
  * SyncService — Handles synchronization of Sekalipay products to local DB.
@@ -55,6 +56,15 @@ class SyncService {
         }
     }
 
+    getCategoryName(categoryId) {
+        const map = {
+            1: 'Aplikasi Premium',
+            3: 'Game',
+            4: 'E-Wallet'
+        };
+        return map[categoryId] || 'Lainnya';
+    }
+
     /**
      * Flatten Sekalipay API response into product rows.
      * 
@@ -66,10 +76,12 @@ class SyncService {
      *   Variants stored as JSONB array
      * 
      * @param {Array} items - Raw items from Sekalipay API
+     * @param {number} categoryId - The main category ID
      * @returns {Array} Flattened product rows ready for upsert
      */
-    flattenItems(items) {
+    flattenItems(items, categoryId) {
         const products = [];
+        const mainCat = this.getCategoryName(categoryId);
 
         for (const item of items) {
             if (!item.products || !Array.isArray(item.products)) continue;
@@ -81,9 +93,9 @@ class SyncService {
                     id: v.id,
                     sku: v.sku || '',
                     name: v.name || '',
-                    base_price: v.price || 0,
+                    base_price: Math.ceil(v.price || 0),
                     markup: 0,           // Default markup, admin can override
-                    sell_price: v.price || 0,  // base_price + markup
+                    sell_price: Math.ceil(v.price || 0),  // base_price + markup
                     stock: v.stock || 0,
                     order_process: v.order_process || 'manual',
                     h2h_provider: v.h2h_provider || null,
@@ -96,8 +108,8 @@ class SyncService {
                 products.push({
                     sekalipay_item_id: item.id,
                     sekalipay_product_id: product.id,
-                    category: item.name || 'Uncategorized',
-                    name: product.name || 'Unknown Product',
+                    category: mainCat,
+                    name: product.name || item.name || 'Unknown Product',
                     icon: item.icon || null,
                     image: product.image || null,
                     variants,
@@ -133,7 +145,7 @@ class SyncService {
                 return {
                     ...newV,
                     markup,
-                    sell_price: newV.base_price + markup,
+                    sell_price: Math.ceil(newV.base_price + markup),
                 };
             }
             return newV;
@@ -149,20 +161,31 @@ class SyncService {
     async fullSync() {
         console.log('[SyncService] Starting full sync...');
         try {
-            const result = await sekalipayService.fetchAllItems(1);
-            if (!result.success) {
-                console.error('[SyncService] Failed to fetch items:', result.message);
-                return { success: false, error: result.message };
+            const categoriesToSync = [1, 3, 4];
+            let items = [];
+            let lastServerTime = null;
+
+            for (const cat of categoriesToSync) {
+                const result = await sekalipayService.fetchAllItems(cat);
+                if (!result.success) {
+                    console.error(`[SyncService] Failed to fetch items for category ${cat}:`, result.message);
+                    continue;
+                }
+                if (result.data) {
+                    const flattened = this.flattenItems(result.data, cat);
+                    items = items.concat(flattened);
+                }
+                if (result.serverTime) {
+                    lastServerTime = result.serverTime;
+                }
             }
 
-            const items = result.data;
             if (!items || items.length === 0) {
                 console.log('[SyncService] No items returned from Sekalipay.');
                 return { success: true, itemCount: 0, productCount: 0 };
             }
 
-            const newProducts = this.flattenItems(items);
-            console.log(`[SyncService] Flattened ${items.length} items into ${newProducts.length} products.`);
+            console.log(`[SyncService] Flattened items into products.`);
 
             // Fetch existing products to preserve markups
             const { data: existingProducts } = await supabase
@@ -180,8 +203,8 @@ class SyncService {
             let upsertedCount = 0;
             const batchSize = 50;
 
-            for (let i = 0; i < newProducts.length; i += batchSize) {
-                const batch = newProducts.slice(i, i + batchSize).map(product => {
+            for (let i = 0; i < items.length; i += batchSize) {
+                const batch = items.slice(i, i + batchSize).map(product => {
                     const existingVars = existingMap[product.sekalipay_product_id];
                     if (existingVars) {
                         product.variants = this.mergeVariants(existingVars, product.variants);
@@ -201,7 +224,7 @@ class SyncService {
             }
 
             // Optionally: deactivate products no longer in Sekalipay
-            const activeProductIds = newProducts.map(p => p.sekalipay_product_id);
+            const activeProductIds = items.map(p => p.sekalipay_product_id);
             if (activeProductIds.length > 0) {
                 await supabase
                     .from('products')
@@ -210,13 +233,17 @@ class SyncService {
             }
 
             // Save sync metadata
-            await this.setLastSyncTime(result.serverTime, {
+            await this.setLastSyncTime(lastServerTime || new Date().toISOString(), {
                 type: 'full',
                 itemCount: items.length,
                 productCount: upsertedCount,
             });
 
             console.log(`[SyncService] Full sync completed. ${upsertedCount} products upserted.`);
+            
+            // Invalidate home page cache after sync
+            cacheService.invalidateHome();
+
             return {
                 success: true,
                 itemCount: items.length,
@@ -244,16 +271,28 @@ class SyncService {
         }
 
         try {
-            const result = await sekalipayService.fetchItemsDelta(lastSync, 1);
-            if (!result.success) {
-                console.error('[SyncService] Failed to fetch delta items:', result.message);
-                return { success: false, error: result.message };
+            const categoriesToSync = [1, 3, 4];
+            let items = [];
+            let lastServerTime = null;
+
+            for (const cat of categoriesToSync) {
+                const result = await sekalipayService.fetchItemsDelta(lastSync, cat);
+                if (!result.success) {
+                    console.error(`[SyncService] Failed to fetch delta items for category ${cat}:`, result.message);
+                    continue;
+                }
+                if (result.data) {
+                    const flattened = this.flattenItems(result.data, cat);
+                    items = items.concat(flattened);
+                }
+                if (result.serverTime) {
+                    lastServerTime = result.serverTime;
+                }
             }
 
-            const items = result.data;
             if (!items || items.length === 0) {
                 console.log('[SyncService] No items changed since last sync.');
-                await this.setLastSyncTime(result.serverTime, {
+                await this.setLastSyncTime(lastServerTime || new Date().toISOString(), {
                     type: 'delta',
                     itemCount: 0,
                     productCount: 0,
@@ -261,8 +300,8 @@ class SyncService {
                 return { success: true, itemCount: 0, productCount: 0 };
             }
 
-            const newProducts = this.flattenItems(items);
-            console.log(`[SyncService] Delta: ${items.length} items → ${newProducts.length} products changed.`);
+            const newProducts = items;
+            console.log(`[SyncService] Delta: ${newProducts.length} products changed.`);
 
             // Fetch existing to preserve markups
             const changedIds = newProducts.map(p => p.sekalipay_product_id);
@@ -302,13 +341,17 @@ class SyncService {
                 }
             }
 
-            await this.setLastSyncTime(result.serverTime, {
+            await this.setLastSyncTime(lastServerTime || new Date().toISOString(), {
                 type: 'delta',
                 itemCount: items.length,
                 productCount: upsertedCount,
             });
 
             console.log(`[SyncService] Delta sync completed. ${upsertedCount} products updated.`);
+            
+            // Invalidate home page cache after sync
+            cacheService.invalidateHome();
+
             return {
                 success: true,
                 itemCount: items.length,
@@ -348,7 +391,7 @@ class SyncService {
                     return {
                         ...v,
                         markup: Math.max(0, markup), // No negative markups
-                        sell_price: v.base_price + Math.max(0, markup),
+                        sell_price: Math.ceil(v.base_price + Math.max(0, markup)),
                     };
                 }
                 return v;
@@ -391,7 +434,7 @@ class SyncService {
             const variants = (product.variants || []).map(v => ({
                 ...v,
                 markup: Math.max(0, markup),
-                sell_price: v.base_price + Math.max(0, markup),
+                sell_price: Math.ceil(v.base_price + Math.max(0, markup)),
             }));
 
             const { error: updateError } = await supabase
@@ -430,7 +473,7 @@ class SyncService {
                 const variants = (product.variants || []).map(v => ({
                     ...v,
                     markup: Math.max(0, markup),
-                    sell_price: v.base_price + Math.max(0, markup),
+                    sell_price: Math.ceil(v.base_price + Math.max(0, markup)),
                 }));
 
                 const { error } = await supabase

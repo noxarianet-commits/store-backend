@@ -72,7 +72,7 @@ async function handlePaymentGatewayWebhook(req, res) {
     // ── Hanya proses jika status "success" ────────────────────────────────
     if (status !== 'success') {
         console.log(`[Webhook/PG-FinCloud] Status bukan "success" (${status}), dilewati.`);
-        return res.sendStatus(200);
+        return res.status(200).json({ message: 'Status not success, ignored' });
     }
 
     if (!reffId) {
@@ -94,7 +94,7 @@ async function handlePaymentGatewayWebhook(req, res) {
     // ── Idempotency check — jangan proses dua kali ────────────────────────
     if (order.status !== 'PENDING') {
         console.log(`[Webhook/PG-FinCloud] Order ${reffId} sudah diproses (status: ${order.status}), skip.`);
-        return res.sendStatus(200);
+        return res.status(200).json({ message: 'Order already processed' });
     }
 
     // ── Verifikasi via API (opsional, untuk extra security) ───────────────
@@ -105,7 +105,7 @@ async function handlePaymentGatewayWebhook(req, res) {
             const apiStatus = checkResult.data.status;
             if (apiStatus !== 'success') {
                 console.warn(`[Webhook/PG-FinCloud] API verification says status=${apiStatus}, bukan success. Skip.`);
-                return res.sendStatus(200);
+                return res.status(200).json({ message: 'API verification failed' });
             }
             console.log(`[Webhook/PG-FinCloud] API verification OK: id_depo=${idDepo}, status=${apiStatus}`);
         } else {
@@ -135,7 +135,7 @@ async function handlePaymentGatewayWebhook(req, res) {
         {
             item_id: variantId,
             quantity: 1,
-            note: '-',
+            note: order.account_details?.sekalipay_note || '-',
         },
     ];
 

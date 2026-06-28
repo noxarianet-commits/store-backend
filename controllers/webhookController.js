@@ -195,13 +195,14 @@ async function handleSekalipayWebhook(req, res) {
     const dataStatus =
         event === 'webhook.test'
             ? 'test'
-            : event === 'order.item.sent'
-            ? (data.item?.status || '')
-            : (data.status || '');
+            : (data.status || data.item?.status || '');
 
     // ── Verifikasi signature ──────────────────────────────────────────────
     const webhookSecret = process.env.SEKALIPAY_WEBHOOK_SECRET || '';
     const expectedSig = buildSekalipaySignature(refId, invoice, dataStatus, webhookSecret);
+
+    console.log(`[Webhook/Sekalipay] Signature debug: ref_id="${refId}", invoice="${invoice}", status="${dataStatus}"`);
+    console.log(`[Webhook/Sekalipay] Signature received="${receivedSig}", expected="${expectedSig}"`);
 
     if (!timingSafeCompare(receivedSig, expectedSig)) {
         console.warn('[Webhook/Sekalipay] Invalid signature — request ditolak.');

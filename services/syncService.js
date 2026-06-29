@@ -103,6 +103,7 @@ class SyncService {
                     required_fields: v.required_fields || [],
                     validation: v.validation || null,
                     updated_at: v.updated_at || null,
+                    is_hidden: false,
                 }));
 
                 products.push({
@@ -140,11 +141,13 @@ class SyncService {
         return newVariants.map(newV => {
             const existing = existingMap[newV.id];
             if (existing) {
-                // Preserve admin markup, update everything else
+                // Preserve admin markup and hidden state, update everything else
                 const markup = existing.markup || 0;
+                const isHidden = existing.is_hidden || false;
                 return {
                     ...newV,
                     markup,
+                    is_hidden: isHidden,
                     sell_price: Math.ceil(newV.base_price + markup),
                 };
             }

@@ -267,4 +267,56 @@ router.get('/featured', async (req, res) => {
     }
 });
 
+/**
+ * PATCH /api/admin/sekalipay/products/:id/variant/:variantId/toggle-hidden
+ * Toggle is_hidden status of a specific variant within a product.
+ */
+router.patch('/products/:id/variant/:variantId/toggle-hidden', async (req, res) => {
+    try {
+        const productId = parseInt(req.params.id);
+        const variantId = parseInt(req.params.variantId);
+
+        // Fetch current product
+        const { data: product, error: fetchError } = await supabase
+            .from('products')
+            .select('variants')
+            .eq('id', productId)
+            .single();
+
+        if (fetchError || !product) {
+            return res.status(404).json({ error: 'Produk tidak ditemukan' });
+        }
+
+        // Toggle is_hidden for the specific variant
+        let found = false;
+        let newHiddenState = false;
+        const variants = (product.variants || []).map(v => {
+            if (v.id === variantId) {
+                found = true;
+                newHiddenState = !v.is_hidden;
+                return { ...v, is_hidden: newHiddenState };
+            }
+            return v;
+        });
+
+        if (!found) {
+            return res.status(404).json({ error: 'Varian tidak ditemukan' });
+        }
+
+        const { error: updateError } = await supabase
+            .from('products')
+            .update({ variants })
+            .eq('id', productId);
+
+        if (updateError) throw updateError;
+
+        // Invalidate home cache
+        cacheService.invalidateHome();
+
+        res.json({ success: true, is_hidden: newHiddenState });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
 module.exports = router;

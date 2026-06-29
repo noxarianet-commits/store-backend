@@ -42,6 +42,7 @@ router.get('/items', async (req, res) => {
         const publicProducts = (data || []).map(p => ({
             ...p,
             variants: (p.variants || [])
+                .filter(v => !v.is_hidden)
                 .map(v => ({
                     id: v.id,
                     sku: v.sku,
@@ -91,7 +92,7 @@ router.get('/items/:id', async (req, res) => {
         // Public view — show sell_price as "price"
         const publicProduct = {
             ...data,
-            variants: (data.variants || []).map(v => ({
+            variants: (data.variants || []).filter(v => !v.is_hidden).map(v => ({
                 id: v.id,
                 sku: v.sku,
                 name: v.name,

@@ -23,7 +23,7 @@ function slugify(text) {
 function toPublicProduct(product) {
     return {
         ...product,
-        variants: (product.variants || []).map(v => ({
+        variants: (product.variants || []).filter(v => !v.is_hidden).map(v => ({
             id: v.id,
             sku: v.sku,
             name: v.name,
@@ -144,6 +144,7 @@ async function getHomePage(req, res) {
             settings: settingsMap,
             categories: Object.values(categoryMap),
             featured_products: featured,
+            all_products: allProducts.map(toPublicProduct),
             testimonials: testimonialsResult.data || [],
         };
 

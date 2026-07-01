@@ -1,5 +1,6 @@
 const supabase = require('../supabase');
 const sekalipayService = require('./sekalipayService');
+const { normalizeNotePhoneNumber } = require('../utils/phoneUtils');
 
 /**
  * Service to handle order fulfillment centrally.
@@ -51,11 +52,14 @@ class OrderFulfillmentService {
                 return { success: false, message: 'Missing variant_id' };
             }
 
+            const rawNote = order.account_details?.sekalipay_note || '-';
+            const note = normalizeNotePhoneNumber(rawNote);
+
             const carts = [
                 {
                     item_id: variantId,
                     quantity: 1,
-                    note: '-',
+                    note,
                 },
             ];
 

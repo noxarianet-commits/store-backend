@@ -1,6 +1,7 @@
 const supabase = require('../supabase');
 const paymentGatewayService = require('../services/paymentGatewayService');
 const paymentPollingService = require('../services/paymentPollingService');
+const { normalizeNotePhoneNumber } = require('../utils/phoneUtils');
 
 // ══════════════════════════════════════════════════════════════════════════
 // HELPER
@@ -147,7 +148,7 @@ async function createPayment(req, res) {
                 sekalipay_variant_id: variant_id,
 
                 // Simpan note ke account_details
-                account_details: note ? { sekalipay_note: note } : null,
+                account_details: note ? { sekalipay_note: normalizeNotePhoneNumber(note) } : null,
 
                 timestamp: new Date().toISOString(),
             },

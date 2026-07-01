@@ -141,6 +141,32 @@ class PaymentPollingService {
             console.error(`[Polling/PG-FinCloud] Error memproses order ${reffId}:`, err);
         }
     }
+
+    async cancelExpiredOrders() {
+        try {
+            // Waktu 30 menit yang lalu
+            const expiredTime = new Date();
+            expiredTime.setMinutes(expiredTime.getMinutes() - 30);
+
+            const { data: orders, error } = await supabase
+                .from('orders')
+                .update({ status: 'CANCELED', error_message: 'Expired: Unpaid for more than 30 minutes' })
+                .eq('status', 'PENDING')
+                .lt('timestamp', expiredTime.toISOString())
+                .select('id');
+
+            if (error) {
+                console.error('[Polling/PG-FinCloud] Gagal update status order expired:', error.message);
+                return;
+            }
+
+            if (orders && orders.length > 0) {
+                console.log(`[Polling/PG-FinCloud] Berhasil membatalkan ${orders.length} order kedaluwarsa (> 30 menit).`);
+            }
+        } catch (err) {
+            console.error('[Polling/PG-FinCloud] Error dalam membatalkan order kedaluwarsa:', err);
+        }
+    }
 }
 
 module.exports = new PaymentPollingService();

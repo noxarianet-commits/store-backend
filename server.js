@@ -127,6 +127,7 @@ const paymentPollingService = require('./services/paymentPollingService');
 cron.schedule('* * * * *', async () => {
     // Run every minute
     await paymentPollingService.pollPendingOrders();
+    await paymentPollingService.cancelExpiredOrders();
 });
 
 console.log('[CRON] Sekalipay sync scheduled: delta every 3h, full daily at 03:00');

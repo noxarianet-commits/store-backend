@@ -39,8 +39,6 @@ async function create(req, res) {
                 name,
                 text,
                 product: product || null,
-                rating: ratingVal,
-                order_id: order_id || null,
             }])
             .select()
             .single();

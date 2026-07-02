@@ -150,7 +150,7 @@ class PaymentPollingService {
 
             const { data: orders, error } = await supabase
                 .from('orders')
-                .update({ status: 'CANCELED', error_message: 'Expired: Unpaid for more than 30 minutes' })
+                .update({ status: 'CANCELLED', error_message: 'Expired: Unpaid for more than 30 minutes' })
                 .eq('status', 'PENDING')
                 .lt('timestamp', expiredTime.toISOString())
                 .select('id');

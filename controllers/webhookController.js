@@ -285,6 +285,21 @@ async function handleSekalipayWebhook(req, res) {
         return res.sendStatus(200);
     }
 
+    // ── order.refunded / order.refounded ──────────────────────────────────
+    if (event === 'order.refunded' || event === 'order.refounded') {
+        await supabase
+            .from('orders')
+            .update({
+                status: 'FAILED',
+                error_message: 'Nomor tujuan salah atau tidak valid (refund). Silakan hubungi admin.',
+                sekalipay_invoice: invoice,
+            })
+            .eq('id', order.id);
+
+        console.log(`[Webhook/Sekalipay] Order ${order.id} REFUNDED/REFOUNDED.`);
+        return res.sendStatus(200);
+    }
+
     // ── Event lain — abaikan ──────────────────────────────────────────────
     console.log(`[Webhook/Sekalipay] Event ${event} tidak diproses.`);
     return res.sendStatus(200);

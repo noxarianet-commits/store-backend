@@ -201,8 +201,8 @@ async function handleSekalipayWebhook(req, res) {
     const webhookSecret = process.env.SEKALIPAY_WEBHOOK_SECRET || '';
     const expectedSig = buildSekalipaySignature(refId, invoice, dataStatus, webhookSecret);
 
-    console.log(`[Webhook/Sekalipay] Signature debug: ref_id="${refId}", invoice="${invoice}", status="${dataStatus}"`);
-    console.log(`[Webhook/Sekalipay] Signature received="${receivedSig}", expected="${expectedSig}"`);
+    // console.log(`[Webhook/Sekalipay] Signature debug: ref_id="${refId}", invoice="${invoice}", status="${dataStatus}"`);
+    // console.log(`[Webhook/Sekalipay] Signature received="${receivedSig}", expected="${expectedSig}"`);
 
     if (!timingSafeCompare(receivedSig, expectedSig)) {
         console.warn('[Webhook/Sekalipay] Invalid signature — request ditolak.');
@@ -285,18 +285,19 @@ async function handleSekalipayWebhook(req, res) {
         return res.sendStatus(200);
     }
 
-    // ── order.refunded / order.refounded ──────────────────────────────────
-    if (event === 'order.refunded' || event === 'order.refounded') {
+    // ── order.refunded ──────────────────────────────────
+    if (event === 'order.refunded') {
+        const rawPayloadStr = JSON.stringify(payload);
         await supabase
             .from('orders')
             .update({
                 status: 'FAILED',
-                error_message: 'Nomor tujuan salah atau tidak valid (refund). Silakan hubungi admin.',
+                error_message: `Nomor tujuan salah atau tidak valid (refund). Response: ${rawPayloadStr}`,
                 sekalipay_invoice: invoice,
             })
             .eq('id', order.id);
 
-        console.log(`[Webhook/Sekalipay] Order ${order.id} REFUNDED/REFOUNDED.`);
+        console.log(`[Webhook/Sekalipay] Order ${order.id} REFUNDED/REFOUNDED. Payload: ${rawPayloadStr}`);
         return res.sendStatus(200);
     }
 

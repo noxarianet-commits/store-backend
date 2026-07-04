@@ -190,15 +190,19 @@ class SyncService {
 
             console.log(`[SyncService] Flattened items into products.`);
 
-            // Fetch existing products to preserve markups
+            // Fetch existing products to preserve markups, is_active, is_featured
             const { data: existingProducts } = await supabase
                 .from('products')
-                .select('sekalipay_product_id, variants');
+                .select('sekalipay_product_id, variants, is_active, is_featured');
 
             const existingMap = {};
             if (existingProducts) {
                 for (const ep of existingProducts) {
-                    existingMap[ep.sekalipay_product_id] = ep.variants;
+                    existingMap[ep.sekalipay_product_id] = {
+                        variants: ep.variants,
+                        is_active: ep.is_active,
+                        is_featured: ep.is_featured,
+                    };
                 }
             }
 
@@ -208,9 +212,14 @@ class SyncService {
 
             for (let i = 0; i < items.length; i += batchSize) {
                 const batch = items.slice(i, i + batchSize).map(product => {
-                    const existingVars = existingMap[product.sekalipay_product_id];
-                    if (existingVars) {
-                        product.variants = this.mergeVariants(existingVars, product.variants);
+                    const existing = existingMap[product.sekalipay_product_id];
+                    if (existing) {
+                        product.variants = this.mergeVariants(existing.variants, product.variants);
+                        // Preserve admin-set values
+                        product.is_active = existing.is_active;
+                        if (existing.is_featured !== undefined) {
+                            product.is_featured = existing.is_featured;
+                        }
                     }
                     return product;
                 });
@@ -306,17 +315,21 @@ class SyncService {
             const newProducts = items;
             console.log(`[SyncService] Delta: ${newProducts.length} products changed.`);
 
-            // Fetch existing to preserve markups
+            // Fetch existing to preserve markups, is_active, is_featured
             const changedIds = newProducts.map(p => p.sekalipay_product_id);
             const { data: existingProducts } = await supabase
                 .from('products')
-                .select('sekalipay_product_id, variants')
+                .select('sekalipay_product_id, variants, is_active, is_featured')
                 .in('sekalipay_product_id', changedIds);
 
             const existingMap = {};
             if (existingProducts) {
                 for (const ep of existingProducts) {
-                    existingMap[ep.sekalipay_product_id] = ep.variants;
+                    existingMap[ep.sekalipay_product_id] = {
+                        variants: ep.variants,
+                        is_active: ep.is_active,
+                        is_featured: ep.is_featured,
+                    };
                 }
             }
 
@@ -326,9 +339,14 @@ class SyncService {
 
             for (let i = 0; i < newProducts.length; i += batchSize) {
                 const batch = newProducts.slice(i, i + batchSize).map(product => {
-                    const existingVars = existingMap[product.sekalipay_product_id];
-                    if (existingVars) {
-                        product.variants = this.mergeVariants(existingVars, product.variants);
+                    const existing = existingMap[product.sekalipay_product_id];
+                    if (existing) {
+                        product.variants = this.mergeVariants(existing.variants, product.variants);
+                        // Preserve admin-set values
+                        product.is_active = existing.is_active;
+                        if (existing.is_featured !== undefined) {
+                            product.is_featured = existing.is_featured;
+                        }
                     }
                     return product;
                 });

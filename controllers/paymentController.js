@@ -1,6 +1,7 @@
 const supabase = require('../supabase');
 const paymentGatewayService = require('../services/paymentGatewayService');
 const paymentPollingService = require('../services/paymentPollingService');
+const sekalipayService = require('../services/sekalipayService');
 const { normalizeNotePhoneNumber } = require('../utils/phoneUtils');
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -96,6 +97,29 @@ async function createPayment(req, res) {
 
         if (expectedAmount < 1000) {
             return res.status(400).json({ error: 'Minimal pembayaran Rp 1.000' });
+        }
+
+        // ── Cek stok real-time dari Sekalipay sebelum buat QRIS ──
+        if (dbProduct.sekalipay_product_id) {
+            const stockCheck = await sekalipayService.fetchItemDetail(variant_id);
+            if (stockCheck.success && stockCheck.data) {
+                const liveStock = stockCheck.data.stock;
+                if (liveStock !== undefined && liveStock <= 0) {
+                    console.warn(`[paymentController] Stok habis untuk variant ${variant_id} (live stock: ${liveStock})`);
+                    // Update stok di DB lokal agar frontend segera update
+                    const updatedVariants = (dbProduct.variants || []).map(v =>
+                        v.id === variant_id ? { ...v, stock: 0 } : v
+                    );
+                    await supabase
+                        .from('products')
+                        .update({ variants: updatedVariants })
+                        .eq('id', product_id);
+                    return res.status(400).json({ error: 'Maaf, stok untuk varian ini sedang habis. Silakan pilih varian lain atau coba lagi nanti.' });
+                }
+            } else {
+                // Jika API gagal, log warning tapi lanjutkan (jangan block checkout)
+                console.warn(`[paymentController] Gagal cek stok real-time untuk variant ${variant_id}, lanjutkan checkout.`);
+            }
         }
 
         // ── Generate order ID ───────────────────────────────────

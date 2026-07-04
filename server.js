@@ -98,7 +98,7 @@ app.use('/api/admin', adminRoutes);
 // SEKALIPAY CRON JOBS
 // ══════════════════════════════════════════════════════════════════════════
 
-cron.schedule('0 */3 * * *', async () => {
+cron.schedule('0 * * * *', async () => {
     console.log('[CRON] Starting Sekalipay delta sync...');
     try {
         const result = await syncService.deltaSync();
@@ -130,7 +130,7 @@ cron.schedule('* * * * *', async () => {
     await paymentPollingService.cancelExpiredOrders();
 });
 
-console.log('[CRON] Sekalipay sync scheduled: delta every 3h, full daily at 03:00');
+console.log('[CRON] Sekalipay sync scheduled: delta every 1h, full daily at 03:00');
 console.log('[CRON] Payment polling scheduled: every 1 minute');
 
 // ══════════════════════════════════════════════════════════════════════════

@@ -33,6 +33,24 @@ function generateOrderId() {
 
 async function createPayment(req, res) {
     try {
+        // ── Cek status toko (buka/tutup) ────────────────────────
+        const { data: statusSetting, error: statusError } = await supabase
+            .from('settings')
+            .select('*')
+            .eq('key', 'shop_status')
+            .single();
+
+        let shopOpen = true;
+        if (!statusError && statusSetting) {
+            shopOpen = statusSetting.value?.isOpen !== false;
+        }
+
+        if (!shopOpen) {
+            return res.status(403).json({
+                error: statusSetting?.value?.message || 'Toko sedang tutup. Silakan coba lagi nanti.'
+            });
+        }
+
         const {
             product_id,
             variant_id,

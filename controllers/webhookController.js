@@ -305,7 +305,7 @@ async function handleSekalipayWebhook(req, res) {
             .from('orders')
             .update({
                 status: 'FAILED',
-                error_message: `Nomor tujuan salah atau tidak valid (refund). Response: ${rawPayloadStr}`,
+                error_message: `Nomor tujuan salah atau tidak valid (refund)`,
                 sekalipay_invoice: invoice,
             })
             .eq('id', order.id);

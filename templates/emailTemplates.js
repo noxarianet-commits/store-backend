@@ -41,17 +41,58 @@ function buildAccountDetailsHtml(accountDetails) {
         return '<p style="color:#888; font-style:italic;">Tidak ada data akun tersedia.</p>';
     }
 
+    const displayTexts = [];
+
     const licenses = accountDetails.licenses || [];
     const rawItems = accountDetails.raw_items || [];
 
-    // Jika ada licenses (produk auto)
-    if (licenses.length > 0) {
-        const rows = licenses.map((license, idx) => `
+    // Extract from top-level licenses
+    licenses.forEach(lic => {
+        if (typeof lic === 'string') {
+            displayTexts.push(lic);
+        } else if (lic && lic.product_license) {
+            displayTexts.push(lic.product_license);
+        } else if (lic && lic.sn) {
+            displayTexts.push(lic.sn);
+        } else if (lic && typeof lic === 'object') {
+            displayTexts.push(JSON.stringify(lic));
+        }
+    });
+
+    // Extract from raw_items (for h2h or unmapped licenses)
+    rawItems.forEach(item => {
+        if (item.h2h_results && item.h2h_results.sn) {
+            displayTexts.push(item.h2h_results.sn);
+        } else if (item.h2h_results && item.h2h_results.ref_id) {
+            displayTexts.push("Ref ID: " + item.h2h_results.ref_id);
+        }
+        
+        const itemLicenses = item.licenses || [];
+        itemLicenses.forEach(lic => {
+            let text = '';
+            if (typeof lic === 'string') {
+                text = lic;
+            } else if (lic && lic.product_license) {
+                text = lic.product_license;
+            } else if (lic && lic.sn) {
+                text = lic.sn;
+            }
+            if (text && !displayTexts.includes(text)) {
+                displayTexts.push(text);
+            }
+        });
+    });
+
+    const validTexts = displayTexts.filter(t => t);
+
+    // Jika ada data yang bisa diekstrak
+    if (validTexts.length > 0) {
+        const rows = validTexts.map((text, idx) => `
             <tr>
                 <td style="padding:10px 14px; border-bottom:1px solid #eee; color:#555; font-size:14px;">${idx + 1}</td>
                 <td style="padding:10px 14px; border-bottom:1px solid #eee; font-size:14px;">
                     <code style="background:#f0f4ff; padding:4px 8px; border-radius:4px; color:#1a237e; font-weight:600; word-break:break-all;">
-                        ${escapeHtml(license)}
+                        ${escapeHtml(text)}
                     </code>
                 </td>
             </tr>
@@ -72,14 +113,10 @@ function buildAccountDetailsHtml(accountDetails) {
         `;
     }
 
-    // Jika ada raw_items tapi tidak ada licenses
+    // Jika ada raw_items tapi tidak ada licenses yang terekstrak
     if (rawItems.length > 0) {
         const itemDetails = rawItems.map(item => {
-            const itemLicenses = item.licenses || [];
-            if (itemLicenses.length > 0) {
-                return itemLicenses.map(l => `<code style="background:#f0f4ff; padding:4px 8px; border-radius:4px; color:#1a237e; font-weight:600; word-break:break-all;">${escapeHtml(l)}</code>`).join('<br/>');
-            }
-            return `<span style="color:#888;">${escapeHtml(item.name || 'Item')} - Menunggu proses</span>`;
+            return `<span style="color:#888;">${escapeHtml(item.product_name || item.name || 'Item')} - Sedang diproses / Data tidak terbaca</span>`;
         }).join('<br/><br/>');
 
         return `<div style="padding:12px; background:#fafbff; border-radius:8px; border:1px solid #e0e0e0;">${itemDetails}</div>`;
@@ -258,7 +295,7 @@ function buildFailedEmailHtml(order) {
                             <div style="background:#e3f2fd; border-left:4px solid #1565c0; padding:14px 18px; border-radius:0 8px 8px 0; margin:0 0 20px;">
                                 <p style="margin:0; color:#0d47a1; font-size:13px; font-weight:600;">ℹ️ Apa yang harus dilakukan?</p>
                                 <p style="margin:6px 0 0; color:#1565c0; font-size:13px; line-height:1.5;">
-                                    Jika Anda sudah melakukan pembayaran, dana akan dikembalikan secara otomatis (refund). 
+                                    nomor tujuan salah atau tidak valid/server sedang bermasalah. Silakan periksa kembali nomor tujuan Anda
                                     Silakan hubungi Admin kami via WhatsApp untuk bantuan lebih lanjut.
                                 </p>
                             </div>

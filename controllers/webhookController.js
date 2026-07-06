@@ -2,6 +2,7 @@ const crypto = require('crypto');
 const supabase = require('../supabase');
 const paymentGatewayService = require('../services/paymentGatewayService');
 const sekalipayService = require('../services/sekalipayService');
+const emailService = require('../services/emailService');
 
 // ══════════════════════════════════════════════════════════════════════════
 // HELPER — Sekalipay Reseller Webhook Signature Verification
@@ -218,7 +219,7 @@ async function handleSekalipayWebhook(req, res) {
     // ── Ambil order dari Supabase via sekalipay_ref_id ────────────────────
     const { data: order, error: fetchError } = await supabase
         .from('orders')
-        .select('id, status')
+        .select('*')
         .eq('sekalipay_ref_id', refId)
         .single();
 
@@ -265,6 +266,13 @@ async function handleSekalipayWebhook(req, res) {
             console.error(`[Webhook/Sekalipay] Gagal update order ${order.id}:`, updateError.message);
         } else {
             console.log(`[Webhook/Sekalipay] Order ${order.id} COMPLETED. Licenses: ${allLicenses.length}`);
+
+            // Kirim email notifikasi sukses ke pembeli (fire-and-forget)
+            emailService.sendOrderCompletedEmail({
+                ...order,
+                account_details: accountDetails,
+                sekalipay_invoice: invoice,
+            }).catch(err => console.error(`[Webhook/Sekalipay] Email completed gagal:`, err.message));
         }
 
         return res.sendStatus(200);
@@ -282,6 +290,11 @@ async function handleSekalipayWebhook(req, res) {
             .eq('id', order.id);
 
         console.log(`[Webhook/Sekalipay] Order ${order.id} CANCELLED.`);
+
+        // Kirim email notifikasi gagal ke pembeli (fire-and-forget)
+        emailService.sendOrderFailedEmail(order)
+            .catch(err => console.error(`[Webhook/Sekalipay] Email failed gagal:`, err.message));
+
         return res.sendStatus(200);
     }
 
@@ -298,6 +311,11 @@ async function handleSekalipayWebhook(req, res) {
             .eq('id', order.id);
 
         console.log(`[Webhook/Sekalipay] Order ${order.id} REFUNDED/REFOUNDED. Payload: ${rawPayloadStr}`);
+
+        // Kirim email notifikasi gagal ke pembeli (fire-and-forget)
+        emailService.sendOrderFailedEmail(order)
+            .catch(err => console.error(`[Webhook/Sekalipay] Email refunded gagal:`, err.message));
+
         return res.sendStatus(200);
     }
 

@@ -94,8 +94,8 @@ class SyncService {
                     sku: v.sku || '',
                     name: v.name || '',
                     base_price: Math.ceil(v.price || 0),
-                    markup: 0,           // Default markup, admin can override
-                    sell_price: Math.ceil(v.price || 0),  // base_price + markup
+                    markup: 1000,        // Default markup, admin can override
+                    sell_price: Math.ceil(v.price || 0) + 1000,  // base_price + markup
                     stock: v.stock || 0,
                     order_process: v.order_process || 'manual',
                     h2h_provider: v.h2h_provider || null,
@@ -141,9 +141,13 @@ class SyncService {
         return newVariants.map(newV => {
             const existing = existingMap[newV.id];
             if (existing) {
-                // Preserve admin markup and hidden state, update everything else
-                const markup = existing.markup || 0;
+                // Detect if variant changed (price or name) from previous sync state
+                const isChanged = existing.base_price !== newV.base_price || existing.name !== newV.name;
+                
+                // If changed, reset to default 1000. If not, preserve admin markup.
+                const markup = isChanged ? 1000 : (existing.markup !== undefined ? existing.markup : 1000);
                 const isHidden = existing.is_hidden || false;
+                
                 return {
                     ...newV,
                     markup,

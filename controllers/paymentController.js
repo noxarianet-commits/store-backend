@@ -120,23 +120,25 @@ async function createPayment(req, res) {
         // ── Cek stok real-time dari Sekalipay sebelum buat QRIS ──
         if (dbProduct.sekalipay_product_id) {
             const stockCheck = await sekalipayService.fetchItemDetail(variant_id);
-            if (stockCheck.success && stockCheck.data) {
-                const liveStock = stockCheck.data.stock;
-                if (liveStock !== undefined && liveStock <= 0) {
-                    console.warn(`[paymentController] Stok habis untuk variant ${variant_id} (live stock: ${liveStock})`);
-                    // Update stok di DB lokal agar frontend segera update
-                    const updatedVariants = (dbProduct.variants || []).map(v =>
-                        v.id === variant_id ? { ...v, stock: 0 } : v
-                    );
-                    await supabase
-                        .from('products')
-                        .update({ variants: updatedVariants })
-                        .eq('id', product_id);
-                    return res.status(400).json({ error: 'Maaf, stok untuk varian ini sedang habis. Silakan pilih varian lain atau coba lagi nanti.' });
-                }
-            } else {
-                // Jika API gagal, log warning tapi lanjutkan (jangan block checkout)
-                console.warn(`[paymentController] Gagal cek stok real-time untuk variant ${variant_id}, lanjutkan checkout.`);
+            
+            // JIKA API MERESPON ERROR ATAU PRODUK TIDAK VALID, BLOCK CHECKOUT
+            if (!stockCheck.success || !stockCheck.data) {
+                console.warn(`[paymentController] Validasi gagal untuk variant ${variant_id}:`, stockCheck.message || 'Unknown Error');
+                return res.status(400).json({ error: 'Produk saat ini sedang tidak tersedia atau tidak valid di sistem penyedia. Silakan coba beberapa saat lagi.' });
+            }
+
+            const liveStock = stockCheck.data.stock;
+            if (liveStock !== undefined && liveStock <= 0) {
+                console.warn(`[paymentController] Stok habis untuk variant ${variant_id} (live stock: ${liveStock})`);
+                // Update stok di DB lokal agar frontend segera update
+                const updatedVariants = (dbProduct.variants || []).map(v =>
+                    v.id === variant_id ? { ...v, stock: 0 } : v
+                );
+                await supabase
+                    .from('products')
+                    .update({ variants: updatedVariants })
+                    .eq('id', product_id);
+                return res.status(400).json({ error: 'Maaf, stok untuk varian ini sedang habis. Silakan pilih varian lain atau coba lagi nanti.' });
             }
         }
 

@@ -146,7 +146,8 @@ router.post('/validate', async (req, res) => {
 
         const result = await sekalipayService.validateAccount(item_id, customer_id, zone_id);
         if (!result.success) {
-            return res.status(result.status || 400).json({
+            const statusCode = result.status >= 500 ? 400 : (result.status || 400);
+            return res.status(statusCode).json({
                 error: result.message,
                 errors: result.errors,
             });

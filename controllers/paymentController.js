@@ -52,59 +52,125 @@ async function createPayment(req, res) {
         }
 
         const {
-            product_id,
-            variant_id,
+            vendor = 'sekalipay', // Default to sekalipay for backward compatibility
+            product_id, // For sekalipay: product.id, For fincloud: sku
+            variant_id, // For sekalipay
+            sku,        // For fincloud
             variant_name,
             product_name,
             amount,
             customer_name,
             wa_number,
             email,
-            note,           // string | json string (for sekalipay)
+            note,           // string | json string (for sekalipay), string (target for fincloud)
             provider_qty,   // number (for open denom)
         } = req.body;
 
-        // ── Validasi input ──────────────────────────────────────
-        if (!variant_id || !amount || !wa_number || !email) {
+        // ── Validasi input umum ──────────────────────────────────────
+        if (!amount || !wa_number || !email) {
             return res.status(400).json({
-                error: 'variant_id, amount, wa_number, dan email wajib diisi',
+                error: 'amount, wa_number, dan email wajib diisi',
             });
         }
         if (typeof amount !== 'number' || amount <= 0) {
             return res.status(400).json({ error: 'amount harus berupa angka positif' });
         }
-        // ── Ambil data produk dari DB untuk verifikasi harga ──────
-        const { data: dbProduct, error: fetchError } = await supabase
-            .from('products')
-            .select('*')
-            .eq('id', product_id)
-            .single();
-
-        if (fetchError || !dbProduct) {
-            return res.status(404).json({ error: 'Produk tidak ditemukan di sistem' });
-        }
-
-        // Cari variant yang sesuai
-        const variant = (dbProduct.variants || []).find(v => v.id === variant_id);
-        if (!variant) {
-            return res.status(404).json({ error: 'Variant tidak ditemukan' });
-        }
-
-        // Verifikasi Harga Secara Aman (Backend-side calculation)
+        
         let expectedAmount = 0;
-        if (variant.provider_meta && variant.provider_meta.open_denom) {
-            if (!provider_qty || typeof provider_qty !== 'number' || provider_qty <= 0) {
-                return res.status(400).json({ error: 'Nominal (provider_qty) wajib diisi untuk produk ini' });
+        let dbVariantId = null;
+        let dbSku = null;
+
+        if (vendor === 'fincloud') {
+            if (!product_id && !sku) {
+                return res.status(400).json({ error: 'sku wajib diisi untuk fincloud' });
             }
-            if (variant.provider_meta.min_qty && provider_qty < variant.provider_meta.min_qty) {
-                return res.status(400).json({ error: `Nominal minimal adalah ${variant.provider_meta.min_qty}` });
+            
+            dbSku = sku || product_id;
+
+            const { data: dbProduct, error: fetchError } = await supabase
+                .from('fincloud_products')
+                .select('*')
+                .eq('sku', dbSku)
+                .single();
+                
+            if (fetchError || !dbProduct) {
+                return res.status(404).json({ error: 'Produk Fincloud tidak ditemukan di sistem' });
             }
-            if (variant.provider_meta.max_qty && provider_qty > variant.provider_meta.max_qty) {
-                return res.status(400).json({ error: `Nominal maksimal adalah ${variant.provider_meta.max_qty}` });
+
+            if (!dbProduct.is_available) {
+                return res.status(400).json({ error: 'Maaf, produk Fincloud ini sedang tidak tersedia.' });
             }
-            expectedAmount = Math.ceil(provider_qty + (variant.sell_price || 0));
+            
+            expectedAmount = Math.ceil(dbProduct.sell_price || 0);
+            
+            // Note: Fincloud PPOB documentation doesn't specify a real-time stock check endpoint,
+            // so we skip real-time stock check for Fincloud PPOB.
+
         } else {
-            expectedAmount = Math.ceil(variant.sell_price || 0);
+            // Default: sekalipay
+            if (!variant_id) {
+                return res.status(400).json({ error: 'variant_id wajib diisi untuk sekalipay' });
+            }
+            
+            dbVariantId = variant_id;
+            
+            // ── Ambil data produk dari DB untuk verifikasi harga ──────
+            const { data: dbProduct, error: fetchError } = await supabase
+                .from('products')
+                .select('*')
+                .eq('id', product_id)
+                .single();
+
+            if (fetchError || !dbProduct) {
+                return res.status(404).json({ error: 'Produk tidak ditemukan di sistem' });
+            }
+
+            // Cari variant yang sesuai
+            const variant = (dbProduct.variants || []).find(v => v.id === dbVariantId);
+            if (!variant) {
+                return res.status(404).json({ error: 'Variant tidak ditemukan' });
+            }
+
+            // Verifikasi Harga Secara Aman (Backend-side calculation)
+            if (variant.provider_meta && variant.provider_meta.open_denom) {
+                if (!provider_qty || typeof provider_qty !== 'number' || provider_qty <= 0) {
+                    return res.status(400).json({ error: 'Nominal (provider_qty) wajib diisi untuk produk ini' });
+                }
+                if (variant.provider_meta.min_qty && provider_qty < variant.provider_meta.min_qty) {
+                    return res.status(400).json({ error: `Nominal minimal adalah ${variant.provider_meta.min_qty}` });
+                }
+                if (variant.provider_meta.max_qty && provider_qty > variant.provider_meta.max_qty) {
+                    return res.status(400).json({ error: `Nominal maksimal adalah ${variant.provider_meta.max_qty}` });
+                }
+                expectedAmount = Math.ceil(provider_qty + (variant.sell_price || 0));
+            } else {
+                expectedAmount = Math.ceil(variant.sell_price || 0);
+            }
+            
+            // ── Cek stok real-time dari Sekalipay sebelum buat QRIS ──
+            if (dbProduct.sekalipay_product_id) {
+                const stockCheck = await sekalipayService.fetchItemDetail(dbVariantId);
+                
+                // JIKA API MERESPON ERROR ATAU PRODUK TIDAK VALID, BLOCK CHECKOUT
+                if (!stockCheck.success || !stockCheck.data) {
+                    console.warn(`[paymentController] Validasi gagal untuk variant ${dbVariantId}:`, stockCheck.message || 'Unknown Error');
+                    return res.status(400).json({ error: 'Produk saat ini sedang tidak tersedia atau tidak valid di sistem penyedia. Silakan coba beberapa saat lagi.' });
+                }
+
+                const liveStock = stockCheck.data.stock;
+                if (liveStock !== undefined && liveStock <= 0) {
+                    console.warn(`[paymentController] Stok habis untuk variant ${dbVariantId} (live stock: ${liveStock})`);
+                    // Update stok di DB lokal agar frontend segera update
+                    const updatedVariants = (dbProduct.variants || []).map(v =>
+                        v.id === dbVariantId ? { ...v, stock: 0 } : v
+                    );
+                    await supabase
+                        .from('products')
+                        .update({ variants: updatedVariants })
+                        .eq('id', product_id);
+                    return res.status(400).json({ error: 'Maaf, stok untuk varian ini sedang habis. Silakan pilih varian lain atau coba lagi nanti.' });
+                }
+            }
         }
 
         // Jika harga dari frontend berbeda dengan perhitungan backend, tolak request
@@ -115,31 +181,6 @@ async function createPayment(req, res) {
 
         if (expectedAmount < 1000) {
             return res.status(400).json({ error: 'Minimal pembayaran Rp 1.000' });
-        }
-
-        // ── Cek stok real-time dari Sekalipay sebelum buat QRIS ──
-        if (dbProduct.sekalipay_product_id) {
-            const stockCheck = await sekalipayService.fetchItemDetail(variant_id);
-            
-            // JIKA API MERESPON ERROR ATAU PRODUK TIDAK VALID, BLOCK CHECKOUT
-            if (!stockCheck.success || !stockCheck.data) {
-                console.warn(`[paymentController] Validasi gagal untuk variant ${variant_id}:`, stockCheck.message || 'Unknown Error');
-                return res.status(400).json({ error: 'Produk saat ini sedang tidak tersedia atau tidak valid di sistem penyedia. Silakan coba beberapa saat lagi.' });
-            }
-
-            const liveStock = stockCheck.data.stock;
-            if (liveStock !== undefined && liveStock <= 0) {
-                console.warn(`[paymentController] Stok habis untuk variant ${variant_id} (live stock: ${liveStock})`);
-                // Update stok di DB lokal agar frontend segera update
-                const updatedVariants = (dbProduct.variants || []).map(v =>
-                    v.id === variant_id ? { ...v, stock: 0 } : v
-                );
-                await supabase
-                    .from('products')
-                    .update({ variants: updatedVariants })
-                    .eq('id', product_id);
-                return res.status(400).json({ error: 'Maaf, stok untuk varian ini sedang habis. Silakan pilih varian lain atau coba lagi nanti.' });
-            }
         }
 
         // ── Generate order ID ───────────────────────────────────
@@ -187,12 +228,17 @@ async function createPayment(req, res) {
                 pg_total: pgTotal,
                 pg_expired_at: null, // FinCloud tidak return expired_at
 
-                // Sekalipay Reseller (untuk auto-order setelah bayar)
-                sekalipay_ref_id: orderId,
-                sekalipay_variant_id: variant_id,
+                // Vendor Information
+                vendor,
+                fincloud_sku: dbSku,
+                sekalipay_ref_id: orderId, // Used as vendor_ref_id in fallback cases
+                sekalipay_variant_id: dbVariantId,
 
-                // Simpan note ke account_details
-                account_details: note ? { sekalipay_note: normalizeNotePhoneNumber(note) } : null,
+                // Simpan note/target ke account_details
+                account_details: note ? { 
+                    sekalipay_note: vendor === 'sekalipay' ? normalizeNotePhoneNumber(note) : null,
+                    target: vendor === 'fincloud' ? normalizeNotePhoneNumber(note) : null,
+                } : null,
 
                 timestamp: new Date().toISOString(),
             },

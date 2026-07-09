@@ -1,6 +1,7 @@
 const supabase = require('../supabase');
 const paymentGatewayService = require('./paymentGatewayService');
 const sekalipayService = require('./sekalipayService');
+const orderFulfillmentService = require('./orderFulfillmentService');
 const { normalizeNotePhoneNumber } = require('../utils/phoneUtils');
 
 /**
@@ -73,7 +74,7 @@ class PaymentPollingService {
             // Pastikan belum diproses secara bersamaan oleh webhook
             const { data: currentOrder } = await supabase
                 .from('orders')
-                .select('status')
+                .select('*')
                 .eq('id', reffId)
                 .single();
 
@@ -88,55 +89,14 @@ class PaymentPollingService {
                 .update({ pg_paid_at: new Date().toISOString() })
                 .eq('id', reffId);
 
-            // ── Buat transaksi ke Sekalipay Reseller API ─────────────────
-            const variantId = order.sekalipay_variant_id;
-            if (!variantId) {
-                console.error(`[Polling/PG-FinCloud] Order ${reffId} tidak punya sekalipay_variant_id.`);
-                await supabase
-                    .from('orders')
-                    .update({ status: 'FAILED', error_message: 'variant_id tidak ditemukan di order' })
-                    .eq('id', reffId);
-                return;
+            // ── Buat transaksi ke Vendor (Sekalipay / Fincloud) via Fulfillment Service ──────────
+            const fulfillmentResult = await orderFulfillmentService.fulfillOrder(currentOrder);
+
+            if (!fulfillmentResult.success && !fulfillmentResult.skipped) {
+                console.error(`[Polling/PG-FinCloud] Fulfillment order gagal untuk ${reffId}:`, fulfillmentResult.message);
+            } else if (fulfillmentResult.success && !fulfillmentResult.skipped) {
+                console.log(`[Polling/PG-FinCloud] Order ${reffId} berhasil diproses via polling.`);
             }
-
-            const carts = [
-                {
-                    item_id: variantId,
-                    quantity: 1,
-                    note: normalizeNotePhoneNumber(order.account_details?.sekalipay_note || '-'),
-                },
-            ];
-
-            const sekalipayResult = await sekalipayService.createTransaction(reffId, carts);
-
-            if (!sekalipayResult.success) {
-                const errMsg = sekalipayResult.message || 'UNKNOWN_SEKALIPAY_ERROR';
-                console.error(`[Polling/PG-FinCloud] Sekalipay order gagal untuk ${reffId}:`, errMsg);
-
-                await supabase
-                    .from('orders')
-                    .update({
-                        status: 'FAILED',
-                        error_message: errMsg,
-                    })
-                    .eq('id', reffId);
-
-                return;
-            }
-
-            const sekalipayData = sekalipayResult.data;
-            console.log(`[Polling/PG-FinCloud] Sekalipay order dibuat: invoice=${sekalipayData.invoice}, ref_id=${sekalipayData.ref_id}`);
-
-            // ── Update order ke PROCESSING ───────────────────────────────
-            await supabase
-                .from('orders')
-                .update({
-                    status: 'PROCESSING',
-                    sekalipay_invoice: sekalipayData.invoice || null,
-                })
-                .eq('id', reffId);
-
-            console.log(`[Polling/PG-FinCloud] Order ${reffId} berhasil diproses.`);
         } catch (err) {
             console.error(`[Polling/PG-FinCloud] Error memproses order ${reffId}:`, err);
         }

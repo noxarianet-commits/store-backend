@@ -3,7 +3,8 @@ const supabase = require('../supabase');
 const paymentGatewayService = require('../services/paymentGatewayService');
 const sekalipayService = require('../services/sekalipayService');
 const emailService = require('../services/emailService');
-
+const orderFulfillmentService = require('../services/orderFulfillmentService');
+const vendorRegistry = require('../services/vendors/vendorRegistry');
 // ══════════════════════════════════════════════════════════════════════════
 // HELPER — Sekalipay Reseller Webhook Signature Verification
 // Format: SHA256(ref_id + ":" + invoice + ":" + status + ":" + webhook_secret)
@@ -121,53 +122,15 @@ async function handlePaymentGatewayWebhook(req, res) {
         .update({ pg_paid_at: new Date().toISOString() })
         .eq('id', reffId);
 
-    // ── Buat transaksi ke Sekalipay Reseller API ──────────────────────────
-    const variantId = order.sekalipay_variant_id;
-    if (!variantId) {
-        console.error(`[Webhook/PG-FinCloud] Order ${reffId} tidak punya sekalipay_variant_id.`);
-        await supabase
-            .from('orders')
-            .update({ status: 'FAILED', error_message: 'variant_id tidak ditemukan di order' })
-            .eq('id', reffId);
-        return res.sendStatus(200);
-    }
+    // ── Buat transaksi ke Vendor (Sekalipay / Fincloud) via Fulfillment Service ──────────
+    // OrderFulfillmentService already has atomic lock and handles both vendors.
+    const fulfillmentResult = await orderFulfillmentService.fulfillOrder(order);
 
-    const carts = [
-        {
-            item_id: variantId,
-            quantity: 1,
-            note: order.account_details?.sekalipay_note || '-',
-        },
-    ];
-
-    const sekalipayResult = await sekalipayService.createTransaction(reffId, carts);
-
-    if (!sekalipayResult.success) {
-        const errMsg = sekalipayResult.message || 'UNKNOWN_SEKALIPAY_ERROR';
-        console.error(`[Webhook/PG-FinCloud] Sekalipay order gagal untuk ${reffId}:`, errMsg);
-
-        await supabase
-            .from('orders')
-            .update({
-                status: 'FAILED',
-                error_message: errMsg,
-            })
-            .eq('id', reffId);
-
+    if (!fulfillmentResult.success && !fulfillmentResult.skipped) {
+        console.error(`[Webhook/PG-FinCloud] Fulfillment order gagal untuk ${reffId}:`, fulfillmentResult.message);
+        // Order status is already updated to FAILED in fulfillOrder
         return res.sendStatus(200); // Tetap 200 agar FinCloud tidak retry
     }
-
-    const sekalipayData = sekalipayResult.data;
-    console.log(`[Webhook/PG-FinCloud] Sekalipay order dibuat: invoice=${sekalipayData.invoice}, ref_id=${sekalipayData.ref_id}`);
-
-    // ── Update order ke PROCESSING ────────────────────────────────────────
-    await supabase
-        .from('orders')
-        .update({
-            status: 'PROCESSING',
-            sekalipay_invoice: sekalipayData.invoice || null,
-        })
-        .eq('id', reffId);
 
     return res.sendStatus(200);
 }
@@ -324,4 +287,100 @@ async function handleSekalipayWebhook(req, res) {
     return res.sendStatus(200);
 }
 
-module.exports = { handlePaymentGatewayWebhook, handleSekalipayWebhook };
+// ══════════════════════════════════════════════════════════════════════════
+// HANDLER 3 — POST /api/webhooks/fincloud-ppob
+// Dipanggil Fincloud PPOB H2H saat order sukses atau gagal
+// ══════════════════════════════════════════════════════════════════════════
+
+async function handleFincloudPPOBWebhook(req, res) {
+    const { reff_id, nominal, status, rrn, sn, signature, signature_hmac } = req.body;
+    
+    console.log(`[Webhook/Fincloud-PPOB] Received callback for reff_id=${reff_id}, status=${status}`);
+
+    if (!reff_id) {
+        return res.status(400).json({ error: 'reff_id missing' });
+    }
+
+    let adapter;
+    try {
+        adapter = vendorRegistry.get('fincloud');
+    } catch (err) {
+        console.error(`[Webhook/Fincloud-PPOB] Fincloud adapter not found`);
+        return res.status(500).json({ error: 'Vendor adapter missing' });
+    }
+
+    const webhookSecret = process.env.FINCLOUD_PPOB_WEBHOOK_SECRET;
+    
+    const isValidSig = adapter.verifyWebhookSignature(req.body, signature, webhookSecret);
+    if (!isValidSig) {
+        console.warn('[Webhook/Fincloud-PPOB] Invalid signature — request ditolak.');
+        return res.status(401).json({ error: 'Invalid signature' });
+    }
+
+    // ── Ambil order dari Supabase (vendor_ref_id = reff_id) ─────────────────────
+    const { data: order, error: fetchError } = await supabase
+        .from('orders')
+        .select('*')
+        .eq('vendor_ref_id', reff_id)
+        .eq('vendor', 'fincloud')
+        .single();
+
+    if (fetchError || !order) {
+        console.error(`[Webhook/Fincloud-PPOB] Order ${reff_id} tidak ditemukan:`, fetchError?.message);
+        return res.sendStatus(200); // 200 to prevent retries
+    }
+
+    if (order.status === 'COMPLETED' || order.status === 'FAILED') {
+        console.log(`[Webhook/Fincloud-PPOB] Order ${reff_id} sudah final (${order.status}), skip.`);
+        return res.sendStatus(200);
+    }
+
+    if (status === 'success') {
+        const actualRrn = rrn || sn || null;
+        const accountDetails = {
+            ...order.account_details,
+            type: 'auto',
+            rrn: actualRrn,
+            licenses: actualRrn ? [actualRrn] : [],
+            completed_at: new Date().toISOString()
+        };
+
+        const { error: updateError } = await supabase
+            .from('orders')
+            .update({
+                status: 'COMPLETED',
+                account_details: accountDetails,
+                vendor_status: 'success'
+            })
+            .eq('id', order.id);
+
+        if (updateError) {
+            console.error(`[Webhook/Fincloud-PPOB] Gagal update order ${order.id}:`, updateError.message);
+        } else {
+            console.log(`[Webhook/Fincloud-PPOB] Order ${order.id} COMPLETED.`);
+            emailService.sendOrderCompletedEmail({
+                ...order,
+                account_details: accountDetails
+            }).catch(err => console.error(`[Webhook/Fincloud-PPOB] Email completed gagal:`, err.message));
+        }
+    } else if (status === 'failed') {
+        await supabase
+            .from('orders')
+            .update({
+                status: 'FAILED',
+                error_message: rrn || 'Order dibatalkan oleh Fincloud',
+                vendor_status: 'failed'
+            })
+            .eq('id', order.id);
+
+        console.log(`[Webhook/Fincloud-PPOB] Order ${order.id} FAILED.`);
+        emailService.sendOrderFailedEmail(order)
+            .catch(err => console.error(`[Webhook/Fincloud-PPOB] Email failed gagal:`, err.message));
+    } else {
+        console.log(`[Webhook/Fincloud-PPOB] Unhandled status: ${status}`);
+    }
+
+    return res.sendStatus(200);
+}
+
+module.exports = { handlePaymentGatewayWebhook, handleSekalipayWebhook, handleFincloudPPOBWebhook };

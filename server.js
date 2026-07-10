@@ -6,10 +6,20 @@ const cron = require('node-cron');
 require('dotenv').config();
 
 const syncService = require('./services/syncService');
+const fincloudSyncService = require('./services/fincloudSyncService');
+
+// Initialize Vendor Registry
+const vendorRegistry = require('./services/vendors/vendorRegistry');
+const SekalipayAdapter = require('./services/vendors/SekalipayAdapter');
+const FincloudPPOBAdapter = require('./services/vendors/FincloudPPOBAdapter');
+vendorRegistry.register('sekalipay', new SekalipayAdapter());
+vendorRegistry.register('fincloud', new FincloudPPOBAdapter());
 
 // Routes
 const sekalipayRoutes = require('./routes/sekalipayRoutes');
 const sekalipayAdminRoutes = require('./routes/sekalipayAdminRoutes');
+const fincloudRoutes = require('./routes/fincloudRoutes');
+const fincloudAdminRoutes = require('./routes/fincloudAdminRoutes');
 const productRoutes = require('./routes/productRoutes');
 const serviceRoutes = require('./routes/serviceRoutes');
 const orderRoutes = require('./routes/orderRoutes');
@@ -78,6 +88,7 @@ app.use(express.json());
 
 app.use('/api/home', homeRoutes);
 app.use('/api/sekalipay', sekalipayRoutes);
+app.use('/api/fincloud', fincloudRoutes);
 app.use('/api/products', productRoutes);
 app.use('/api/services', serviceRoutes);
 app.use('/api/settings', settingsRoutes);
@@ -89,6 +100,7 @@ app.use('/api/payments', paymentRoutes);
 // ══════════════════════════════════════════════════════════════════════════
 
 app.use('/api/admin/sekalipay', verifyAdmin, sekalipayAdminRoutes);
+app.use('/api/admin/fincloud', verifyAdmin, fincloudAdminRoutes);
 app.use('/api/orders', verifyAdmin, orderRoutes);
 
 // Admin auth: login limiter and verifyAdmin are defined in adminRoutes.js
@@ -119,6 +131,20 @@ cron.schedule('0 3 * * *', async () => {
 });
 
 // ══════════════════════════════════════════════════════════════════════════
+// FINCLOUD CRON JOBS
+// ══════════════════════════════════════════════════════════════════════════
+
+cron.schedule('30 3 * * *', async () => { // Run at 03:30 daily (after sekalipay)
+    console.log('[CRON] Starting Fincloud full sync...');
+    try {
+        const result = await fincloudSyncService.syncAllProducts();
+        console.log(`[CRON] Fincloud sync completed: ${result.stats?.upserted || 0} products synced.`);
+    } catch (err) {
+        console.error('[CRON] Fincloud sync failed:', err.message);
+    }
+});
+
+// ══════════════════════════════════════════════════════════════════════════
 // PAYMENT POLLING CRON JOBS (Fallback for Webhooks)
 // ══════════════════════════════════════════════════════════════════════════
 
@@ -128,9 +154,11 @@ cron.schedule('* * * * *', async () => {
     // Run every minute
     await paymentPollingService.pollPendingOrders();
     await paymentPollingService.cancelExpiredOrders();
+    await paymentPollingService.pollProcessingOrders();
 });
 
 console.log('[CRON] Sekalipay sync scheduled: delta every 1h, full daily at 03:00');
+console.log('[CRON] Fincloud sync scheduled: full daily at 03:30');
 console.log('[CRON] Payment polling scheduled: every 1 minute');
 
 // ══════════════════════════════════════════════════════════════════════════

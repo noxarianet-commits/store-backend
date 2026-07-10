@@ -1,7 +1,10 @@
 const supabase = require('../supabase');
 const paymentGatewayService = require('./paymentGatewayService');
 const sekalipayService = require('./sekalipayService');
+const orderFulfillmentService = require('./orderFulfillmentService');
 const { normalizeNotePhoneNumber } = require('../utils/phoneUtils');
+const vendorRegistry = require('./vendors/vendorRegistry');
+const emailService = require('./emailService');
 
 /**
  * Service untuk mem-polling status pembayaran dari FinCloud
@@ -73,7 +76,7 @@ class PaymentPollingService {
             // Pastikan belum diproses secara bersamaan oleh webhook
             const { data: currentOrder } = await supabase
                 .from('orders')
-                .select('status')
+                .select('*')
                 .eq('id', reffId)
                 .single();
 
@@ -88,55 +91,14 @@ class PaymentPollingService {
                 .update({ pg_paid_at: new Date().toISOString() })
                 .eq('id', reffId);
 
-            // ── Buat transaksi ke Sekalipay Reseller API ─────────────────
-            const variantId = order.sekalipay_variant_id;
-            if (!variantId) {
-                console.error(`[Polling/PG-FinCloud] Order ${reffId} tidak punya sekalipay_variant_id.`);
-                await supabase
-                    .from('orders')
-                    .update({ status: 'FAILED', error_message: 'variant_id tidak ditemukan di order' })
-                    .eq('id', reffId);
-                return;
+            // ── Buat transaksi ke Vendor (Sekalipay / Fincloud) via Fulfillment Service ──────────
+            const fulfillmentResult = await orderFulfillmentService.fulfillOrder(currentOrder);
+
+            if (!fulfillmentResult.success && !fulfillmentResult.skipped) {
+                console.error(`[Polling/PG-FinCloud] Fulfillment order gagal untuk ${reffId}:`, fulfillmentResult.message);
+            } else if (fulfillmentResult.success && !fulfillmentResult.skipped) {
+                console.log(`[Polling/PG-FinCloud] Order ${reffId} berhasil diproses via polling.`);
             }
-
-            const carts = [
-                {
-                    item_id: variantId,
-                    quantity: 1,
-                    note: normalizeNotePhoneNumber(order.account_details?.sekalipay_note || '-'),
-                },
-            ];
-
-            const sekalipayResult = await sekalipayService.createTransaction(reffId, carts);
-
-            if (!sekalipayResult.success) {
-                const errMsg = sekalipayResult.message || 'UNKNOWN_SEKALIPAY_ERROR';
-                console.error(`[Polling/PG-FinCloud] Sekalipay order gagal untuk ${reffId}:`, errMsg);
-
-                await supabase
-                    .from('orders')
-                    .update({
-                        status: 'FAILED',
-                        error_message: errMsg,
-                    })
-                    .eq('id', reffId);
-
-                return;
-            }
-
-            const sekalipayData = sekalipayResult.data;
-            console.log(`[Polling/PG-FinCloud] Sekalipay order dibuat: invoice=${sekalipayData.invoice}, ref_id=${sekalipayData.ref_id}`);
-
-            // ── Update order ke PROCESSING ───────────────────────────────
-            await supabase
-                .from('orders')
-                .update({
-                    status: 'PROCESSING',
-                    sekalipay_invoice: sekalipayData.invoice || null,
-                })
-                .eq('id', reffId);
-
-            console.log(`[Polling/PG-FinCloud] Order ${reffId} berhasil diproses.`);
         } catch (err) {
             console.error(`[Polling/PG-FinCloud] Error memproses order ${reffId}:`, err);
         }
@@ -165,6 +127,108 @@ class PaymentPollingService {
             }
         } catch (err) {
             console.error('[Polling/PG-FinCloud] Error dalam membatalkan order kedaluwarsa:', err);
+        }
+    }
+
+    async pollProcessingOrders() {
+        try {
+            console.log('[Polling/H2H-FinCloud] Memulai pengecekan status order PROCESSING...');
+
+            // Ambil order PROCESSING dari vendor Fincloud yang dibuat dalam 24 jam terakhir
+            const yesterday = new Date();
+            yesterday.setHours(yesterday.getHours() - 24);
+
+            const { data: orders, error } = await supabase
+                .from('orders')
+                .select('*')
+                .eq('status', 'PROCESSING')
+                .eq('vendor', 'fincloud')
+                .gte('timestamp', yesterday.toISOString());
+
+            if (error) {
+                console.error('[Polling/H2H-FinCloud] Gagal mengambil processing orders:', error.message);
+                return;
+            }
+
+            if (!orders || orders.length === 0) {
+                console.log('[Polling/H2H-FinCloud] Tidak ada processing orders untuk diperiksa.');
+                return;
+            }
+
+            console.log(`[Polling/H2H-FinCloud] Ditemukan ${orders.length} order PROCESSING.`);
+
+            const adapter = vendorRegistry.get('fincloud');
+
+            for (const order of orders) {
+                const refId = order.vendor_ref_id || order.id;
+                console.log(`[Polling/H2H-FinCloud] Memeriksa status order ${order.id} (refId: ${refId})...`);
+
+                const checkResult = await adapter.checkOrderStatus(refId);
+
+                if (!checkResult.success || !checkResult.data) {
+                    console.warn(`[Polling/H2H-FinCloud] Gagal cek status untuk order ${order.id}:`, checkResult.message);
+                    continue;
+                }
+
+                // Fincloud usually returns the actual status in checkResult.data.data.status
+                let apiStatus = checkResult.data?.data?.status;
+                if (!apiStatus && typeof checkResult.data?.status === 'string') {
+                    apiStatus = checkResult.data.status;
+                }
+                
+                const rrn = checkResult.data?.data?.sn || checkResult.data?.data?.rrn || checkResult.data?.sn || checkResult.data?.rrn;
+
+                if (apiStatus === 'success') {
+                    const accountDetails = {
+                        ...order.account_details,
+                        type: 'auto',
+                        rrn: rrn || null,
+                        licenses: rrn ? [rrn] : [],
+                        completed_at: new Date().toISOString()
+                    };
+
+                    const { error: updateError } = await supabase
+                        .from('orders')
+                        .update({
+                            status: 'COMPLETED',
+                            account_details: accountDetails,
+                            vendor_status: 'success'
+                        })
+                        .eq('id', order.id);
+
+                    if (updateError) {
+                        console.error(`[Polling/H2H-FinCloud] Gagal update status sukses untuk order ${order.id}:`, updateError.message);
+                    } else {
+                        console.log(`[Polling/H2H-FinCloud] Order ${order.id} berhasil diupdate ke COMPLETED.`);
+                        emailService.sendOrderCompletedEmail({
+                            ...order,
+                            account_details: accountDetails
+                        }).catch(err => console.error(`[Polling/H2H-FinCloud] Gagal kirim email sukses untuk order ${order.id}:`, err.message));
+                    }
+                } else if (apiStatus === 'failed' || apiStatus === 'cancel' || apiStatus === 'cancelled' || apiStatus === 'refund') {
+                    const { error: updateError } = await supabase
+                        .from('orders')
+                        .update({
+                            status: 'FAILED',
+                            error_message: rrn || 'Order dibatalkan oleh Fincloud (via Polling)',
+                            vendor_status: 'failed'
+                        })
+                        .eq('id', order.id);
+
+                    if (updateError) {
+                        console.error(`[Polling/H2H-FinCloud] Gagal update status gagal untuk order ${order.id}:`, updateError.message);
+                    } else {
+                        console.log(`[Polling/H2H-FinCloud] Order ${order.id} berhasil diupdate ke FAILED.`);
+                        emailService.sendOrderFailedEmail(order)
+                            .catch(err => console.error(`[Polling/H2H-FinCloud] Gagal kirim email gagal untuk order ${order.id}:`, err.message));
+                    }
+                } else {
+                    console.log(`[Polling/H2H-FinCloud] Order ${order.id} masih pending/processing di Fincloud (status: ${apiStatus}).`);
+                }
+            }
+
+        } catch (err) {
+            console.error('[Polling/H2H-FinCloud] Error dalam pollProcessingOrders:', err);
         }
     }
 }

@@ -38,4 +38,14 @@ router.post(
     webhookController.handleSekalipayWebhook
 );
 
+/**
+ * POST /api/webhooks/fincloud-ppob
+ * Callback dari Fincloud PPOB H2H ketika order selesai / dibatalkan.
+ */
+router.post(
+    '/fincloud-ppob',
+    express.urlencoded({ extended: true }),
+    webhookController.handleFincloudPPOBWebhook
+);
+
 module.exports = router;

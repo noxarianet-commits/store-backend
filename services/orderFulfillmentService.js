@@ -1,22 +1,23 @@
 const supabase = require('../supabase');
-const sekalipayService = require('./sekalipayService');
+const vendorRegistry = require('./vendors/vendorRegistry');
 const { normalizeNotePhoneNumber } = require('../utils/phoneUtils');
 
 /**
  * Service to handle order fulfillment centrally.
  * Implements atomic locking to prevent race conditions from multiple triggers
  * (e.g., webhook, cron polling, on-demand status check) causing duplicate
- * transactions to Sekalipay.
+ * transactions to vendors.
  */
 class OrderFulfillmentService {
     /**
-     * Claims the order atomically and processes the Sekalipay transaction.
+     * Claims the order atomically and processes the transaction.
      * @param {Object} order The order object from database
      * @returns {Promise<{success: boolean, skipped?: boolean, message?: string}>}
      */
     async fulfillOrder(order) {
         const orderId = order.id;
-        console.log(`[OrderFulfillment] Attempting to claim order ${orderId}...`);
+        const vendorName = order.vendor || 'sekalipay'; // default to sekalipay for backward compatibility
+        console.log(`[OrderFulfillment] Attempting to claim order ${orderId} for vendor ${vendorName}...`);
 
         try {
             // 1. Atomic Claim: UPDATE ... WHERE id = ? AND status = 'PENDING'
@@ -39,68 +40,140 @@ class OrderFulfillmentService {
                 return { success: true, skipped: true };
             }
 
-            console.log(`[OrderFulfillment] Klaim berhasil untuk order ${orderId}. Memproses Sekalipay...`);
+            console.log(`[OrderFulfillment] Klaim berhasil untuk order ${orderId}. Memproses ke ${vendorName}...`);
 
-            // 3. Process Sekalipay Transaction
-            const variantId = order.sekalipay_variant_id;
-            if (!variantId) {
-                console.error(`[OrderFulfillment] Order ${orderId} tidak punya sekalipay_variant_id.`);
+            // 3. Process Transaction via Vendor Adapter
+            let vendorAdapter;
+            try {
+                vendorAdapter = vendorRegistry.get(vendorName);
+            } catch (err) {
+                console.error(`[OrderFulfillment] ${err.message}`);
                 await supabase
                     .from('orders')
-                    .update({ status: 'FAILED', error_message: 'variant_id tidak ditemukan di order' })
+                    .update({ status: 'FAILED', error_message: `Vendor ${vendorName} tidak didukung` })
                     .eq('id', orderId);
-                return { success: false, message: 'Missing variant_id' };
+                return { success: false, message: 'Unsupported vendor' };
             }
 
-            const rawNote = order.account_details?.sekalipay_note || '-';
-            const note = normalizeNotePhoneNumber(rawNote);
+            let vendorResult;
 
-            const carts = [
-                {
-                    item_id: variantId,
-                    quantity: 1,
-                    note,
-                },
-            ];
+            if (vendorName === 'fincloud') {
+                const sku = order.fincloud_sku;
+                if (!sku) {
+                    await supabase
+                        .from('orders')
+                        .update({ status: 'FAILED', error_message: 'fincloud_sku tidak ditemukan di order' })
+                        .eq('id', orderId);
+                    return { success: false, message: 'Missing fincloud_sku' };
+                }
 
-            const sekalipayResult = await sekalipayService.createTransaction(orderId, carts);
+                // Fincloud PPOB uses target directly
+                let target = order.account_details?.target;
+                if (!target && order.account_details?.sekalipay_note) {
+                    // Fallback to sekalipay_note (which might contain the number)
+                    target = normalizeNotePhoneNumber(order.account_details.sekalipay_note);
+                }
 
-            // 4. Handle Sekalipay Result & Update Status
-            if (!sekalipayResult.success) {
-                const errMsg = sekalipayResult.message || 'UNKNOWN_SEKALIPAY_ERROR';
-                console.error(`[OrderFulfillment] Sekalipay order gagal untuk ${orderId}:`, errMsg);
+                if (!target) {
+                    await supabase
+                        .from('orders')
+                        .update({ status: 'FAILED', error_message: 'Target/nomor HP tidak ditemukan' })
+                        .eq('id', orderId);
+                    return { success: false, message: 'Missing target' };
+                }
 
+                vendorResult = await vendorAdapter.createOrder(orderId, { sku, target });
+
+                if (!vendorResult.success) {
+                    const errMsg = vendorResult.message || 'UNKNOWN_FINCLOUD_ERROR';
+                    console.error(`[OrderFulfillment] Fincloud order gagal untuk ${orderId}:`, errMsg, vendorResult.data);
+                    
+                    await supabase
+                        .from('orders')
+                        .update({
+                            status: 'FAILED',
+                            error_message: errMsg,
+                        })
+                        .eq('id', orderId);
+
+                    return { success: false, message: errMsg };
+                }
+
+                console.log(`[OrderFulfillment] Fincloud order dibuat: reff_id=${orderId}`);
+
+                // Update order to PROCESSING
                 await supabase
                     .from('orders')
                     .update({
-                        status: 'FAILED',
-                        error_message: errMsg,
+                        status: 'PROCESSING',
+                        vendor_ref_id: orderId, // Fincloud uses our orderId as reff_id
+                        vendor_status: 'pending'
                     })
                     .eq('id', orderId);
 
-                return { success: false, message: errMsg };
+            } else {
+                // Default / Sekalipay
+                const variantId = order.sekalipay_variant_id;
+                if (!variantId) {
+                    console.error(`[OrderFulfillment] Order ${orderId} tidak punya sekalipay_variant_id.`);
+                    await supabase
+                        .from('orders')
+                        .update({ status: 'FAILED', error_message: 'variant_id tidak ditemukan di order' })
+                        .eq('id', orderId);
+                    return { success: false, message: 'Missing variant_id' };
+                }
+
+                const rawNote = order.account_details?.sekalipay_note || '-';
+                const note = normalizeNotePhoneNumber(rawNote);
+
+                const carts = [
+                    {
+                        item_id: variantId,
+                        quantity: 1,
+                        note,
+                    },
+                ];
+
+                vendorResult = await vendorAdapter.createOrder(orderId, { carts });
+
+                if (!vendorResult.success) {
+                    const errMsg = vendorResult.message || 'UNKNOWN_SEKALIPAY_ERROR';
+                    console.error(`[OrderFulfillment] Sekalipay order gagal untuk ${orderId}:`, errMsg);
+
+                    await supabase
+                        .from('orders')
+                        .update({
+                            status: 'FAILED',
+                            error_message: errMsg,
+                        })
+                        .eq('id', orderId);
+
+                    return { success: false, message: errMsg };
+                }
+
+                const sekalipayData = vendorResult.data;
+                console.log(`[OrderFulfillment] Sekalipay order dibuat: invoice=${sekalipayData.invoice}, ref_id=${sekalipayData.ref_id}`);
+
+                // Update order to PROCESSING (waiting for Sekalipay webhook for completion)
+                // We update both legacy columns and new vendor columns
+                await supabase
+                    .from('orders')
+                    .update({
+                        status: 'PROCESSING',
+                        sekalipay_invoice: sekalipayData.invoice || null,
+                        vendor_ref_id: sekalipayData.ref_id || null,
+                        vendor_invoice: sekalipayData.invoice || null,
+                        vendor_status: 'pending'
+                    })
+                    .eq('id', orderId);
             }
 
-            const sekalipayData = sekalipayResult.data;
-            console.log(`[OrderFulfillment] Sekalipay order dibuat: invoice=${sekalipayData.invoice}, ref_id=${sekalipayData.ref_id}`);
-
-            // Update order to PROCESSING (waiting for Sekalipay webhook for completion)
-            await supabase
-                .from('orders')
-                .update({
-                    status: 'PROCESSING',
-                    sekalipay_invoice: sekalipayData.invoice || null,
-                })
-                .eq('id', orderId);
-
-            console.log(`[OrderFulfillment] Order ${orderId} berhasil diproses ke Sekalipay.`);
+            console.log(`[OrderFulfillment] Order ${orderId} berhasil diproses ke ${vendorName}.`);
             return { success: true };
 
         } catch (err) {
             console.error(`[OrderFulfillment] Exception saat memproses order ${orderId}:`, err);
             
-            // Revert lock if something catastrophic happens before Sekalipay is hit?
-            // Safer to leave it as PROCESSING_LOCK or FAILED to avoid infinite retry loops on error.
             await supabase
                 .from('orders')
                 .update({ status: 'FAILED', error_message: err.message })

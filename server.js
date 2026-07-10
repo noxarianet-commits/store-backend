@@ -154,6 +154,7 @@ cron.schedule('* * * * *', async () => {
     // Run every minute
     await paymentPollingService.pollPendingOrders();
     await paymentPollingService.cancelExpiredOrders();
+    await paymentPollingService.pollProcessingOrders();
 });
 
 console.log('[CRON] Sekalipay sync scheduled: delta every 1h, full daily at 03:00');

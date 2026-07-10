@@ -293,7 +293,7 @@ async function handleSekalipayWebhook(req, res) {
 // ══════════════════════════════════════════════════════════════════════════
 
 async function handleFincloudPPOBWebhook(req, res) {
-    const { reff_id, nominal, status, rrn, signature, signature_hmac } = req.body;
+    const { reff_id, nominal, status, rrn, sn, signature, signature_hmac } = req.body;
     
     console.log(`[Webhook/Fincloud-PPOB] Received callback for reff_id=${reff_id}, status=${status}`);
 
@@ -336,10 +336,12 @@ async function handleFincloudPPOBWebhook(req, res) {
     }
 
     if (status === 'success') {
+        const actualRrn = rrn || sn || null;
         const accountDetails = {
             ...order.account_details,
             type: 'auto',
-            rrn: rrn || null,
+            rrn: actualRrn,
+            licenses: actualRrn ? [actualRrn] : [],
             completed_at: new Date().toISOString()
         };
 

@@ -4,6 +4,15 @@ const NodeCache = require('node-cache');
  * CacheService — In-memory cache wrapper using node-cache.
  * Provides TTL-based caching to reduce database queries.
  */
+/**
+ * Standard cache key prefixes.
+ * All home-related keys use 'home_' prefix so invalidateHome() clears them.
+ */
+const KEYS = {
+    HOME_PAGE: 'home_page',
+    HOME_CATEGORY: (slug) => `home_category_${slug}`,
+};
+
 class CacheService {
     constructor() {
         this.cache = new NodeCache({
@@ -11,6 +20,7 @@ class CacheService {
             checkperiod: 60,   // Check for expired keys every 60s
             useClones: false,  // Return references for performance
         });
+        this.KEYS = KEYS;
 
         this.cache.on('expired', (key) => {
             console.log(`[Cache] Key expired: ${key}`);
@@ -38,6 +48,26 @@ class CacheService {
         } else {
             this.cache.set(key, value);
         }
+    }
+
+    /**
+     * Get from cache or fetch and cache the result.
+     * Avoids repetitive get→check→set boilerplate in controllers.
+     *
+     * @param {string} key - Cache key
+     * @param {Function} fetchFn - Async function that returns the data to cache
+     * @param {number} [ttl=300] - TTL in seconds (default 5 minutes)
+     * @returns {Promise<any>} Cached or freshly fetched data
+     */
+    async getOrSet(key, fetchFn, ttl = 300) {
+        const cached = this.cache.get(key);
+        if (cached !== undefined) {
+            return cached;
+        }
+
+        const data = await fetchFn();
+        this.set(key, data, ttl);
+        return data;
     }
 
     /**

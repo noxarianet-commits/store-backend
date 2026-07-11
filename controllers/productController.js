@@ -1,4 +1,5 @@
 const supabase = require('../supabase');
+const cacheService = require('../services/cacheService');
 
 /**
  * GET /api/products
@@ -28,6 +29,7 @@ async function create(req, res) {
             .from('products')
             .insert([req.body]);
         if (error) throw error;
+        cacheService.invalidateHome();
         res.json(data);
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -46,6 +48,7 @@ async function update(req, res) {
             .update(req.body)
             .eq('id', id);
         if (error) throw error;
+        cacheService.invalidateHome();
         res.json({ success: true });
     } catch (err) {
         res.status(500).json({ error: err.message });
@@ -64,6 +67,7 @@ async function remove(req, res) {
             .delete()
             .eq('id', id);
         if (error) throw error;
+        cacheService.invalidateHome();
         res.json({ success: true });
     } catch (err) {
         res.status(500).json({ error: err.message });

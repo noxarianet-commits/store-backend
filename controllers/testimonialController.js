@@ -1,4 +1,5 @@
 const supabase = require('../supabase');
+const cacheService = require('../services/cacheService');
 
 /**
  * GET /api/testimonials
@@ -45,6 +46,7 @@ async function create(req, res) {
 
         if (error) throw error;
 
+        cacheService.invalidateHome();
         console.log(`[testimonial] Testimoni dari ${name} (rating: ${ratingVal}, order: ${order_id})`);
         res.status(201).json({ success: true, data });
     } catch (err) {

@@ -56,106 +56,109 @@ function toPublicService(service) {
  */
 async function getHomePage(req, res) {
     try {
-        const cacheKey = 'home_page';
-        const cached = cacheService.get(cacheKey);
-        if (cached) {
-            return res.json(cached);
-        }
-
-        // Fetch all data in parallel
-        const [productsResult, servicesResult, testimonialsResult, settingsResult] = await Promise.all([
-            supabase
-                .from('products')
-                .select('*')
-                .eq('is_active', true)
-                .order('category', { ascending: true })
-                .order('name', { ascending: true }),
-            supabase
-                .from('services')
-                .select('*')
-                .eq('is_active', true)
-                .order('created_at', { ascending: true }),
-            supabase
-                .from('testimonials')
-                .select('*')
-                .order('created_at', { ascending: false })
-                .limit(10),
-            supabase
-                .from('settings')
-                .select('*'),
-        ]);
-
-        // Process settings (filter sensitive keys)
-        const settingsMap = {
-            shop_status: { isOpen: true, message: 'Selamat datang!' },
-        };
-        if (settingsResult.data) {
-            settingsResult.data.forEach(s => {
-                if (s.key !== 'admin_auth' && s.key !== 'sekalipay_last_sync') {
-                    settingsMap[s.key] = s.value;
-                }
-            });
-        }
-
-        // Build categories from products
-        const allProducts = productsResult.data || [];
-        const categoryMap = {};
-
-        for (const product of allProducts) {
-            const cat = product.category || 'Uncategorized';
-            if (!categoryMap[cat]) {
-                categoryMap[cat] = {
-                    slug: slugify(cat),
-                    name: cat,
-                    icon: product.icon || null,
-                    product_count: 0,
-                    type: 'product',
-                };
-            }
-            categoryMap[cat].product_count++;
-        }
-
-        // Add services as a category
-        const services = servicesResult.data || [];
-        if (services.length > 0) {
-            categoryMap['Layanan Jasa & Bot'] = {
-                slug: 'layanan-jasa-bot',
-                name: 'Layanan Jasa & Bot',
-                icon: null,
-                product_count: services.length,
-                type: 'service',
-            };
-        }
-
-        // Build featured products:
-        // Priority 1: Products marked as featured by admin
-        const featured = [];
-        const featuredIds = new Set();
-        const MAX_FEATURED = 12;
-
-        for (const p of allProducts) {
-            if (p.is_featured && featured.length < MAX_FEATURED) {
-                featured.push(toPublicProduct(p));
-                featuredIds.add(p.id);
-            }
-        }
-
-        const responseData = {
-            settings: settingsMap,
-            categories: Object.values(categoryMap),
-            featured_products: featured,
-            all_products: allProducts.map(toPublicProduct),
-            testimonials: testimonialsResult.data || [],
-        };
-
-        // Cache for 5 minutes
-        cacheService.set(cacheKey, responseData, 300);
+        const responseData = await cacheService.getOrSet(
+            cacheService.KEYS.HOME_PAGE,
+            () => fetchHomePageData(),
+            300
+        );
 
         res.json(responseData);
     } catch (err) {
         console.error('[HomeController] getHomePage error:', err.message);
         res.status(500).json({ error: err.message });
     }
+}
+
+/**
+ * Fetch all home page data from Supabase.
+ * @returns {Promise<object>} Home page response data
+ */
+async function fetchHomePageData() {
+    // Fetch all data in parallel
+    const [productsResult, servicesResult, testimonialsResult, settingsResult] = await Promise.all([
+        supabase
+            .from('products')
+            .select('*')
+            .eq('is_active', true)
+            .order('category', { ascending: true })
+            .order('name', { ascending: true }),
+        supabase
+            .from('services')
+            .select('*')
+            .eq('is_active', true)
+            .order('created_at', { ascending: true }),
+        supabase
+            .from('testimonials')
+            .select('*')
+            .order('created_at', { ascending: false })
+            .limit(10),
+        supabase
+            .from('settings')
+            .select('*'),
+    ]);
+
+    // Process settings (filter sensitive keys)
+    const settingsMap = {
+        shop_status: { isOpen: true, message: 'Selamat datang!' },
+    };
+    if (settingsResult.data) {
+        settingsResult.data.forEach(s => {
+            if (s.key !== 'admin_auth' && s.key !== 'sekalipay_last_sync') {
+                settingsMap[s.key] = s.value;
+            }
+        });
+    }
+
+    // Build categories from products
+    const allProducts = productsResult.data || [];
+    const categoryMap = {};
+
+    for (const product of allProducts) {
+        const cat = product.category || 'Uncategorized';
+        if (!categoryMap[cat]) {
+            categoryMap[cat] = {
+                slug: slugify(cat),
+                name: cat,
+                icon: product.icon || null,
+                product_count: 0,
+                type: 'product',
+            };
+        }
+        categoryMap[cat].product_count++;
+    }
+
+    // Add services as a category
+    const services = servicesResult.data || [];
+    if (services.length > 0) {
+        categoryMap['Layanan Jasa & Bot'] = {
+            slug: 'layanan-jasa-bot',
+            name: 'Layanan Jasa & Bot',
+            icon: null,
+            product_count: services.length,
+            type: 'service',
+        };
+    }
+
+    // Build featured products:
+    // Priority 1: Products marked as featured by admin
+    const featured = [];
+    const featuredIds = new Set();
+    const MAX_FEATURED = 12;
+
+    for (const p of allProducts) {
+        if (p.is_featured && featured.length < MAX_FEATURED) {
+            featured.push(toPublicProduct(p));
+            featuredIds.add(p.id);
+        }
+    }
+
+    return {
+        settings: settingsMap,
+        categories: Object.values(categoryMap),
+        featured_products: featured,
+        all_products: allProducts.map(toPublicProduct),
+        testimonials: testimonialsResult.data || [],
+    };
 }
 
 /**

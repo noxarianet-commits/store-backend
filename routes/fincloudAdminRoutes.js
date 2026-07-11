@@ -147,6 +147,81 @@ router.patch('/products/:sku/markup', async (req, res) => {
 });
 
 /**
+ * PATCH /api/admin/fincloud/products/bulk-markup
+ * Bulk update markup for multiple Fincloud products by sku.
+ * Body: { updates: [{ sku, markup }, ...] }
+ */
+router.patch('/products/bulk-markup', async (req, res) => {
+    try {
+        const { updates } = req.body;
+
+        if (!Array.isArray(updates) || updates.length === 0) {
+            return res.status(400).json({ error: 'updates array is required' });
+        }
+
+        // Validate all entries first
+        const skus = [];
+        const markupBySku = {};
+        for (const item of updates) {
+            if (!item || !item.sku) {
+                return res.status(400).json({ error: 'Each update must include sku' });
+            }
+            const markupValue = parseInt(item.markup);
+            if (isNaN(markupValue) || markupValue < 0) {
+                return res.status(400).json({ error: `Invalid markup for sku ${item.sku}` });
+            }
+            skus.push(item.sku);
+            markupBySku[item.sku] = markupValue;
+        }
+
+        // Fetch base_price for all skus in one query
+        const { data: products, error: fetchError } = await supabase
+            .from('fincloud_products')
+            .select('id, sku, base_price')
+            .in('sku', skus);
+
+        if (fetchError) throw fetchError;
+
+        if (!products || products.length === 0) {
+            return res.status(404).json({ error: 'No matching products found' });
+        }
+
+        // Build upsert batches
+        const BATCH_SIZE = 100;
+        let updatedCount = 0;
+
+        for (let i = 0; i < products.length; i += BATCH_SIZE) {
+            const batch = products.slice(i, i + BATCH_SIZE)
+                .filter(p => markupBySku[p.sku] !== undefined)
+                .map(p => ({
+                    id: p.id,
+                    sku: p.sku,
+                    markup: markupBySku[p.sku],
+                    sell_price: p.base_price + markupBySku[p.sku],
+                }));
+
+            if (batch.length === 0) continue;
+
+            const { error: updateError } = await supabase
+                .from('fincloud_products')
+                .upsert(batch, { onConflict: 'sku' });
+
+            if (updateError) throw updateError;
+            updatedCount += batch.length;
+        }
+
+        cacheService.invalidateHome();
+        res.json({
+            success: true,
+            message: `${updatedCount} markup diperbarui`,
+            updatedCount,
+        });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+/**
  * PATCH /api/admin/fincloud/products/:sku/toggle
  * Toggle is_hidden status (note: fincloud uses is_hidden to hide from public while keeping active in admin).
  */

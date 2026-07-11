@@ -134,12 +134,12 @@ class SyncService {
         const existingMap = {};
         if (Array.isArray(existingVariants)) {
             for (const v of existingVariants) {
-                existingMap[v.id] = v;
+                if (v.sku) existingMap[v.sku] = v;
             }
         }
 
         return newVariants.map(newV => {
-            const existing = existingMap[newV.id];
+            const existing = newV.sku ? existingMap[newV.sku] : null;
             if (existing) {
                 // Detect if variant changed (price or name) from previous sync state
                 const isChanged = existing.base_price !== newV.base_price || existing.name !== newV.name;
@@ -431,6 +431,7 @@ class SyncService {
                 return { success: false, error: updateError.message };
             }
 
+            cacheService.invalidateHome();
             return { success: true };
         } catch (err) {
             return { success: false, error: err.message };
@@ -471,6 +472,7 @@ class SyncService {
                 return { success: false, error: updateError.message };
             }
 
+            cacheService.invalidateHome();
             return { success: true };
         } catch (err) {
             return { success: false, error: err.message };
@@ -509,6 +511,7 @@ class SyncService {
                 if (!error) updatedCount++;
             }
 
+            cacheService.invalidateHome();
             return { success: true, updatedCount };
         } catch (err) {
             return { success: false, error: err.message };

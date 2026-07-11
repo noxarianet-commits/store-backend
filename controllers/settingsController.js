@@ -1,4 +1,5 @@
 const supabase = require('../supabase');
+const cacheService = require('../services/cacheService');
 
 /**
  * GET /api/settings
@@ -46,6 +47,7 @@ async function update(req, res) {
             console.error('Supabase Error:', error);
             return res.status(500).json({ error: error.message });
         }
+        cacheService.invalidateHome();
         res.json({ success: true });
     } catch (err) {
         console.error('UPDATE Settings Error:', err);

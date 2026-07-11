@@ -136,6 +136,7 @@ router.patch('/products/:id/markup', async (req, res) => {
         }
 
         if (result.success) {
+            cacheService.invalidateHome();
             res.json({ success: true, message: 'Markup berhasil diupdate' });
         } else {
             res.status(400).json({ success: false, error: result.error });
@@ -171,6 +172,8 @@ router.patch('/products/:id/toggle', async (req, res) => {
 
         if (updateError) throw updateError;
 
+        cacheService.invalidateHome();
+
         res.json({
             success: true,
             is_active: !product.is_active,
@@ -200,6 +203,7 @@ router.post('/global-markup', async (req, res) => {
 
         const result = await syncService.applyGlobalMarkup(markupValue);
         if (result.success) {
+            cacheService.invalidateHome();
             res.json({
                 success: true,
                 message: `Markup global Rp ${markupValue.toLocaleString('id-ID')} diterapkan ke ${result.updatedCount} produk`,

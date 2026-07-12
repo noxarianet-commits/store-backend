@@ -40,6 +40,7 @@ async function create(req, res) {
                 name,
                 text,
                 product: product || null,
+                rating: ratingVal,
             }])
             .select()
             .single();

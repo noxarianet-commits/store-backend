@@ -174,10 +174,10 @@ router.patch('/products/bulk-markup', async (req, res) => {
             markupBySku[item.sku] = markupValue;
         }
 
-        // Fetch base_price for all skus in one query
+        // Fetch all columns to satisfy NOT NULL constraints during upsert
         const { data: products, error: fetchError } = await supabase
             .from('fincloud_products')
-            .select('id, sku, base_price')
+            .select('*')
             .in('sku', skus);
 
         if (fetchError) throw fetchError;
@@ -194,8 +194,7 @@ router.patch('/products/bulk-markup', async (req, res) => {
             const batch = products.slice(i, i + BATCH_SIZE)
                 .filter(p => markupBySku[p.sku] !== undefined)
                 .map(p => ({
-                    id: p.id,
-                    sku: p.sku,
+                    ...p,
                     markup: markupBySku[p.sku],
                     sell_price: p.base_price + markupBySku[p.sku],
                 }));

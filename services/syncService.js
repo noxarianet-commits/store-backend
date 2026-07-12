@@ -150,6 +150,8 @@ class SyncService {
                 
                 return {
                     ...newV,
+                    required_fields: (newV.required_fields?.length > 0) ? newV.required_fields : (existing.required_fields || []),
+                    validation: (newV.validation && newV.validation.available !== undefined) ? newV.validation : (existing.validation || null),
                     markup,
                     is_hidden: isHidden,
                     sell_price: Math.ceil(newV.base_price + markup),

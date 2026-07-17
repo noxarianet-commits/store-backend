@@ -92,10 +92,12 @@ async function create(req, res) {
 
         if (rawTestimonial && rawTestimonial !== '-' && rawTestimonial !== '') {
             console.log('Menyimpan Testimoni Baru dari:', customerWA);
+            const productName = orderData.product || '';
+            const testiText = productName ? `${rawTestimonial} (${productName})` : rawTestimonial;
             const { error: testiError } = await supabase.from('testimonials').insert([{
                 name: customerWA,
-                text: rawTestimonial,
-                product: orderData.product || 'Unknown',
+                text: testiText,
+                rating: 5,
                 created_at: new Date().toISOString()
             }]);
 

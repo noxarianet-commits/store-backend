@@ -38,8 +38,7 @@ async function create(req, res) {
             .from('testimonials')
             .insert([{
                 name,
-                text,
-                product: product || null,
+                text: product ? `${text} (${product})` : text,
                 rating: ratingVal,
             }])
             .select()

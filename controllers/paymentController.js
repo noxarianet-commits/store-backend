@@ -1,11 +1,12 @@
 const supabase = require('../supabase');
 const paymentGatewayService = require('../services/paymentGatewayService');
+const orkutGatewayService = require('../services/orkutGatewayService');
 const paymentPollingService = require('../services/paymentPollingService');
 const sekalipayService = require('../services/sekalipayService');
 const { normalizeNotePhoneNumber } = require('../utils/phoneUtils');
 
 // ══════════════════════════════════════════════════════════════════════════
-// HELPER
+// HELPERS
 // ══════════════════════════════════════════════════════════════════════════
 
 function generateOrderId() {
@@ -14,9 +15,63 @@ function generateOrderId() {
     return `NX-${ts}-${rand}`;
 }
 
+/**
+ * Generate kode unik (1–999) yang belum dipakai oleh transaksi PENDING.
+ * Kode unik ditambahkan ke nominal agar setiap pembayaran punya
+ * total yang berbeda — penting untuk ORKUT balance-delta detection.
+ */
+async function generateUniqueCode() {
+    // Ambil kode unik yang sudah dipakai oleh order PENDING
+    const { data: pendingOrders } = await supabase
+        .from('orders')
+        .select('unique_code')
+        .eq('status', 'PENDING')
+        .gt('unique_code', 0);
+
+    const usedCodes = new Set((pendingOrders || []).map(o => o.unique_code));
+
+    // Cari kode unik yang belum dipakai (1–100)
+    let code;
+    let attempts = 0;
+    do {
+        code = Math.floor(Math.random() * 100) + 1; // 1–100
+        attempts++;
+    } while (usedCodes.has(code) && attempts < 200);
+
+    // Fallback jika semua terpakai
+    if (usedCodes.has(code)) {
+        code = Math.floor(Math.random() * 100) + 1;
+    }
+
+    return code;
+}
+
+/**
+ * Baca setting payment_gateway dari Supabase.
+ * Returns 'fincloud' (default) atau 'orkut'.
+ */
+async function getActivePaymentGateway() {
+    try {
+        const { data, error } = await supabase
+            .from('settings')
+            .select('value')
+            .eq('key', 'payment_gateway')
+            .single();
+
+        if (error || !data || !data.value) return 'fincloud';
+        let val = data.value;
+        if (typeof val === 'object' && val !== null) {
+            val = val.provider || val.value || val.gateway || 'fincloud';
+        }
+        return String(val).toLowerCase().trim() === 'orkut' ? 'orkut' : 'fincloud';
+    } catch {
+        return 'fincloud';
+    }
+}
+
 // ══════════════════════════════════════════════════════════════════════════
 // POST /api/payments/create
-// Buat order baru + invoice QRIS di FinCloud.
+// Buat order baru + invoice QRIS via gateway aktif (FinCloud / ORKUT).
 //
 // Body:
 //   product_id       (string)  — ID produk di DB kita
@@ -28,7 +83,7 @@ function generateOrderId() {
 //   wa_number        (string)
 //   email            (string)
 //
-// Note: payment_code tidak diperlukan lagi (selalu QRIS via FinCloud).
+// Note: payment_gateway dipilih otomatis dari setting admin.
 // ══════════════════════════════════════════════════════════════════════════
 
 async function createPayment(req, res) {
@@ -183,27 +238,65 @@ async function createPayment(req, res) {
             return res.status(400).json({ error: 'Minimal pembayaran Rp 1.000' });
         }
 
-        // ── Generate order ID ───────────────────────────────────
+        // ── Generate order ID & kode unik ───────────────────────
         const orderId = generateOrderId();
+        const uniqueCode = await generateUniqueCode();
+        const totalWithUniqueCode = amount + uniqueCode;
 
-        // ── Buat invoice QRIS di FinCloud ───────────────────────
-        const pgResult = await paymentGatewayService.createInvoice({
-            reffId: orderId,
-            nominal: amount,
-        });
+        // ── Tentukan payment gateway dari setting admin ─────────
+        const pgProvider = await getActivePaymentGateway();
+        console.log(`[paymentController] Using payment gateway: ${pgProvider}, unique_code: ${uniqueCode}`);
 
-        if (!pgResult.success) {
-            console.error('[paymentController] FinCloud createInvoice failed:', pgResult);
-            return res.status(pgResult.status || 502).json({
-                error: `Gagal membuat pembayaran: ${pgResult.message}`,
+        let pgData, pgFee, pgTotal, pgInvoice, pgPaymentLink, pgQrLink;
+
+        if (pgProvider === 'orkut') {
+            // ── Buat QRIS via ORKUT Gateway ─────────────────────
+            const orkutResult = await orkutGatewayService.createPayment({
+                trxId: orderId,
+                amount: totalWithUniqueCode,
             });
+
+            if (!orkutResult.success) {
+                console.error('[paymentController] ORKUT createPayment failed:', orkutResult);
+                return res.status(orkutResult.status || 502).json({
+                    error: `Gagal membuat pembayaran ORKUT: ${orkutResult.message}`,
+                });
+            }
+
+            pgData = orkutResult.data;
+            pgFee = 0; // ORKUT tidak mengenakan fee tambahan
+            pgTotal = totalWithUniqueCode;
+            pgInvoice = pgData.ref || orderId;
+            pgPaymentLink = null;
+            
+            // Gunakan HTTPS QR Generator jika qr_string ada, untuk mencegah Mixed Content Block (HTTP di HTTPS)
+            if (pgData.qr_string) {
+                pgQrLink = `https://api.qrserver.com/v1/create-qr-code/?size=350x350&data=${encodeURIComponent(pgData.qr_string)}`;
+            } else {
+                pgQrLink = pgData.qr_link || null;
+            }
+
+        } else {
+            // ── Buat invoice QRIS via FinCloud (default) ────────
+            const pgResult = await paymentGatewayService.createInvoice({
+                reffId: orderId,
+                nominal: totalWithUniqueCode,
+            });
+
+            if (!pgResult.success) {
+                console.error('[paymentController] FinCloud createInvoice failed:', pgResult);
+                return res.status(pgResult.status || 502).json({
+                    error: `Gagal membuat pembayaran: ${pgResult.message}`,
+                });
+            }
+
+            pgData = pgResult.data;
+            pgFee = (pgData.nominal_total || totalWithUniqueCode) - (pgData.nominal_asli || totalWithUniqueCode);
+            pgTotal = pgData.nominal_total || totalWithUniqueCode;
+            pgInvoice = String(pgData.id_depo || '');
+            pgPaymentLink = pgData.invoice_url || null;
+            pgQrLink = pgData.qr_url || null;
         }
-
-        const pgData = pgResult.data;
-
-        // ── Map response FinCloud → kolom Supabase ──────────────
-        const pgFee = (pgData.nominal_total || amount) - (pgData.nominal_asli || amount);
-        const pgTotal = pgData.nominal_total || amount;
 
         // ── Simpan order ke Supabase ────────────────────────────
         const { error: dbError } = await supabase.from('orders').insert([
@@ -218,20 +311,27 @@ async function createPayment(req, res) {
                 payment_method: 'QRIS',
                 status: 'PENDING',
 
-                // Data PG (FinCloud)
-                pg_invoice: String(pgData.id_depo || ''),
-                pg_payment_link: pgData.invoice_url || null,
-                pg_qr_link: pgData.qr_url || null,
+                // Data PG
+                pg_provider: pgProvider,
+                pg_invoice: pgInvoice,
+                pg_payment_link: pgPaymentLink,
+                pg_qr_link: pgQrLink,
                 pg_virtual_account: null,
                 pg_payment_code: 'QRIS',
                 pg_fee: pgFee,
                 pg_total: pgTotal,
-                pg_expired_at: null, // FinCloud tidak return expired_at
+                pg_expired_at: null,
+
+                // Kode unik
+                unique_code: uniqueCode,
+
+                // ORKUT-specific
+                orkut_ref_id: pgProvider === 'orkut' ? (pgData.ref || orderId) : null,
 
                 // Vendor Information
                 vendor,
                 fincloud_sku: dbSku,
-                sekalipay_ref_id: orderId, // Used as vendor_ref_id in fallback cases
+                sekalipay_ref_id: orderId,
                 sekalipay_variant_id: dbVariantId,
 
                 // Simpan note/target ke account_details
@@ -251,24 +351,25 @@ async function createPayment(req, res) {
                 .json({ error: `Gagal menyimpan order: ${dbError.message}` });
         }
 
-        console.log(`[paymentController] Order ${orderId} created, FinCloud id_depo: ${pgData.id_depo}`);
+        console.log(`[paymentController] Order ${orderId} created via ${pgProvider}, unique_code: ${uniqueCode}`);
 
         // ── Response ke frontend ────────────────────────────────
-        // Mapping field names agar frontend tetap kompatibel
         return res.status(201).json({
             success: true,
             data: {
                 order_id: orderId,
-                invoice: String(pgData.id_depo || ''),
+                invoice: pgInvoice,
                 amount,
+                unique_code: uniqueCode,
                 fee: pgFee,
                 total: pgTotal,
                 payment_code: 'QRIS',
-                payment_link: pgData.invoice_url || null,
-                qr_link: pgData.qr_url || null,
+                payment_link: pgPaymentLink,
+                qr_link: pgQrLink,
                 virtual_account: null,
                 expired_at: null,
                 status: 'PENDING',
+                pg_provider: pgProvider,
             },
         });
     } catch (err) {
@@ -289,7 +390,7 @@ async function getPaymentStatus(req, res) {
         const { data, error } = await supabase
             .from('orders')
             .select(
-                'id, status, pg_invoice, pg_paid_at, pg_qr_link, pg_virtual_account, account_details, error_message, pg_expired_at, sekalipay_variant_id'
+                'id, status, pg_invoice, pg_paid_at, pg_qr_link, pg_virtual_account, account_details, error_message, pg_expired_at, sekalipay_variant_id, unique_code, pg_provider'
             )
             .eq('id', orderId)
             .single();
@@ -307,7 +408,7 @@ async function getPaymentStatus(req, res) {
             const { data: updatedData } = await supabase
                 .from('orders')
                 .select(
-                    'id, status, pg_invoice, pg_paid_at, pg_qr_link, pg_virtual_account, account_details, error_message, pg_expired_at'
+                    'id, status, pg_invoice, pg_paid_at, pg_qr_link, pg_virtual_account, account_details, error_message, pg_expired_at, unique_code, pg_provider'
                 )
                 .eq('id', orderId)
                 .single();
@@ -328,7 +429,8 @@ async function getPaymentStatus(req, res) {
 
 // ══════════════════════════════════════════════════════════════════════════
 // POST /api/payments/cancel
-// Batalkan invoice FinCloud (status → expired).
+// Batalkan invoice (status → expired/cancelled).
+// Routing ke gateway yang sesuai berdasarkan pg_provider order.
 // ══════════════════════════════════════════════════════════════════════════
 
 async function cancelPayment(req, res) {
@@ -342,7 +444,7 @@ async function cancelPayment(req, res) {
         // Cek order di Supabase
         const { data: order, error: fetchError } = await supabase
             .from('orders')
-            .select('id, status')
+            .select('id, status, pg_provider')
             .eq('id', order_id)
             .single();
 
@@ -356,14 +458,20 @@ async function cancelPayment(req, res) {
             });
         }
 
-        // Cancel di FinCloud
-        const cancelResult = await paymentGatewayService.cancelInvoice(order_id);
+        // Cancel berdasarkan gateway provider
+        if (order.pg_provider === 'orkut') {
+            // ORKUT tidak punya endpoint cancel — langsung update di DB saja
+            console.log(`[paymentController] ORKUT order ${order_id} cancelled (no API cancel needed)`);
+        } else {
+            // Cancel di FinCloud
+            const cancelResult = await paymentGatewayService.cancelInvoice(order_id);
 
-        if (!cancelResult.success) {
-            console.error('[paymentController] FinCloud cancelInvoice failed:', cancelResult);
-            return res.status(502).json({
-                error: `Gagal membatalkan: ${cancelResult.message}`,
-            });
+            if (!cancelResult.success) {
+                console.error('[paymentController] FinCloud cancelInvoice failed:', cancelResult);
+                return res.status(502).json({
+                    error: `Gagal membatalkan: ${cancelResult.message}`,
+                });
+            }
         }
 
         // Update status di Supabase
@@ -372,7 +480,7 @@ async function cancelPayment(req, res) {
             .update({ status: 'CANCELLED' })
             .eq('id', order_id);
 
-        console.log(`[paymentController] Order ${order_id} cancelled via FinCloud`);
+        console.log(`[paymentController] Order ${order_id} cancelled via ${order.pg_provider}`);
 
         return res.json({ success: true, message: 'Invoice berhasil dibatalkan' });
     } catch (err) {

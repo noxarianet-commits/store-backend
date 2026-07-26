@@ -48,4 +48,15 @@ router.post(
     webhookController.handleFincloudPPOBWebhook
 );
 
+/**
+ * POST /api/webhooks/orkut
+ * Callback dari ORKUT Gateway (jika webhook dikonfigurasi).
+ */
+router.post(
+    '/orkut',
+    express.json(),
+    webhookController.handleOrkutWebhook
+);
+
 module.exports = router;
+

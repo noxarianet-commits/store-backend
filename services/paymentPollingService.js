@@ -1,5 +1,6 @@
 const supabase = require('../supabase');
 const paymentGatewayService = require('./paymentGatewayService');
+const orkutGatewayService = require('./orkutGatewayService');
 const sekalipayService = require('./sekalipayService');
 const orderFulfillmentService = require('./orderFulfillmentService');
 const { normalizeNotePhoneNumber } = require('../utils/phoneUtils');
@@ -7,15 +8,15 @@ const vendorRegistry = require('./vendors/vendorRegistry');
 const emailService = require('./emailService');
 
 /**
- * Service untuk mem-polling status pembayaran dari FinCloud
- * sebagai solusi jika webhook dari FinCloud gagal atau tidak masuk.
+ * Service untuk mem-polling status pembayaran dari FinCloud dan ORKUT
+ * sebagai solusi jika webhook dari payment gateway gagal atau tidak masuk.
  */
 class PaymentPollingService {
     async pollPendingOrders() {
         try {
-            console.log('[Polling/PG-FinCloud] Memulai pengecekan status pending orders...');
+            console.log('[Polling/PG] Memulai pengecekan status pending orders...');
             
-            // Cari order PENDING yang menggunakan QRIS dan punya id_depo (pg_invoice)
+            // Cari order PENDING yang menggunakan QRIS dan punya pg_invoice
             // Batasi misalnya order yang dibuat maksimal 24 jam terakhir agar tidak berat
             const yesterday = new Date();
             yesterday.setHours(yesterday.getHours() - 24);
@@ -29,29 +30,96 @@ class PaymentPollingService {
                 .gte('timestamp', yesterday.toISOString());
 
             if (error) {
-                console.error('[Polling/PG-FinCloud] Gagal mengambil pending orders:', error.message);
+                console.error('[Polling/PG] Gagal mengambil pending orders:', error.message);
                 return;
             }
 
             if (!orders || orders.length === 0) {
-                console.log('[Polling/PG-FinCloud] Tidak ada pending orders untuk diproses.');
+                console.log('[Polling/PG] Tidak ada pending orders untuk diproses.');
                 return;
             }
 
-            console.log(`[Polling/PG-FinCloud] Ditemukan ${orders.length} order PENDING.`);
+            console.log(`[Polling/PG] Ditemukan ${orders.length} order PENDING.`);
 
-            // Proses setiap order
+            // Proses setiap order berdasarkan pg_provider
             for (const order of orders) {
                 await this.processOrder(order);
             }
 
-            console.log('[Polling/PG-FinCloud] Pengecekan selesai.');
+            console.log('[Polling/PG] Pengecekan selesai.');
         } catch (err) {
-            console.error('[Polling/PG-FinCloud] Error dalam proses polling:', err);
+            console.error('[Polling/PG] Error dalam proses polling:', err);
         }
     }
 
     async processOrder(order) {
+        const pgProvider = order.pg_provider || 'fincloud';
+        
+        if (pgProvider === 'orkut') {
+            return this._processOrkutOrder(order);
+        } else {
+            return this._processFincloudOrder(order);
+        }
+    }
+
+    /**
+     * Proses polling untuk order ORKUT.
+     * Cek status via ORKUT Gateway API.
+     */
+    async _processOrkutOrder(order) {
+        const refId = order.orkut_ref_id || order.id;
+        const orderId = order.id;
+
+        try {
+            const checkResult = await orkutGatewayService.checkPaymentStatus(refId);
+
+            if (!checkResult.success) {
+                return;
+            }
+
+            if (checkResult.paymentStatus !== 'PAID') {
+                // Belum dibayar, abaikan
+                return;
+            }
+
+            console.log(`[Polling/PG-ORKUT] Order ${orderId} ternyata sudah PAID (ref=${refId}). Memproses...`);
+
+            // Pastikan belum diproses secara bersamaan
+            const { data: currentOrder } = await supabase
+                .from('orders')
+                .select('*')
+                .eq('id', orderId)
+                .single();
+
+            if (currentOrder && currentOrder.status !== 'PENDING') {
+                console.log(`[Polling/PG-ORKUT] Order ${orderId} sudah diproses. Skip.`);
+                return;
+            }
+
+            // Update pg_paid_at
+            await supabase
+                .from('orders')
+                .update({ pg_paid_at: new Date().toISOString() })
+                .eq('id', orderId);
+
+            // Fulfillment
+            const fulfillmentResult = await orderFulfillmentService.fulfillOrder(currentOrder);
+
+            if (!fulfillmentResult.success && !fulfillmentResult.skipped) {
+                console.error(`[Polling/PG-ORKUT] Fulfillment order gagal untuk ${orderId}:`, fulfillmentResult.message);
+            } else if (fulfillmentResult.success && !fulfillmentResult.skipped) {
+                console.log(`[Polling/PG-ORKUT] Order ${orderId} berhasil diproses via polling.`);
+            }
+        } catch (err) {
+            console.error(`[Polling/PG-ORKUT] Error memproses order ${orderId}:`, err);
+        }
+    }
+
+    /**
+     * Proses polling untuk order FinCloud.
+     * Cek status via FinCloud API (id_depo).
+     */
+    async _processFincloudOrder(order) {
         const idDepo = order.pg_invoice;
         const reffId = order.id;
 
@@ -60,7 +128,6 @@ class PaymentPollingService {
             const checkResult = await paymentGatewayService.checkInvoiceStatus(idDepo);
             
             if (!checkResult.success || !checkResult.data) {
-                // Jika FinCloud API mengembalikan status sukses (false) / error
                 return;
             }
 
@@ -118,15 +185,15 @@ class PaymentPollingService {
                 .select('id');
 
             if (error) {
-                console.error('[Polling/PG-FinCloud] Gagal update status order expired:', error.message);
+                console.error('[Polling/PG] Gagal update status order expired:', error.message);
                 return;
             }
 
             if (orders && orders.length > 0) {
-                console.log(`[Polling/PG-FinCloud] Berhasil membatalkan ${orders.length} order kedaluwarsa (> 30 menit).`);
+                console.log(`[Polling/PG] Berhasil membatalkan ${orders.length} order kedaluwarsa (> 30 menit).`);
             }
         } catch (err) {
-            console.error('[Polling/PG-FinCloud] Error dalam membatalkan order kedaluwarsa:', err);
+            console.error('[Polling/PG] Error dalam membatalkan order kedaluwarsa:', err);
         }
     }
 

@@ -383,4 +383,56 @@ async function handleFincloudPPOBWebhook(req, res) {
     return res.sendStatus(200);
 }
 
-module.exports = { handlePaymentGatewayWebhook, handleSekalipayWebhook, handleFincloudPPOBWebhook };
+// ══════════════════════════════════════════════════════════════════════════
+// HANDLER 4 — POST /api/webhooks/orkut
+// Callback dari ORKUT Gateway (jika webhook dikonfigurasi).
+// ══════════════════════════════════════════════════════════════════════════
+
+async function handleOrkutWebhook(req, res) {
+    const { ref_id, trx_id, status, amount } = req.body;
+    const targetRef = ref_id || trx_id;
+
+    console.log(`[Webhook/ORKUT] Received callback for ref=${targetRef}, status=${status}`);
+
+    if (!targetRef) {
+        return res.status(400).json({ error: 'ref_id or trx_id missing' });
+    }
+
+    if (status !== 'PAID' && status !== 'CLAIMED' && status !== 'success') {
+        return res.sendStatus(200);
+    }
+
+    // Ambil order dari Supabase
+    const { data: order, error: fetchError } = await supabase
+        .from('orders')
+        .select('*')
+        .or(`id.eq.${targetRef},orkut_ref_id.eq.${targetRef}`)
+        .single();
+
+    if (fetchError || !order) {
+        console.error(`[Webhook/ORKUT] Order ${targetRef} tidak ditemukan.`);
+        return res.sendStatus(200);
+    }
+
+    if (order.status !== 'PENDING') {
+        console.log(`[Webhook/ORKUT] Order ${order.id} sudah diproses (status: ${order.status}), skip.`);
+        return res.sendStatus(200);
+    }
+
+    // Update pg_paid_at
+    await supabase
+        .from('orders')
+        .update({ pg_paid_at: new Date().toISOString() })
+        .eq('id', order.id);
+
+    // Fulfill order
+    const fulfillmentResult = await orderFulfillmentService.fulfillOrder(order);
+    if (!fulfillmentResult.success && !fulfillmentResult.skipped) {
+        console.error(`[Webhook/ORKUT] Fulfillment order gagal untuk ${order.id}:`, fulfillmentResult.message);
+    }
+
+    return res.sendStatus(200);
+}
+
+module.exports = { handlePaymentGatewayWebhook, handleSekalipayWebhook, handleFincloudPPOBWebhook, handleOrkutWebhook };
+

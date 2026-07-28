@@ -13,7 +13,27 @@
  */
 
 const nodemailer = require('nodemailer');
+const supabase = require('../supabase');
 const { buildCompletedEmailHtml, buildFailedEmailHtml } = require('../templates/emailTemplates');
+
+/**
+ * Fetch WhatsApp CS setting from Supabase with fallback
+ */
+async function getWaCsNumber() {
+    try {
+        const { data } = await supabase
+            .from('settings')
+            .select('value')
+            .eq('key', 'whatsapp_cs')
+            .maybeSingle();
+        if (data && data.value) {
+            return String(data.value);
+        }
+    } catch (err) {
+        console.warn('[EmailService] Gagal fetch whatsapp_cs setting:', err.message);
+    }
+    return '6285199605580';
+}
 
 // ══════════════════════════════════════════════════════════════════════════
 // SMTP TRANSPORTER SETUP
@@ -104,7 +124,8 @@ async function sendEmail({ to, subject, html }) {
  * @returns {Promise<{success: boolean, messageId?: string, error?: string}>}
  */
 async function sendOrderCompletedEmail(order) {
-    const html = buildCompletedEmailHtml(order);
+    const waNumber = await getWaCsNumber();
+    const html = buildCompletedEmailHtml(order, waNumber);
 
     return sendEmail({
         to: order.email,
@@ -120,7 +141,8 @@ async function sendOrderCompletedEmail(order) {
  * @returns {Promise<{success: boolean, messageId?: string, error?: string}>}
  */
 async function sendOrderFailedEmail(order) {
-    const html = buildFailedEmailHtml(order);
+    const waNumber = await getWaCsNumber();
+    const html = buildFailedEmailHtml(order, waNumber);
 
     return sendEmail({
         to: order.email,

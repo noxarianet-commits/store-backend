@@ -455,12 +455,14 @@ function getSectionTitle(productType) {
 /**
  * Build HTML email untuk order COMPLETED (sukses).
  * @param {Object} order - Data order lengkap dari Supabase
+ * @param {string} [waNumber='6285199605580'] - Nomor WhatsApp CS
  * @returns {string} HTML string
  */
-function buildCompletedEmailHtml(order) {
+function buildCompletedEmailHtml(order, waNumber = '6285199605580') {
     const { html: accountHtml, productType } = buildAccountDetailsHtml(order.account_details);
     const warningHtml = buildWarningHtml(productType);
     const sectionTitle = getSectionTitle(productType);
+    const cleanWa = String(waNumber || '6285199605580').replace(/\D/g, '') || '6285199605580';
 
     return `
 <!DOCTYPE html>
@@ -537,7 +539,7 @@ function buildCompletedEmailHtml(order) {
                     <tr>
                         <td style="background:#f5f5f7; padding:24px 40px; text-align:center; border-top:1px solid #eee;">
                             <p style="margin:0 0 6px; color:#888; font-size:12px;">Ada kendala? Hubungi kami via WhatsApp</p>
-                            <p style="margin:0 0 12px; color:#1a237e; font-size:13px; font-weight:600;">wa.me/6285199605580</p>
+                            <p style="margin:0 0 12px; color:#1a237e; font-size:13px; font-weight:600;">wa.me/${cleanWa}</p>
                             <p style="margin:0; color:#bbb; font-size:11px;">© ${new Date().getFullYear()} Noxarianet Store — noxarianet.web.id</p>
                         </td>
                     </tr>
@@ -554,9 +556,12 @@ function buildCompletedEmailHtml(order) {
  * Build HTML email untuk order FAILED / CANCELLED.
  * CATATAN: error_message TIDAK ditampilkan ke user (hanya info umum).
  * @param {Object} order - Data order dari Supabase
+ * @param {string} [waNumber='6285199605580'] - Nomor WhatsApp CS
  * @returns {string} HTML string
  */
-function buildFailedEmailHtml(order) {
+function buildFailedEmailHtml(order, waNumber = '6285199605580') {
+    const cleanWa = String(waNumber || '6285199605580').replace(/\D/g, '') || '6285199605580';
+
     return `
 <!DOCTYPE html>
 <html lang="id">
@@ -634,7 +639,7 @@ function buildFailedEmailHtml(order) {
                     <tr>
                         <td style="background:#f5f5f7; padding:24px 40px; text-align:center; border-top:1px solid #eee;">
                             <p style="margin:0 0 6px; color:#888; font-size:12px;">Butuh bantuan? Hubungi Admin kami</p>
-                            <p style="margin:0 0 12px; color:#1a237e; font-size:13px; font-weight:600;">wa.me/6285199605580</p>
+                            <p style="margin:0 0 12px; color:#1a237e; font-size:13px; font-weight:600;">wa.me/${cleanWa}</p>
                             <p style="margin:0; color:#bbb; font-size:11px;">© ${new Date().getFullYear()} Noxarianet Store — noxarianet.web.id</p>
                         </td>
                     </tr>

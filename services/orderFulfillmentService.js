@@ -124,15 +124,31 @@ class OrderFulfillmentService {
                 }
 
                 const rawNote = order.account_details?.sekalipay_note || '-';
-                const note = normalizeNotePhoneNumber(rawNote);
+                let note = normalizeNotePhoneNumber(rawNote);
+                let zoneId = order.account_details?.zone_id || order.account_details?.zoneId || null;
 
-                const carts = [
-                    {
-                        item_id: variantId,
-                        quantity: 1,
-                        note,
-                    },
-                ];
+                // Extract zone_id and clean note if formatted as USER_ID(ZONE_ID)
+                if (typeof note === 'string') {
+                    const match = note.match(/^([^\(\)]+)\(([^\(\)]+)\)$/);
+                    if (match) {
+                        note = match[1].trim();
+                        if (!zoneId) {
+                            zoneId = match[2].trim();
+                        }
+                    }
+                }
+
+                const cartItem = {
+                    item_id: variantId,
+                    quantity: 1,
+                    note,
+                };
+
+                if (zoneId) {
+                    cartItem.zone_id = String(zoneId);
+                }
+
+                const carts = [cartItem];
 
                 vendorResult = await vendorAdapter.createOrder(orderId, { carts });
 

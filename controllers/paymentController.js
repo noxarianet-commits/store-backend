@@ -118,6 +118,9 @@ async function createPayment(req, res) {
             wa_number,
             email,
             note,           // string | json string (for sekalipay), string (target for fincloud)
+            customer_id,
+            user_id,
+            zone_id,
             provider_qty,   // number (for open denom)
         } = req.body;
 
@@ -334,11 +337,30 @@ async function createPayment(req, res) {
                 sekalipay_ref_id: orderId,
                 sekalipay_variant_id: dbVariantId,
 
-                // Simpan note/target ke account_details
-                account_details: note ? { 
-                    sekalipay_note: vendor === 'sekalipay' ? normalizeNotePhoneNumber(note) : null,
-                    target: vendor === 'fincloud' ? normalizeNotePhoneNumber(note) : null,
-                } : null,
+                // Simpan note/target/zone_id ke account_details
+                account_details: (() => {
+                    const rawZoneId = zone_id || (req.body.fieldData && req.body.fieldData.zone_id);
+                    const rawUserId = customer_id || user_id || (req.body.fieldData && req.body.fieldData.customer_id);
+
+                    let finalZoneId = rawZoneId ? String(rawZoneId).trim() : null;
+                    let finalUserId = rawUserId ? String(rawUserId).trim() : null;
+
+                    if (!finalZoneId && note && typeof note === 'string') {
+                        const match = note.match(/^([^\(\)]+)\(([^\(\)]+)\)$/);
+                        if (match) {
+                            finalUserId = finalUserId || match[1].trim();
+                            finalZoneId = match[2].trim();
+                        }
+                    }
+
+                    return note ? { 
+                        sekalipay_note: vendor === 'sekalipay' ? normalizeNotePhoneNumber(note) : null,
+                        target: vendor === 'fincloud' ? normalizeNotePhoneNumber(note) : null,
+                        customer_id: finalUserId,
+                        user_id: finalUserId,
+                        zone_id: finalZoneId,
+                    } : null;
+                })(),
 
                 timestamp: new Date().toISOString(),
             },

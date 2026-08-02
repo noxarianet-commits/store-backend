@@ -229,6 +229,43 @@ async function createPayment(req, res) {
                     return res.status(400).json({ error: 'Maaf, stok untuk varian ini sedang habis. Silakan pilih varian lain atau coba lagi nanti.' });
                 }
             }
+
+            // ── Cek ketersediaan variant di layanan validasi (H2H/topup: ewallet/game) ──
+            // Pastikan data[].variants[].status = active/on/true sebelum create payment
+            if (variant.validation?.available && dbProduct.sekalipay_product_id) {
+                try {
+                    const svcCheck = await sekalipayService.checkValidationServices(dbProduct.name);
+                    if (svcCheck.success && Array.isArray(svcCheck.data)) {
+                        // Cari produk yang cocok berdasarkan nama atau sekalipay_product_id
+                        const matchedSvc = svcCheck.data.find(s =>
+                            s.product_id === dbProduct.sekalipay_product_id
+                            || s.product_name?.toLowerCase() === dbProduct.name?.toLowerCase()
+                        );
+
+                        // Cek status variant spesifik di response (harus active/on/true)
+                        if (matchedSvc?.variants && Array.isArray(matchedSvc.variants)) {
+                            const matchedVariant = matchedSvc.variants.find(v => v.item_id === dbVariantId);
+                            if (matchedVariant) {
+                                const vstatus = String(matchedVariant.status).toLowerCase();
+                                const isVariantActive = vstatus === 'active' || vstatus === 'on' || vstatus === 'true';
+                                if (!isVariantActive) {
+                                    console.warn(`[paymentController] Variant ${dbVariantId} status "${matchedVariant.status}" is not active in validation services`);
+                                    return res.status(400).json({
+                                        error: 'Varian produk ini sedang tidak aktif di penyedia layanan. Silakan pilih varian lain atau coba lagi nanti.'
+                                    });
+                                }
+                                console.log(`[paymentController] Validation service check passed for "${dbProduct.name}" variant ${dbVariantId} (status: ${matchedVariant.status})`);
+                            }
+                        }
+                    } else {
+                        // API gagal tapi bukan network error — tetap lanjut (fail-open)
+                        console.warn('[paymentController] checkValidationServices returned no data, proceeding with checkout (fail-open)');
+                    }
+                } catch (valErr) {
+                    // Network error atau unexpected crash — tetap lanjut (fail-open)
+                    console.warn('[paymentController] checkValidationServices error, proceeding with checkout (fail-open):', valErr.message);
+                }
+            }
         }
 
         // Jika harga dari frontend berbeda dengan perhitungan backend, tolak request

@@ -162,6 +162,29 @@ class SekalipayService {
     }
 
     // ══════════════════════════════════════════════════════════════
+    // VALIDATION SERVICES (Pre-checkout availability check)
+    // ══════════════════════════════════════════════════════════════
+
+    /**
+     * Check which products have active validation services.
+     * Used before checkout to verify that the H2H/topup service
+     * (ewallet/game) is still available for processing.
+     * 
+     * @param {string} [search] - Filter by product/item name (e.g. "dana", "mobile_legends")
+     * @returns {{ success: boolean, data?: Array, meta?: object }}
+     */
+    async checkValidationServices(search = '') {
+        try {
+            const res = await this.client.get('/v1/validation/services', {
+                params: { search: search || undefined },
+            });
+            return { success: true, data: res.data.data, meta: res.data.meta };
+        } catch (error) {
+            return this._handleError(error, 'checkValidationServices');
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════
     // TRANSACTIONS (prepared for future use)
     // ══════════════════════════════════════════════════════════════
 

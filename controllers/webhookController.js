@@ -1,6 +1,7 @@
 const crypto = require('crypto');
 const supabase = require('../supabase');
 const paymentGatewayService = require('../services/paymentGatewayService');
+const sayabayarGatewayService = require('../services/sayabayarGatewayService');
 const sekalipayService = require('../services/sekalipayService');
 const emailService = require('../services/emailService');
 const orderFulfillmentService = require('../services/orderFulfillmentService');
@@ -384,55 +385,79 @@ async function handleFincloudPPOBWebhook(req, res) {
 }
 
 // ══════════════════════════════════════════════════════════════════════════
-// HANDLER 4 — POST /api/webhooks/orkut
-// Callback dari ORKUT Gateway (jika webhook dikonfigurasi).
+// HANDLER 4 — POST /api/webhooks/sayabayar
+// Callback dari Saya Bayar Gateway (invoice.paid, invoice.expired, dll).
 // ══════════════════════════════════════════════════════════════════════════
 
-async function handleOrkutWebhook(req, res) {
-    const { ref_id, trx_id, status, amount } = req.body;
-    const targetRef = ref_id || trx_id;
+async function handleSayabayarWebhook(req, res) {
+    try {
+        const signature = req.headers['x-webhook-signature'];
+        const payloadString = req.rawBody || (typeof req.body === 'string' ? req.body : JSON.stringify(req.body));
+        
+        const { webhookSecret } = await sayabayarGatewayService.getConfig();
+        
+        if (webhookSecret) {
+            const isValid = sayabayarGatewayService.verifyWebhookSignature(payloadString, signature, webhookSecret);
+            if (!isValid) {
+                console.warn('[Webhook/Sayabayar] Invalid signature - request ditolak.');
+                return res.status(401).json({ error: 'Invalid signature' });
+            }
+        }
 
-    console.log(`[Webhook/ORKUT] Received callback for ref=${targetRef}, status=${status}`);
+        const body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
+        const { event, data } = body || {};
 
-    if (!targetRef) {
-        return res.status(400).json({ error: 'ref_id or trx_id missing' });
+        if (!data) {
+            return res.status(400).json({ error: 'Payload data missing' });
+        }
+
+        const invoiceId = data.invoice_id || data.id || data.invoice_number;
+        console.log(`[Webhook/Sayabayar] Received event ${event} for invoiceId=${invoiceId}`);
+
+        const { data: order, error: fetchError } = await supabase
+            .from('orders')
+            .select('*')
+            .or(`id.eq.${invoiceId},sayabayar_ref_id.eq.${invoiceId},pg_invoice.eq.${data.payment_url || invoiceId}`)
+            .maybeSingle();
+
+        if (fetchError || !order) {
+            console.error(`[Webhook/Sayabayar] Order ${invoiceId} tidak ditemukan.`);
+            return res.status(200).json({ received: true });
+        }
+
+        if (order.status !== 'PENDING') {
+            console.log(`[Webhook/Sayabayar] Order ${order.id} sudah diproses (status: ${order.status}), skip.`);
+            return res.status(200).json({ received: true });
+        }
+
+        if (event === 'invoice.paid') {
+            await supabase
+                .from('orders')
+                .update({ pg_paid_at: data.paid_at || new Date().toISOString() })
+                .eq('id', order.id);
+
+            const fulfillmentResult = await orderFulfillmentService.fulfillOrder(order);
+            if (!fulfillmentResult.success && !fulfillmentResult.skipped) {
+                console.error(`[Webhook/Sayabayar] Fulfillment order gagal untuk ${order.id}:`, fulfillmentResult.message);
+            }
+        } else if (event === 'invoice.expired' || event === 'invoice.cancelled') {
+            await supabase
+                .from('orders')
+                .update({ status: 'CANCELLED', error_message: `Invoice ${event} di Saya Bayar` })
+                .eq('id', order.id);
+        }
+
+        return res.status(200).json({ received: true });
+    } catch (err) {
+        console.error('[Webhook/Sayabayar] Internal error:', err);
+        return res.status(500).json({ error: err.message });
     }
-
-    if (status !== 'PAID' && status !== 'CLAIMED' && status !== 'success') {
-        return res.sendStatus(200);
-    }
-
-    // Ambil order dari Supabase
-    const { data: order, error: fetchError } = await supabase
-        .from('orders')
-        .select('*')
-        .or(`id.eq.${targetRef},orkut_ref_id.eq.${targetRef}`)
-        .single();
-
-    if (fetchError || !order) {
-        console.error(`[Webhook/ORKUT] Order ${targetRef} tidak ditemukan.`);
-        return res.sendStatus(200);
-    }
-
-    if (order.status !== 'PENDING') {
-        console.log(`[Webhook/ORKUT] Order ${order.id} sudah diproses (status: ${order.status}), skip.`);
-        return res.sendStatus(200);
-    }
-
-    // Update pg_paid_at
-    await supabase
-        .from('orders')
-        .update({ pg_paid_at: new Date().toISOString() })
-        .eq('id', order.id);
-
-    // Fulfill order
-    const fulfillmentResult = await orderFulfillmentService.fulfillOrder(order);
-    if (!fulfillmentResult.success && !fulfillmentResult.skipped) {
-        console.error(`[Webhook/ORKUT] Fulfillment order gagal untuk ${order.id}:`, fulfillmentResult.message);
-    }
-
-    return res.sendStatus(200);
 }
 
-module.exports = { handlePaymentGatewayWebhook, handleSekalipayWebhook, handleFincloudPPOBWebhook, handleOrkutWebhook };
+module.exports = {
+    handlePaymentGatewayWebhook,
+    handleSekalipayWebhook,
+    handleFincloudPPOBWebhook,
+    handleSayabayarWebhook
+};
 

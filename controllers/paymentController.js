@@ -1,6 +1,6 @@
 const supabase = require('../supabase');
 const paymentGatewayService = require('../services/paymentGatewayService');
-const orkutGatewayService = require('../services/orkutGatewayService');
+const sayabayarGatewayService = require('../services/sayabayarGatewayService');
 const paymentPollingService = require('../services/paymentPollingService');
 const sekalipayService = require('../services/sekalipayService');
 const { normalizeNotePhoneNumber } = require('../utils/phoneUtils');
@@ -18,7 +18,7 @@ function generateOrderId() {
 /**
  * Generate kode unik (1–999) yang belum dipakai oleh transaksi PENDING.
  * Kode unik ditambahkan ke nominal agar setiap pembayaran punya
- * total yang berbeda — penting untuk ORKUT balance-delta detection.
+ * total yang berbeda.
  */
 async function generateUniqueCode() {
     // Ambil kode unik yang sudah dipakai oleh order PENDING
@@ -48,7 +48,7 @@ async function generateUniqueCode() {
 
 /**
  * Baca setting payment_gateway dari Supabase.
- * Returns 'fincloud' (default) atau 'orkut'.
+ * Returns 'fincloud' (default) atau 'sayabayar'.
  */
 async function getActivePaymentGateway() {
     try {
@@ -56,14 +56,17 @@ async function getActivePaymentGateway() {
             .from('settings')
             .select('value')
             .eq('key', 'payment_gateway')
-            .single();
+            .maybeSingle();
 
         if (error || !data || !data.value) return 'fincloud';
         let val = data.value;
+        if (typeof val === 'string') {
+            try { val = JSON.parse(val); } catch (e) {}
+        }
         if (typeof val === 'object' && val !== null) {
             val = val.provider || val.value || val.gateway || 'fincloud';
         }
-        return String(val).toLowerCase().trim() === 'orkut' ? 'orkut' : 'fincloud';
+        return String(val).toLowerCase().trim() === 'sayabayar' ? 'sayabayar' : 'fincloud';
     } catch {
         return 'fincloud';
     }
@@ -71,7 +74,7 @@ async function getActivePaymentGateway() {
 
 // ══════════════════════════════════════════════════════════════════════════
 // POST /api/payments/create
-// Buat order baru + invoice QRIS via gateway aktif (FinCloud / ORKUT).
+// Buat order baru + invoice QRIS via gateway aktif (FinCloud / Saya Bayar).
 //
 // Body:
 //   product_id       (string)  — ID produk di DB kita
@@ -289,31 +292,34 @@ async function createPayment(req, res) {
 
         let pgData, pgFee, pgTotal, pgInvoice, pgPaymentLink, pgQrLink;
 
-        if (pgProvider === 'orkut') {
-            // ── Buat QRIS via ORKUT Gateway ─────────────────────
-            const orkutResult = await orkutGatewayService.createPayment({
-                trxId: orderId,
+        if (pgProvider === 'sayabayar') {
+            // ── Buat Invoice via Saya Bayar ────────────────────
+            const sayabayarResult = await sayabayarGatewayService.createInvoice({
+                customer_name: (customer_name || wa_number || 'Pelanggan').trim(),
+                customer_email: (email || 'customer@noxarianet.web.id').trim(),
                 amount: totalWithUniqueCode,
+                description: `Order ${orderId} - ${product_name || 'NoxariaNet Store'}`,
+                redirect_url: `${process.env.FRONTEND_URL || 'http://localhost:5173'}/checkout/success?order_id=${orderId}`
             });
 
-            if (!orkutResult.success) {
-                console.error('[paymentController] ORKUT createPayment failed:', orkutResult);
-                return res.status(orkutResult.status || 502).json({
-                    error: `Gagal membuat pembayaran ORKUT: ${orkutResult.message}`,
+            if (!sayabayarResult.success) {
+                console.error('[paymentController] Saya Bayar createInvoice failed:', sayabayarResult);
+                return res.status(sayabayarResult.status || 502).json({
+                    error: `Gagal membuat pembayaran Saya Bayar: ${sayabayarResult.message}`,
                 });
             }
 
-            pgData = orkutResult.data;
-            pgFee = 0; // ORKUT tidak mengenakan fee tambahan
+            pgData = sayabayarResult.data;
+            pgFee = 0; // Saya Bayar 0% transaction fee
             pgTotal = totalWithUniqueCode;
-            pgInvoice = pgData.ref || orderId;
-            pgPaymentLink = null;
+            pgInvoice = pgData.payment_url || pgData.invoice_number || pgData.id;
+            pgPaymentLink = pgData.payment_url || null;
             
-            // Gunakan HTTPS QR Generator jika qr_string ada, untuk mencegah Mixed Content Block (HTTP di HTTPS)
-            if (pgData.qr_string) {
-                pgQrLink = `https://api.qrserver.com/v1/create-qr-code/?size=350x350&data=${encodeURIComponent(pgData.qr_string)}`;
+            const qrisString = pgData.payment_channel?.qris_string;
+            if (qrisString) {
+                pgQrLink = `https://api.qrserver.com/v1/create-qr-code/?size=350x350&data=${encodeURIComponent(qrisString)}`;
             } else {
-                pgQrLink = pgData.qr_link || null;
+                pgQrLink = pgData.payment_url || null;
             }
 
         } else {
@@ -360,13 +366,13 @@ async function createPayment(req, res) {
                 pg_payment_code: 'QRIS',
                 pg_fee: pgFee,
                 pg_total: pgTotal,
-                pg_expired_at: null,
+                pg_expired_at: pgData?.expired_at || null,
 
                 // Kode unik
                 unique_code: uniqueCode,
 
-                // ORKUT-specific
-                orkut_ref_id: pgProvider === 'orkut' ? (pgData.ref || orderId) : null,
+                // Saya Bayar-specific
+                sayabayar_ref_id: pgProvider === 'sayabayar' ? (pgData.id || orderId) : null,
 
                 // Vendor Information
                 vendor,
@@ -518,9 +524,8 @@ async function cancelPayment(req, res) {
         }
 
         // Cancel berdasarkan gateway provider
-        if (order.pg_provider === 'orkut') {
-            // ORKUT tidak punya endpoint cancel — langsung update di DB saja
-            console.log(`[paymentController] ORKUT order ${order_id} cancelled (no API cancel needed)`);
+        if (order.pg_provider === 'sayabayar') {
+            console.log(`[paymentController] Saya Bayar order ${order_id} cancelled (no API cancel needed)`);
         } else {
             // Cancel di FinCloud
             const cancelResult = await paymentGatewayService.cancelInvoice(order_id);

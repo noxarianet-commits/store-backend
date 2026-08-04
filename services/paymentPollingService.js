@@ -1,6 +1,6 @@
 const supabase = require('../supabase');
 const paymentGatewayService = require('./paymentGatewayService');
-const orkutGatewayService = require('./orkutGatewayService');
+const sayabayarGatewayService = require('./sayabayarGatewayService');
 const sekalipayService = require('./sekalipayService');
 const orderFulfillmentService = require('./orderFulfillmentService');
 const { normalizeNotePhoneNumber } = require('../utils/phoneUtils');
@@ -8,7 +8,7 @@ const vendorRegistry = require('./vendors/vendorRegistry');
 const emailService = require('./emailService');
 
 /**
- * Service untuk mem-polling status pembayaran dari FinCloud dan ORKUT
+ * Service untuk mem-polling status pembayaran dari FinCloud dan Saya Bayar
  * sebagai solusi jika webhook dari payment gateway gagal atau tidak masuk.
  */
 class PaymentPollingService {
@@ -55,36 +55,34 @@ class PaymentPollingService {
     async processOrder(order) {
         const pgProvider = order.pg_provider || 'fincloud';
         
-        if (pgProvider === 'orkut') {
-            return this._processOrkutOrder(order);
+        if (pgProvider === 'sayabayar') {
+            return this._processSayabayarOrder(order);
         } else {
             return this._processFincloudOrder(order);
         }
     }
 
     /**
-     * Proses polling untuk order ORKUT.
-     * Cek status via ORKUT Gateway API.
+     * Proses polling untuk order Saya Bayar.
+     * Cek status via API Saya Bayar GET /v1/invoices/:id.
      */
-    async _processOrkutOrder(order) {
-        const refId = order.orkut_ref_id || order.id;
+    async _processSayabayarOrder(order) {
+        const refId = order.sayabayar_ref_id || order.id;
         const orderId = order.id;
 
         try {
-            const checkResult = await orkutGatewayService.checkPaymentStatus(refId);
+            const checkResult = await sayabayarGatewayService.getInvoiceDetails(refId);
 
-            if (!checkResult.success) {
+            if (!checkResult.success || !checkResult.data) {
                 return;
             }
 
-            if (checkResult.paymentStatus !== 'PAID') {
-                // Belum dibayar, abaikan
+            if (checkResult.data.status !== 'paid') {
                 return;
             }
 
-            console.log(`[Polling/PG-ORKUT] Order ${orderId} ternyata sudah PAID (ref=${refId}). Memproses...`);
+            console.log(`[Polling/PG-Sayabayar] Order ${orderId} ternyata sudah PAID (ref=${refId}). Memproses...`);
 
-            // Pastikan belum diproses secara bersamaan
             const { data: currentOrder } = await supabase
                 .from('orders')
                 .select('*')
@@ -92,26 +90,24 @@ class PaymentPollingService {
                 .single();
 
             if (currentOrder && currentOrder.status !== 'PENDING') {
-                console.log(`[Polling/PG-ORKUT] Order ${orderId} sudah diproses. Skip.`);
+                console.log(`[Polling/PG-Sayabayar] Order ${orderId} sudah diproses. Skip.`);
                 return;
             }
 
-            // Update pg_paid_at
             await supabase
                 .from('orders')
                 .update({ pg_paid_at: new Date().toISOString() })
                 .eq('id', orderId);
 
-            // Fulfillment
             const fulfillmentResult = await orderFulfillmentService.fulfillOrder(currentOrder);
 
             if (!fulfillmentResult.success && !fulfillmentResult.skipped) {
-                console.error(`[Polling/PG-ORKUT] Fulfillment order gagal untuk ${orderId}:`, fulfillmentResult.message);
+                console.error(`[Polling/PG-Sayabayar] Fulfillment order gagal untuk ${orderId}:`, fulfillmentResult.message);
             } else if (fulfillmentResult.success && !fulfillmentResult.skipped) {
-                console.log(`[Polling/PG-ORKUT] Order ${orderId} berhasil diproses via polling.`);
+                console.log(`[Polling/PG-Sayabayar] Order ${orderId} berhasil diproses via polling.`);
             }
         } catch (err) {
-            console.error(`[Polling/PG-ORKUT] Error memproses order ${orderId}:`, err);
+            console.error(`[Polling/PG-Sayabayar] Error memproses order ${orderId}:`, err);
         }
     }
 

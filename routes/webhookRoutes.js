@@ -49,13 +49,13 @@ router.post(
 );
 
 /**
- * POST /api/webhooks/orkut
- * Callback dari ORKUT Gateway (jika webhook dikonfigurasi).
+ * POST /api/webhooks/sayabayar
+ * Callback dari Saya Bayar Gateway (invoice.paid, invoice.expired, dll).
  */
 router.post(
-    '/orkut',
-    express.json(),
-    webhookController.handleOrkutWebhook
+    '/sayabayar',
+    rawBodyMiddleware,
+    webhookController.handleSayabayarWebhook
 );
 
 module.exports = router;

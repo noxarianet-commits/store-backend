@@ -3,16 +3,61 @@ const fs = require('fs');
 
 /**
  * GET /api/orders
- * List all orders. (Protected)
+ * List orders with pagination, search, and status filter. (Protected)
  */
 async function list(req, res) {
     try {
+        const page = parseInt(req.query.page, 10) || 1;
+        const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 100);
+        const search = req.query.search ? req.query.search.trim() : '';
+        const status = req.query.status ? req.query.status.trim().toUpperCase() : '';
+
+        const from = (page - 1) * limit;
+        const to = from + limit - 1;
+
+        let query = supabase
+            .from('orders')
+            .select('*', { count: 'exact' });
+
+        if (search) {
+            query = query.or(`id.ilike.%${search}%,wa_number.ilike.%${search}%`);
+        }
+
+        if (status && status !== 'ALL') {
+            query = query.eq('status', status);
+        }
+
+        query = query
+            .order('timestamp', { ascending: false })
+            .range(from, to);
+
+        const { data, count, error } = await query;
+        if (error) throw error;
+
+        res.json({
+            orders: data || [],
+            total: count || 0,
+            page,
+            limit,
+            totalPages: Math.ceil((count || 0) / limit) || 1
+        });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+}
+
+/**
+ * GET /api/orders/stats
+ * Lightweight fetch of minimal order fields for dashboard & revenue stats.
+ * Avoids downloading heavy JSON account_details and image fields.
+ */
+async function getStats(req, res) {
+    try {
         const { data, error } = await supabase
             .from('orders')
-            .select('*')
-            .order('timestamp', { ascending: false });
+            .select('id, price, status, timestamp');
         if (error) throw error;
-        res.json(data);
+        res.json(data || []);
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
@@ -153,4 +198,4 @@ async function remove(req, res) {
     }
 }
 
-module.exports = { list, create, update, remove };
+module.exports = { list, getStats, create, update, remove };

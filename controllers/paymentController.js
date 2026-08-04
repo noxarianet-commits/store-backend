@@ -372,7 +372,7 @@ async function createPayment(req, res) {
                 unique_code: uniqueCode,
 
                 // Saya Bayar-specific
-                sayabayar_ref_id: pgProvider === 'sayabayar' ? (pgData.id || orderId) : null,
+                sayabayar_ref_id: pgProvider === 'sayabayar' ? (pgData.id || pgData.invoice_number || null) : null,
 
                 // Vendor Information
                 vendor,
@@ -454,9 +454,7 @@ async function getPaymentStatus(req, res) {
 
         const { data, error } = await supabase
             .from('orders')
-            .select(
-                'id, status, pg_invoice, pg_paid_at, pg_qr_link, pg_virtual_account, account_details, error_message, pg_expired_at, sekalipay_variant_id, unique_code, pg_provider'
-            )
+            .select('*')
             .eq('id', orderId)
             .single();
 
@@ -472,9 +470,7 @@ async function getPaymentStatus(req, res) {
             // Re-fetch data terbaru jika ada perubahan dari proses polling
             const { data: updatedData } = await supabase
                 .from('orders')
-                .select(
-                    'id, status, pg_invoice, pg_paid_at, pg_qr_link, pg_virtual_account, account_details, error_message, pg_expired_at, unique_code, pg_provider'
-                )
+                .select('*')
                 .eq('id', orderId)
                 .single();
                 

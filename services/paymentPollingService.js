@@ -67,8 +67,13 @@ class PaymentPollingService {
      * Cek status via API Saya Bayar GET /v1/invoices/:id.
      */
     async _processSayabayarOrder(order) {
-        const refId = order.sayabayar_ref_id || order.id;
+        const refId = order.sayabayar_ref_id || (order.pg_invoice && !order.pg_invoice.startsWith('http') ? order.pg_invoice : null);
         const orderId = order.id;
+
+        if (!refId || refId.startsWith('NX-')) {
+            console.warn(`[Polling/PG-Sayabayar] Order ${orderId} tidak memiliki sayabayar_ref_id valid, skip polling API.`);
+            return;
+        }
 
         try {
             const checkResult = await sayabayarGatewayService.getInvoiceDetails(refId);

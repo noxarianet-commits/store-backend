@@ -294,10 +294,11 @@ async function createPayment(req, res) {
 
         if (pgProvider === 'sayabayar') {
             // ── Buat Invoice via Saya Bayar ────────────────────
+            // Catatan: Saya Bayar secara otomatis menambahkan kode unik (unique_code) dan menghasilkan amount_to_pay
             const sayabayarResult = await sayabayarGatewayService.createInvoice({
                 customer_name: (customer_name || wa_number || 'Pelanggan').trim(),
                 customer_email: (email || 'customer@noxarianet.web.id').trim(),
-                amount: totalWithUniqueCode,
+                amount: amount,
                 description: `Order ${orderId} - ${product_name || 'NoxariaNet Store'}`,
                 redirect_url: `${process.env.FRONTEND_URL || 'http://localhost:5173'}/checkout/success?order_id=${orderId}`
             });
@@ -311,7 +312,8 @@ async function createPayment(req, res) {
 
             pgData = sayabayarResult.data;
             pgFee = 0; // Saya Bayar 0% transaction fee
-            pgTotal = totalWithUniqueCode;
+            const sayabayarUniqueCode = pgData.unique_code ?? pgData.payment_channel?.unique_code ?? (pgData.amount_to_pay ? (pgData.amount_to_pay - amount) : 0);
+            pgTotal = pgData.amount_to_pay || pgData.payment_channel?.amount_to_pay || (amount + sayabayarUniqueCode);
             pgInvoice = pgData.payment_url || pgData.invoice_number || pgData.id;
             pgPaymentLink = pgData.payment_url || null;
             
@@ -344,6 +346,10 @@ async function createPayment(req, res) {
             pgQrLink = pgData.qr_url || null;
         }
 
+        const effectiveUniqueCode = pgProvider === 'sayabayar' 
+            ? (pgData.unique_code ?? pgData.payment_channel?.unique_code ?? (pgData.amount_to_pay ? (pgData.amount_to_pay - amount) : 0)) 
+            : uniqueCode;
+
         // ── Simpan order ke Supabase ────────────────────────────
         const { error: dbError } = await supabase.from('orders').insert([
             {
@@ -369,7 +375,7 @@ async function createPayment(req, res) {
                 pg_expired_at: pgData?.expired_at || null,
 
                 // Kode unik
-                unique_code: uniqueCode,
+                unique_code: effectiveUniqueCode,
 
                 // Saya Bayar-specific
                 sayabayar_ref_id: pgProvider === 'sayabayar' ? (pgData.id || pgData.invoice_number || null) : null,

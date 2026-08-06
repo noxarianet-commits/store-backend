@@ -48,12 +48,18 @@ class SayabayarGatewayService {
             };
         }
 
+        // Sanitasi customer_name: jika hanya angka (seperti nomor HP/WA), berikan awalan 'Pelanggan '
+        let formattedName = (customer_name || 'Pelanggan NoxariaNet').trim();
+        if (/^\d+$/.test(formattedName)) {
+            formattedName = `Pelanggan ${formattedName}`;
+        }
+
         const payload = {
-            customer_name: customer_name || 'Pelanggan NoxariaNet',
+            customer_name: formattedName,
             customer_email: customer_email || 'customer@noxarianet.web.id',
             amount: parseInt(amount, 10),
             description: description || 'Pembelian Produk NoxariaNet',
-            channel_preference: channelPreference,
+            channel_preference: channelPreference || 'platform',
             payment_method: payment_method || defaultMethod || 'qris'
         };
 
@@ -61,6 +67,7 @@ class SayabayarGatewayService {
         if (expired_at) payload.expired_at = expired_at;
 
         try {
+            console.log('[SayabayarGatewayService] Sending invoice payload:', JSON.stringify(payload, null, 2));
             const response = await axios.post(`${baseURL}/invoices`, payload, {
                 headers: {
                     'Content-Type': 'application/json',
@@ -76,17 +83,30 @@ class SayabayarGatewayService {
                 };
             }
 
+            const errorMsg = response.data?.error?.message || 'Gagal membuat invoice Saya Bayar';
+            const errorDetails = response.data?.error?.details ? ` - Detail: ${JSON.stringify(response.data.error.details)}` : '';
+
             return {
                 success: false,
                 status: response.status || 500,
-                message: response.data?.error?.message || 'Gagal membuat invoice Saya Bayar'
+                message: `${errorMsg}${errorDetails}`
             };
         } catch (err) {
-            console.error('[SayabayarGatewayService] createInvoice error:', err.response?.data || err.message);
+            const errData = err.response?.data;
+            console.error('[SayabayarGatewayService] createInvoice error:', JSON.stringify(errData, null, 2) || err.message);
+
+            let errorMsg = errData?.error?.message || err.message || 'Error koneksi ke API Saya Bayar';
+            if (errData?.error?.details) {
+                const detailsStr = typeof errData.error.details === 'object'
+                    ? JSON.stringify(errData.error.details)
+                    : String(errData.error.details);
+                errorMsg += ` - Detail: ${detailsStr}`;
+            }
+
             return {
                 success: false,
                 status: err.response?.status || 500,
-                message: err.response?.data?.error?.message || err.message || 'Error koneksi ke API Saya Bayar'
+                message: errorMsg
             };
         }
     }

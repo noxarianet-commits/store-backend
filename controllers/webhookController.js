@@ -2,6 +2,7 @@ const crypto = require('crypto');
 const supabase = require('../supabase');
 const paymentGatewayService = require('../services/paymentGatewayService');
 const sayabayarGatewayService = require('../services/sayabayarGatewayService');
+const dyqrisGatewayService = require('../services/dyqrisGatewayService');
 const sekalipayService = require('../services/sekalipayService');
 const emailService = require('../services/emailService');
 const orderFulfillmentService = require('../services/orderFulfillmentService');
@@ -454,10 +455,86 @@ async function handleSayabayarWebhook(req, res) {
     }
 }
 
+// ══════════════════════════════════════════════════════════════════════════
+// HANDLER 5 — POST /api/webhooks/dyqris
+// Callback dari Dyqris Mini QRIS Gateway (transaction.paid).
+// ══════════════════════════════════════════════════════════════════════════
+
+async function handleDyqrisWebhook(req, res) {
+    try {
+        const signature = req.headers['x-signature'];
+        const payloadString = req.rawBody || (typeof req.body === 'string' ? req.body : JSON.stringify(req.body));
+        
+        const { webhookSecret } = await dyqrisGatewayService.getConfig();
+        
+        if (webhookSecret) {
+            const isValid = dyqrisGatewayService.verifyWebhookSignature(payloadString, signature, webhookSecret);
+            if (!isValid) {
+                console.warn('[Webhook/Dyqris] Invalid signature - request ditolak.');
+                return res.status(401).json({ error: 'Invalid signature' });
+            }
+        }
+
+        const body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
+        const { event, id, ref_id, status } = body || {};
+
+        console.log(`[Webhook/Dyqris] Received event ${event || status} for id=${id}, ref_id=${ref_id}`);
+
+        if (!id && !ref_id) {
+            return res.status(400).json({ error: 'Payload transaction ID missing' });
+        }
+
+        // Cari order berdasarkan dyqris_ref_id (Dyqris transaction id) atau id (ref_id toko NX-...)
+        let query = supabase.from('orders').select('*');
+        if (id && ref_id) {
+            query = query.or(`dyqris_ref_id.eq.${id},id.eq.${ref_id}`);
+        } else if (id) {
+            query = query.or(`dyqris_ref_id.eq.${id},id.eq.${id}`);
+        } else {
+            query = query.eq('id', ref_id);
+        }
+
+        const { data: order, error: fetchError } = await query.maybeSingle();
+
+        if (fetchError || !order) {
+            console.error(`[Webhook/Dyqris] Order id=${id} ref_id=${ref_id} tidak ditemukan.`);
+            return res.status(200).json({ received: true });
+        }
+
+        if (order.status !== 'PENDING') {
+            console.log(`[Webhook/Dyqris] Order ${order.id} sudah diproses (status: ${order.status}), skip.`);
+            return res.status(200).json({ received: true });
+        }
+
+        if (event === 'transaction.paid' || status === 'paid') {
+            await supabase
+                .from('orders')
+                .update({ pg_paid_at: body.paid_at || new Date().toISOString() })
+                .eq('id', order.id);
+
+            const fulfillmentResult = await orderFulfillmentService.fulfillOrder(order);
+            if (!fulfillmentResult.success && !fulfillmentResult.skipped) {
+                console.error(`[Webhook/Dyqris] Fulfillment order gagal untuk ${order.id}:`, fulfillmentResult.message);
+            }
+        } else if (status === 'expired' || status === 'cancelled') {
+            await supabase
+                .from('orders')
+                .update({ status: 'CANCELLED', error_message: `Transaksi Dyqris ${status}` })
+                .eq('id', order.id);
+        }
+
+        return res.status(200).json({ received: true });
+    } catch (err) {
+        console.error('[Webhook/Dyqris] Internal error:', err);
+        return res.status(500).json({ error: err.message });
+    }
+}
+
 module.exports = {
     handlePaymentGatewayWebhook,
     handleSekalipayWebhook,
     handleFincloudPPOBWebhook,
-    handleSayabayarWebhook
+    handleSayabayarWebhook,
+    handleDyqrisWebhook
 };
 

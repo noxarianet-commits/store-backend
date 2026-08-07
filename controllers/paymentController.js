@@ -1,6 +1,7 @@
 const supabase = require('../supabase');
 const paymentGatewayService = require('../services/paymentGatewayService');
 const sayabayarGatewayService = require('../services/sayabayarGatewayService');
+const dyqrisGatewayService = require('../services/dyqrisGatewayService');
 const paymentPollingService = require('../services/paymentPollingService');
 const sekalipayService = require('../services/sekalipayService');
 const { normalizeNotePhoneNumber } = require('../utils/phoneUtils');
@@ -66,7 +67,10 @@ async function getActivePaymentGateway() {
         if (typeof val === 'object' && val !== null) {
             val = val.provider || val.value || val.gateway || 'fincloud';
         }
-        return String(val).toLowerCase().trim() === 'sayabayar' ? 'sayabayar' : 'fincloud';
+        const strVal = String(val).toLowerCase().trim();
+        if (strVal === 'sayabayar') return 'sayabayar';
+        if (strVal === 'dyqris') return 'dyqris';
+        return 'fincloud';
     } catch {
         return 'fincloud';
     }
@@ -292,7 +296,35 @@ async function createPayment(req, res) {
 
         let pgData, pgFee, pgTotal, pgInvoice, pgPaymentLink, pgQrLink;
 
-        if (pgProvider === 'sayabayar') {
+        if (pgProvider === 'dyqris') {
+            // ── Buat Transaksi via Dyqris Gateway ──────────────
+            // Dyqris tidak memerlukan penambahan kode unik dari toko (unique_code = 0)
+            const dyqrisResult = await dyqrisGatewayService.createTransaction({
+                refId: orderId,
+                amount: amount,
+                expiryMinutes: 15,
+                metadata: {
+                    customer_name: (customer_name || wa_number || 'Pelanggan').trim(),
+                    email: (email || 'customer@noxarianet.web.id').trim(),
+                    product_name: product_name || 'NoxariaNet Store'
+                }
+            });
+
+            if (!dyqrisResult.success) {
+                console.error('[paymentController] Dyqris createTransaction failed:', dyqrisResult);
+                return res.status(dyqrisResult.status || 502).json({
+                    error: `Gagal membuat pembayaran Dyqris: ${dyqrisResult.message}`,
+                });
+            }
+
+            pgData = dyqrisResult.data;
+            pgFee = 0;
+            pgTotal = pgData.actual_amount || amount;
+            pgInvoice = pgData.id;
+            pgPaymentLink = pgData.qr_image_url || null;
+            pgQrLink = pgData.qr_image_url || (pgData.qr_string ? `https://api.qrserver.com/v1/create-qr-code/?size=350x350&data=${encodeURIComponent(pgData.qr_string)}` : null);
+
+        } else if (pgProvider === 'sayabayar') {
             // ── Buat Invoice via Saya Bayar ────────────────────
             // Catatan: Saya Bayar secara otomatis menambahkan kode unik (unique_code) dan menghasilkan amount_to_pay
             const sayabayarResult = await sayabayarGatewayService.createInvoice({
@@ -346,9 +378,11 @@ async function createPayment(req, res) {
             pgQrLink = pgData.qr_url || null;
         }
 
-        const effectiveUniqueCode = pgProvider === 'sayabayar' 
-            ? (pgData.unique_code ?? pgData.payment_channel?.unique_code ?? (pgData.amount_to_pay ? (pgData.amount_to_pay - amount) : 0)) 
-            : uniqueCode;
+        const effectiveUniqueCode = pgProvider === 'dyqris'
+            ? (pgData.actual_amount ? (pgData.actual_amount - amount) : 0)
+            : pgProvider === 'sayabayar' 
+                ? (pgData.unique_code ?? pgData.payment_channel?.unique_code ?? (pgData.amount_to_pay ? (pgData.amount_to_pay - amount) : 0)) 
+                : uniqueCode;
 
         // ── Simpan order ke Supabase ────────────────────────────
         const { error: dbError } = await supabase.from('orders').insert([
@@ -376,6 +410,9 @@ async function createPayment(req, res) {
 
                 // Kode unik
                 unique_code: effectiveUniqueCode,
+
+                // Dyqris-specific (renamed from orkut_ref_id)
+                dyqris_ref_id: pgProvider === 'dyqris' ? (pgData.id || null) : null,
 
                 // Saya Bayar-specific
                 sayabayar_ref_id: pgProvider === 'sayabayar' ? (pgData.id || pgData.invoice_number || null) : null,

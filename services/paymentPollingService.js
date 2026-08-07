@@ -1,6 +1,7 @@
 const supabase = require('../supabase');
 const paymentGatewayService = require('./paymentGatewayService');
 const sayabayarGatewayService = require('./sayabayarGatewayService');
+const dyqrisGatewayService = require('./dyqrisGatewayService');
 const sekalipayService = require('./sekalipayService');
 const orderFulfillmentService = require('./orderFulfillmentService');
 const { normalizeNotePhoneNumber } = require('../utils/phoneUtils');
@@ -8,7 +9,7 @@ const vendorRegistry = require('./vendors/vendorRegistry');
 const emailService = require('./emailService');
 
 /**
- * Service untuk mem-polling status pembayaran dari FinCloud dan Saya Bayar
+ * Service untuk mem-polling status pembayaran dari FinCloud, Saya Bayar, dan Dyqris
  * sebagai solusi jika webhook dari payment gateway gagal atau tidak masuk.
  */
 class PaymentPollingService {
@@ -57,8 +58,64 @@ class PaymentPollingService {
         
         if (pgProvider === 'sayabayar') {
             return this._processSayabayarOrder(order);
+        } else if (pgProvider === 'dyqris') {
+            return this._processDyqrisOrder(order);
         } else {
             return this._processFincloudOrder(order);
+        }
+    }
+
+    /**
+     * Proses polling untuk order Dyqris.
+     * Cek status via Dyqris API GET /v1/transactions/:id.
+     */
+    async _processDyqrisOrder(order) {
+        const refId = order.dyqris_ref_id || order.pg_invoice;
+        const orderId = order.id;
+
+        if (!refId) {
+            console.warn(`[Polling/PG-Dyqris] Order ${orderId} tidak memiliki dyqris_ref_id valid, skip polling API.`);
+            return;
+        }
+
+        try {
+            const checkResult = await dyqrisGatewayService.getTransactionDetails(refId);
+
+            if (!checkResult.success || !checkResult.data) {
+                return;
+            }
+
+            if (checkResult.data.status !== 'paid') {
+                return;
+            }
+
+            console.log(`[Polling/PG-Dyqris] Order ${orderId} ternyata sudah PAID (ref=${refId}). Memproses...`);
+
+            const { data: currentOrder } = await supabase
+                .from('orders')
+                .select('*')
+                .eq('id', orderId)
+                .single();
+
+            if (currentOrder && currentOrder.status !== 'PENDING') {
+                console.log(`[Polling/PG-Dyqris] Order ${orderId} sudah diproses. Skip.`);
+                return;
+            }
+
+            await supabase
+                .from('orders')
+                .update({ pg_paid_at: checkResult.data.paid_at || new Date().toISOString() })
+                .eq('id', orderId);
+
+            const fulfillmentResult = await orderFulfillmentService.fulfillOrder(currentOrder);
+
+            if (!fulfillmentResult.success && !fulfillmentResult.skipped) {
+                console.error(`[Polling/PG-Dyqris] Fulfillment order gagal untuk ${orderId}:`, fulfillmentResult.message);
+            } else if (fulfillmentResult.success && !fulfillmentResult.skipped) {
+                console.log(`[Polling/PG-Dyqris] Order ${orderId} berhasil diproses via polling.`);
+            }
+        } catch (err) {
+            console.error(`[Polling/PG-Dyqris] Error memproses order ${orderId}:`, err);
         }
     }
 

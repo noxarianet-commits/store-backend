@@ -58,5 +58,15 @@ router.post(
     webhookController.handleSayabayarWebhook
 );
 
+/**
+ * POST /api/webhooks/dyqris
+ * Callback dari Dyqris Mini QRIS Gateway (transaction.paid).
+ */
+router.post(
+    '/dyqris',
+    rawBodyMiddleware,
+    webhookController.handleDyqrisWebhook
+);
+
 module.exports = router;
 

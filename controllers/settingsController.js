@@ -13,7 +13,8 @@ async function list(req, res) {
         if (error) throw error;
 
         const settingsMap = {
-            shop_status: { isOpen: true, message: 'Selamat datang!' }
+            shop_status: { isOpen: true, message: 'Selamat datang!' },
+            wa_group_link: 'https://chat.whatsapp.com/HQDNahAemv6GfmZqYZjSSD?s=sw&p=a&ilr=4&amv=3'
             // CATATAN: admin_auth TIDAK lagi ada di settings — sudah dipindah ke tabel admins
         };
         data.forEach(s => {

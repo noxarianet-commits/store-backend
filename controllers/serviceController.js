@@ -20,6 +20,27 @@ async function list(req, res) {
 }
 
 /**
+ * GET /api/services/:id
+ * Get a single service by ID.
+ */
+async function getById(req, res) {
+    try {
+        const { id } = req.params;
+        const { data, error } = await supabase
+            .from('services')
+            .select('*')
+            .eq('id', id)
+            .maybeSingle();
+
+        if (error) throw error;
+        if (!data) return res.status(404).json({ error: 'Layanan tidak ditemukan' });
+        res.json({ ...data, is_service_table: true });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+}
+
+/**
  * POST /api/services
  * Create a new service. (Protected)
  */
@@ -74,4 +95,4 @@ async function remove(req, res) {
     }
 }
 
-module.exports = { list, create, update, remove };
+module.exports = { list, getById, create, update, remove };

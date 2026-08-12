@@ -4,6 +4,7 @@ const serviceController = require('../controllers/serviceController');
 const verifyAdmin = require('../middleware/verifyAdmin');
 
 router.get('/', serviceController.list);
+router.get('/:id', serviceController.getById);
 router.post('/', verifyAdmin, serviceController.create);
 router.put('/:id', verifyAdmin, serviceController.update);
 router.delete('/:id', verifyAdmin, serviceController.remove);

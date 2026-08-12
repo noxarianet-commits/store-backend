@@ -78,23 +78,23 @@ async function fetchHomePageData() {
     const [productsResult, servicesResult, testimonialsResult, settingsResult] = await Promise.all([
         supabase
             .from('products')
-            .select('*')
+            .select('id, name, brand, category, icon, image, variants, is_active, is_featured, copyright_text, updated_at, sekalipay_product_id')
             .eq('is_active', true)
             .order('category', { ascending: true })
             .order('name', { ascending: true }),
         supabase
             .from('services')
-            .select('*')
+            .select('id, name, brand, category, icon, image, description, variants, is_active, sort_order, created_at')
             .eq('is_active', true)
             .order('created_at', { ascending: true }),
         supabase
             .from('testimonials')
-            .select('*')
+            .select('id, name, text, rating, avatar_url, created_at')
             .order('created_at', { ascending: false })
             .limit(10),
         supabase
             .from('settings')
-            .select('*'),
+            .select('key, value'),
     ]);
 
     // Process settings (filter sensitive keys)
@@ -179,7 +179,7 @@ async function getCategoryProducts(req, res) {
         if (slug === 'layanan-jasa-bot') {
             const { data, error } = await supabase
                 .from('services')
-                .select('*')
+                .select('id, name, brand, category, icon, image, description, variants, is_active, sort_order, created_at')
                 .eq('is_active', true)
                 .order('created_at', { ascending: true });
 
@@ -201,7 +201,7 @@ async function getCategoryProducts(req, res) {
         // Regular product category — find by matching slug
         const { data: allProducts, error } = await supabase
             .from('products')
-            .select('*')
+            .select('id, name, brand, category, icon, image, variants, is_active, is_featured, copyright_text, updated_at, sekalipay_product_id')
             .eq('is_active', true)
             .order('name', { ascending: true });
 

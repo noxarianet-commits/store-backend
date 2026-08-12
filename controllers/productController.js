@@ -20,6 +20,27 @@ async function list(req, res) {
 }
 
 /**
+ * GET /api/products/:id
+ * Get a single product by ID.
+ */
+async function getById(req, res) {
+    try {
+        const { id } = req.params;
+        const { data, error } = await supabase
+            .from('products')
+            .select('*')
+            .eq('id', id)
+            .maybeSingle();
+
+        if (error) throw error;
+        if (!data) return res.status(404).json({ error: 'Produk tidak ditemukan' });
+        res.json(data);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+}
+
+/**
  * POST /api/products
  * Create a new product. (Protected)
  */
@@ -74,4 +95,4 @@ async function remove(req, res) {
     }
 }
 
-module.exports = { list, create, update, remove };
+module.exports = { list, getById, create, update, remove };

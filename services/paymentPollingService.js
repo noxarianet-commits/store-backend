@@ -24,7 +24,7 @@ class PaymentPollingService {
 
             const { data: orders, error } = await supabase
                 .from('orders')
-                .select('*')
+                .select('id, status, payment_method, pg_invoice, pg_provider, dyqris_ref_id, sayabayar_ref_id, timestamp')
                 .eq('status', 'PENDING')
                 .eq('payment_method', 'QRIS')
                 .not('pg_invoice', 'is', null)
@@ -265,7 +265,7 @@ class PaymentPollingService {
 
             const { data: orders, error } = await supabase
                 .from('orders')
-                .select('*')
+                .select('id, status, vendor, vendor_ref_id, account_details, timestamp')
                 .eq('status', 'PROCESSING')
                 .eq('vendor', 'fincloud')
                 .gte('timestamp', yesterday.toISOString());

@@ -78,24 +78,29 @@ async function fetchHomePageData() {
     const [productsResult, servicesResult, testimonialsResult, settingsResult] = await Promise.all([
         supabase
             .from('products')
-            .select('id, name, brand, category, icon, image, variants, is_active, is_featured, copyright_text, updated_at, sekalipay_product_id')
+            .select('id, sekalipay_item_id, sekalipay_product_id, category, name, icon, image, variants, is_active, synced_at, created_at, is_featured')
             .eq('is_active', true)
             .order('category', { ascending: true })
             .order('name', { ascending: true }),
         supabase
             .from('services')
-            .select('id, name, brand, category, icon, image, description, variants, is_active, sort_order, created_at')
+            .select('id, category, name, icon, image, subtitle, features, variants, is_active, created_at')
             .eq('is_active', true)
             .order('created_at', { ascending: true }),
         supabase
             .from('testimonials')
-            .select('id, name, text, rating, avatar_url, created_at')
+            .select('id, name, rating, text, created_at')
             .order('created_at', { ascending: false })
             .limit(10),
         supabase
             .from('settings')
             .select('key, value'),
     ]);
+
+    if (productsResult.error) throw productsResult.error;
+    if (servicesResult.error) throw servicesResult.error;
+    if (testimonialsResult.error) throw testimonialsResult.error;
+    if (settingsResult.error) throw settingsResult.error;
 
     // Process settings (filter sensitive keys)
     const settingsMap = {
@@ -179,7 +184,7 @@ async function getCategoryProducts(req, res) {
         if (slug === 'layanan-jasa-bot') {
             const { data, error } = await supabase
                 .from('services')
-                .select('id, name, brand, category, icon, image, description, variants, is_active, sort_order, created_at')
+                .select('id, category, name, icon, image, subtitle, features, variants, is_active, created_at')
                 .eq('is_active', true)
                 .order('created_at', { ascending: true });
 
@@ -201,7 +206,7 @@ async function getCategoryProducts(req, res) {
         // Regular product category — find by matching slug
         const { data: allProducts, error } = await supabase
             .from('products')
-            .select('id, name, brand, category, icon, image, variants, is_active, is_featured, copyright_text, updated_at, sekalipay_product_id')
+            .select('id, sekalipay_item_id, sekalipay_product_id, category, name, icon, image, variants, is_active, synced_at, created_at, is_featured')
             .eq('is_active', true)
             .order('name', { ascending: true });
 

@@ -20,8 +20,32 @@ async function list(req, res) {
 }
 
 /**
+ * Map a product to public format (hide base_price/markup, filter hidden variants).
+ * Mirrors toPublicProduct in homeController.
+ * @param {object} product
+ * @returns {object}
+ */
+function toPublicProduct(product) {
+    return {
+        ...product,
+        variants: (product.variants || []).filter(v => !v.is_hidden).map(v => ({
+            id: v.id,
+            sku: v.sku,
+            name: v.name,
+            price: product.sekalipay_product_id ? v.sell_price : (v.price || v.sell_price),
+            stock: v.stock,
+            order_process: v.order_process,
+            required_fields: v.required_fields,
+            validation: v.validation,
+            provider_meta: v.provider_meta,
+        })),
+    };
+}
+
+/**
  * GET /api/products/:id
  * Get a single product by ID.
+ * Returns 404 for inactive products. Strips hidden variants and sensitive pricing.
  */
 async function getById(req, res) {
     try {
@@ -33,8 +57,10 @@ async function getById(req, res) {
             .maybeSingle();
 
         if (error) throw error;
-        if (!data) return res.status(404).json({ error: 'Produk tidak ditemukan' });
-        res.json(data);
+        if (!data || data.is_active === false) {
+            return res.status(404).json({ error: 'Produk tidak ditemukan' });
+        }
+        res.json(toPublicProduct(data));
     } catch (err) {
         res.status(500).json({ error: err.message });
     }

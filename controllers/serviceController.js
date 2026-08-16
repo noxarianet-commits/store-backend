@@ -22,6 +22,7 @@ async function list(req, res) {
 /**
  * GET /api/services/:id
  * Get a single service by ID.
+ * Returns 404 for inactive services.
  */
 async function getById(req, res) {
     try {
@@ -33,7 +34,9 @@ async function getById(req, res) {
             .maybeSingle();
 
         if (error) throw error;
-        if (!data) return res.status(404).json({ error: 'Layanan tidak ditemukan' });
+        if (!data || data.is_active === false) {
+            return res.status(404).json({ error: 'Layanan tidak ditemukan' });
+        }
         res.json({ ...data, is_service_table: true });
     } catch (err) {
         res.status(500).json({ error: err.message });

@@ -68,5 +68,22 @@ router.post(
     webhookController.handleDyqrisWebhook
 );
 
+/**
+ * GET & POST /api/webhooks/okeconnect
+ * Callback dari OkeConnect H2H saat order selesai/gagal.
+ * Format OkeConnect: GET /api/webhooks/okeconnect?refid=xxx&message=xxx
+ */
+router.get(
+    '/okeconnect',
+    webhookController.handleOkeconnectWebhook
+);
+
+router.post(
+    '/okeconnect',
+    express.urlencoded({ extended: true }),
+    webhookController.handleOkeconnectWebhook
+);
+
 module.exports = router;
+
 

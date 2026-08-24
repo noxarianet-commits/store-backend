@@ -1,80 +1,225 @@
 const supabase = require('../supabase');
+const vendorRegistry = require('../services/vendors/vendorRegistry');
 const cacheService = require('../services/cacheService');
+const { groupProducts, buildMultiServerProduct, getCanonicalKey } = require('../utils/productGrouping');
 
 /**
- * GET /api/products
- * List all products ordered by created_at.
- */
-async function list(req, res) {
-    try {
-        const { data, error } = await supabase
-            .from('products')
-            .select('*')
-            .order('created_at', { ascending: true });
-
-        if (error) throw error;
-        res.json(data);
-    } catch (err) {
-        res.status(500).json({ error: err.message });
-    }
-}
-
-/**
- * Map a product to public format (hide base_price/markup, filter hidden variants).
- * Mirrors toPublicProduct in homeController.
- * @param {object} product
- * @returns {object}
+ * Format a product row and its variants for public display.
+ * Hides base_price and markup; maps sell_price to price.
  */
 function toPublicProduct(product) {
-    return {
-        ...product,
-        variants: (product.variants || []).filter(v => !v.is_hidden).map(v => ({
-            id: v.id,
-            sku: v.sku,
+    const variants = (product.product_variants || [])
+        .filter(v => v.is_active !== false && !v.is_hidden)
+        .map(v => ({
+            id: v.vendor_variant_id,
+            db_id: v.id,
+            sku: v.metadata?.sku || v.vendor_variant_id,
             name: v.name,
-            price: product.sekalipay_product_id ? v.sell_price : (v.price || v.sell_price),
+            price: v.sell_price,
             stock: v.stock,
             order_process: v.order_process,
-            required_fields: v.required_fields,
-            validation: v.validation,
-            provider_meta: v.provider_meta,
-        })),
+            required_fields: v.required_fields || [],
+            validation: v.validation || {},
+            provider_meta: v.provider_meta || {},
+        }));
+
+    return {
+        id: product.id,
+        vendor: product.vendor,
+        external_id: product.external_id,
+        category: product.category,
+        name: product.name,
+        brand: product.brand,
+        icon: product.icon,
+        image: product.image,
+        is_active: product.is_active,
+        is_featured: product.is_featured,
+        variants,
     };
 }
 
 /**
- * GET /api/products/:id
- * Get a single product by ID.
- * Returns 404 for inactive products. Strips hidden variants and sensitive pricing.
+ * GET /api/products
+ * List all active products. Supports ?vendor=, ?category=, ?search=, ?page=, ?per_page=
  */
-async function getById(req, res) {
+async function list(req, res) {
     try {
-        const { id } = req.params;
-        const { data, error } = await supabase
-            .from('products')
-            .select('*')
-            .eq('id', id)
-            .maybeSingle();
+        const { vendor, category, search, page = 1, per_page = 50 } = req.query;
+        const limit = Math.min(parseInt(per_page) || 50, 200);
+        const offset = (Math.max(parseInt(page) || 1, 1) - 1) * limit;
 
-        if (error) throw error;
-        if (!data || data.is_active === false) {
-            return res.status(404).json({ error: 'Produk tidak ditemukan' });
+        let query = supabase
+            .from('products')
+            .select('*, product_variants(*)', { count: 'exact' })
+            .eq('is_active', true)
+            .order('category', { ascending: true })
+            .order('name', { ascending: true });
+
+        if (vendor && vendor !== 'all') {
+            query = query.eq('vendor', vendor);
         }
-        res.json(toPublicProduct(data));
+        if (category) {
+            query = query.eq('category', category);
+        }
+        if (search) {
+            query = query.or(`name.ilike.%${search}%,category.ilike.%${search}%,brand.ilike.%${search}%`);
+        }
+
+        const { data, error, count } = await query;
+        if (error) throw error;
+
+        // If vendor filter is specified, return raw public products for that vendor
+        if (vendor && vendor !== 'all') {
+            const publicProducts = (data || []).map(toPublicProduct);
+            const paginated = publicProducts.slice(offset, offset + limit);
+            return res.json({
+                data: paginated,
+                meta: {
+                    total: count || publicProducts.length,
+                    page: parseInt(page) || 1,
+                    per_page: limit,
+                    total_pages: Math.ceil((count || publicProducts.length) / limit),
+                },
+            });
+        }
+
+        // Otherwise deduplicate across vendors
+        const deduped = groupProducts(data || []);
+        const paginated = deduped.slice(offset, offset + limit);
+
+        res.json({
+            data: paginated,
+            meta: {
+                total: deduped.length,
+                page: parseInt(page) || 1,
+                per_page: limit,
+                total_pages: Math.ceil(deduped.length / limit),
+            },
+        });
+    } catch (err) {
+        console.error('GET /api/products error:', err.message);
+        res.status(500).json({ error: err.message });
+    }
+}
+
+/**
+ * GET /api/products/categories
+ * Get distinct active categories. Supports ?vendor=
+ */
+async function getCategories(req, res) {
+    try {
+        const { vendor } = req.query;
+        let query = supabase
+            .from('products')
+            .select('category')
+            .eq('is_active', true);
+
+        if (vendor && vendor !== 'all') {
+            query = query.eq('vendor', vendor);
+        }
+
+        const { data, error } = await query;
+        if (error) throw error;
+
+        const categories = [...new Set((data || []).map(p => p.category))].sort();
+        res.json(categories);
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
 }
 
 /**
- * POST /api/products
- * Create a new product. (Protected)
+ * GET /api/products/:id
+ * Get a single product by ID with its variants and peer server options.
+ */
+async function getById(req, res) {
+    try {
+        const { id } = req.params;
+
+        // 1. Fetch the primary target product
+        const { data: primary, error } = await supabase
+            .from('products')
+            .select('*, product_variants(*)')
+            .eq('id', id)
+            .maybeSingle();
+
+        if (error) throw error;
+        if (!primary || primary.is_active === false) {
+            return res.status(404).json({ error: 'Produk tidak ditemukan' });
+        }
+
+        // 2. Find peer products in the same canonical group across all vendors
+        const targetCanonicalKey = getCanonicalKey(primary.name);
+        const { data: peerCandidates } = await supabase
+            .from('products')
+            .select('*, product_variants(*)')
+            .eq('is_active', true)
+            .eq('category', primary.category);
+
+        const peerProducts = (peerCandidates || []).filter(p =>
+            getCanonicalKey(p.name) === targetCanonicalKey
+        );
+
+        // 3. Build unified multi-server product payload
+        const multiServerProduct = buildMultiServerProduct(primary, peerProducts);
+
+        res.json(multiServerProduct);
+    } catch (err) {
+        console.error('GET /api/products/:id error:', err.message);
+        res.status(500).json({ error: err.message });
+    }
+}
+
+/**
+ * POST /api/products/validate
+ * Proxy customer validation to the appropriate vendor adapter.
+ * Body: { vendor: 'sekalipay'|'okeconnect'|'fincloud', variant_id: string|number, customer_id: string, zone_id?: string }
+ */
+async function validate(req, res) {
+    try {
+        const { vendor = 'sekalipay', variant_id, item_id, customer_id, zone_id } = req.body;
+        const targetVariantId = variant_id || item_id;
+
+        if (!targetVariantId || !customer_id) {
+            return res.status(400).json({ error: 'variant_id dan customer_id wajib diisi' });
+        }
+
+        if (vendor === 'okeconnect') {
+            return res.json({ valid: true, account_name: customer_id, display_name: customer_id });
+        }
+
+        const adapter = vendorRegistry.get(vendor);
+        if (!adapter) {
+            return res.status(400).json({ error: `Vendor '${vendor}' tidak ditemukan` });
+        }
+
+        const result = await adapter.validateAccount({
+            variantId: targetVariantId,
+            customerId: customer_id,
+            zoneId: zone_id,
+        });
+
+        if (!result.success || result.valid === false) {
+            const statusCode = result.status >= 500 ? 400 : (result.status || 400);
+            return res.status(statusCode).json({
+                error: result.message || 'Validasi akun gagal',
+                errors: result.errors,
+            });
+        }
+
+        res.json(result.data || { valid: true });
+    } catch (err) {
+        console.error('POST /api/products/validate error:', err.message);
+        res.status(500).json({ error: err.message });
+    }
+}
+
+/**
+ * POST /api/products (Protected)
  */
 async function create(req, res) {
     try {
-        const { data, error } = await supabase
-            .from('products')
-            .insert([req.body]);
+        const { data, error } = await supabase.from('products').insert([req.body]);
         if (error) throw error;
         cacheService.invalidateHome();
         res.json(data);
@@ -84,16 +229,12 @@ async function create(req, res) {
 }
 
 /**
- * PUT /api/products/:id
- * Update a product by ID. (Protected)
+ * PUT /api/products/:id (Protected)
  */
 async function update(req, res) {
     try {
         const { id } = req.params;
-        const { error } = await supabase
-            .from('products')
-            .update(req.body)
-            .eq('id', id);
+        const { error } = await supabase.from('products').update(req.body).eq('id', id);
         if (error) throw error;
         cacheService.invalidateHome();
         res.json({ success: true });
@@ -103,16 +244,12 @@ async function update(req, res) {
 }
 
 /**
- * DELETE /api/products/:id
- * Delete a product by ID. (Protected)
+ * DELETE /api/products/:id (Protected)
  */
 async function remove(req, res) {
     try {
         const { id } = req.params;
-        const { error } = await supabase
-            .from('products')
-            .delete()
-            .eq('id', id);
+        const { error } = await supabase.from('products').delete().eq('id', id);
         if (error) throw error;
         cacheService.invalidateHome();
         res.json({ success: true });
@@ -121,4 +258,13 @@ async function remove(req, res) {
     }
 }
 
-module.exports = { list, getById, create, update, remove };
+module.exports = {
+    list,
+    getCategories,
+    getById,
+    validate,
+    create,
+    update,
+    remove,
+};
+

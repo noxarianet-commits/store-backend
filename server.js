@@ -5,22 +5,22 @@ const rateLimit = require('express-rate-limit');
 const cron = require('node-cron');
 require('dotenv').config();
 
-const syncService = require('./services/syncService');
-const fincloudSyncService = require('./services/fincloudSyncService');
+// Initialize Unified Product Sync Service
+const productSyncService = require('./services/productSyncService');
 
 // Initialize Vendor Registry
 const vendorRegistry = require('./services/vendors/vendorRegistry');
 const SekalipayAdapter = require('./services/vendors/SekalipayAdapter');
 const FincloudPPOBAdapter = require('./services/vendors/FincloudPPOBAdapter');
+const OkeconnectAdapter = require('./services/vendors/OkeconnectAdapter');
 vendorRegistry.register('sekalipay', new SekalipayAdapter());
 vendorRegistry.register('fincloud', new FincloudPPOBAdapter());
+vendorRegistry.register('okeconnect', new OkeconnectAdapter());
 
-// Routes
-const sekalipayRoutes = require('./routes/sekalipayRoutes');
-const sekalipayAdminRoutes = require('./routes/sekalipayAdminRoutes');
-const fincloudRoutes = require('./routes/fincloudRoutes');
-const fincloudAdminRoutes = require('./routes/fincloudAdminRoutes');
+
+// Routes — Unified
 const productRoutes = require('./routes/productRoutes');
+const adminProductRoutes = require('./routes/adminProductRoutes');
 const serviceRoutes = require('./routes/serviceRoutes');
 const orderRoutes = require('./routes/orderRoutes');
 const settingsRoutes = require('./routes/settingsRoutes');
@@ -47,39 +47,29 @@ const globalLimiter = rateLimit({
     standardHeaders: true, legacyHeaders: false,
 });
 
-// CORS
-const allowedOrigins = [
-    'http://localhost:5173',
-    'https://noxarianet.vercel.app',
-    'https://www.noxarianet.web.id',
-    'https://test.noxarianet.web.id'
-];
-if (process.env.FRONTEND_URL) allowedOrigins.push(process.env.FRONTEND_URL);
-
+// CORS — Allow all origins
 app.use(cors({
-    origin: function (origin, callback) {
-        if (!origin || allowedOrigins.includes(origin) || origin.includes('vercel.app') || origin.startsWith('http://localhost:')) {
-            callback(null, true);
-        } else {
-            callback(new Error('Akses ditolak oleh CORS'));
-        }
-    },
+    origin: true,
+    credentials: true,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'x-admin-token']
+    allowedHeaders: ['Content-Type', 'Authorization', 'x-admin-token', 'x-signature', 'x-event', 'x-webhook-signature', 'x-callback-secret', '*'],
+    optionsSuccessStatus: 200
 }));
 
+
 // Middleware
-app.use(helmet({ contentSecurityPolicy: false }));
+app.use(helmet({ contentSecurityPolicy: false, crossOriginResourcePolicy: false }));
 app.use(globalLimiter);
 
+
+
 // ══════════════════════════════════════════════════════════════════════════
-// WEBHOOK ROUTES — Harus di-mount SEBELUM express.json()
-// agar raw body bisa dibaca untuk verifikasi signature
+// WEBHOOK ROUTES — Mounted before express.json() for raw body verification
 // ══════════════════════════════════════════════════════════════════════════
 
 app.use('/api/webhooks', webhookRoutes);
 
-// Global JSON body parser (hanya untuk non-webhook routes)
+// Global JSON body parser (for non-webhook routes)
 app.use(express.json());
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -87,8 +77,6 @@ app.use(express.json());
 // ══════════════════════════════════════════════════════════════════════════
 
 app.use('/api/home', homeRoutes);
-app.use('/api/sekalipay', sekalipayRoutes);
-app.use('/api/fincloud', fincloudRoutes);
 app.use('/api/products', productRoutes);
 app.use('/api/services', serviceRoutes);
 app.use('/api/settings', settingsRoutes);
@@ -99,48 +87,55 @@ app.use('/api/payments', paymentRoutes);
 // ROUTES — Protected (Admin)
 // ══════════════════════════════════════════════════════════════════════════
 
-app.use('/api/admin/sekalipay', verifyAdmin, sekalipayAdminRoutes);
-app.use('/api/admin/fincloud', verifyAdmin, fincloudAdminRoutes);
+app.use('/api/admin/products', adminProductRoutes);
 app.use('/api/orders', verifyAdmin, orderRoutes);
-
-// Admin auth: login limiter and verifyAdmin are defined in adminRoutes.js
 app.use('/api/admin', adminRoutes);
 
 // ══════════════════════════════════════════════════════════════════════════
-// SEKALIPAY CRON JOBS
+// CRON JOBS — Unified Product Sync
 // ══════════════════════════════════════════════════════════════════════════
 
+// Sekalipay delta sync every 1 hour
 cron.schedule('0 * * * *', async () => {
     console.log('[CRON] Starting Sekalipay delta sync...');
     try {
-        const result = await syncService.deltaSync();
-        console.log(`[CRON] Delta sync completed: ${result.productCount || 0} products updated.`);
+        const result = await productSyncService.syncVendor('sekalipay', { type: 'delta' });
+        console.log(`[CRON] Sekalipay delta sync completed:`, result);
     } catch (err) {
-        console.error('[CRON] Delta sync failed:', err.message);
+        console.error('[CRON] Sekalipay delta sync failed:', err.message);
     }
 });
 
+// Sekalipay full sync daily at 03:00
 cron.schedule('0 3 * * *', async () => {
     console.log('[CRON] Starting Sekalipay full sync...');
     try {
-        const result = await syncService.fullSync();
-        console.log(`[CRON] Full sync completed: ${result.productCount || 0} products synced.`);
+        const result = await productSyncService.syncVendor('sekalipay', { type: 'full' });
+        console.log(`[CRON] Sekalipay full sync completed:`, result);
     } catch (err) {
-        console.error('[CRON] Full sync failed:', err.message);
+        console.error('[CRON] Sekalipay full sync failed:', err.message);
     }
 });
 
-// ══════════════════════════════════════════════════════════════════════════
-// FINCLOUD CRON JOBS
-// ══════════════════════════════════════════════════════════════════════════
-
-cron.schedule('30 3 * * *', async () => { // Run at 03:30 daily (after sekalipay)
+// Fincloud full sync daily at 03:30
+cron.schedule('30 3 * * *', async () => {
     console.log('[CRON] Starting Fincloud full sync...');
     try {
-        const result = await fincloudSyncService.syncAllProducts();
-        console.log(`[CRON] Fincloud sync completed: ${result.stats?.upserted || 0} products synced.`);
+        const result = await productSyncService.syncVendor('fincloud', { type: 'full' });
+        console.log(`[CRON] Fincloud full sync completed:`, result);
     } catch (err) {
-        console.error('[CRON] Fincloud sync failed:', err.message);
+        console.error('[CRON] Fincloud full sync failed:', err.message);
+    }
+});
+
+// Okeconnect full sync daily at 04:00
+cron.schedule('0 4 * * *', async () => {
+    console.log('[CRON] Starting Okeconnect full sync...');
+    try {
+        const result = await productSyncService.syncVendor('okeconnect', { type: 'full' });
+        console.log(`[CRON] Okeconnect full sync completed:`, result);
+    } catch (err) {
+        console.error('[CRON] Okeconnect full sync failed:', err.message);
     }
 });
 
@@ -157,9 +152,9 @@ cron.schedule('* * * * *', async () => {
     await paymentPollingService.pollProcessingOrders();
 });
 
-console.log('[CRON] Sekalipay sync scheduled: delta every 1h, full daily at 03:00');
-console.log('[CRON] Fincloud sync scheduled: full daily at 03:30');
+console.log('[CRON] Unified Product Sync scheduled: Sekalipay (delta 1h, full 03:00), Fincloud (full 03:30), Okeconnect (full 04:00)');
 console.log('[CRON] Payment polling scheduled: every 1 minute');
+
 
 // ══════════════════════════════════════════════════════════════════════════
 // START / EXPORT

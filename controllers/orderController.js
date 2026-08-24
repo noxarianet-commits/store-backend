@@ -121,8 +121,8 @@ async function create(req, res) {
                 email: orderData.email || '-',
                 wa_number: orderData.wa_number || '-',
                 payment_method: orderData.payment_method || '-',
-                testimonial: orderData.testimonial || '-',
-                proof_image: publicUrl,
+                customer_name: orderData.customer_name || orderData.wa_number || '-',
+                status: 'PENDING',
                 timestamp: new Date().toISOString()
             }]);
 

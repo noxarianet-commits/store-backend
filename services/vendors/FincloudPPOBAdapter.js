@@ -2,10 +2,13 @@ const VendorAdapter = require('./VendorAdapter');
 const axios = require('axios');
 const crypto = require('crypto');
 
+/**
+ * Fincloud PPOB Adapter.
+ * Handles integration with Fincloud PPOB API for digital goods & bill payments.
+ */
 class FincloudPPOBAdapter extends VendorAdapter {
     constructor() {
         super('fincloud');
-        // Pastikan baseURL selalu berujung ke /api
         let base = process.env.FINCLOUD_BASE_URL || 'https://fincloud.my.id/api';
         if (!base.endsWith('/api')) {
             base = `${base.replace(/\/$/, '')}/api`;
@@ -32,14 +35,14 @@ class FincloudPPOBAdapter extends VendorAdapter {
 
         try {
             const res = await axios.post(`${this.baseURL}${endpoint}`, payload.toString(), {
-                headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
+                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                timeout: 30000,
             });
-            // Adapt fincloud response format to match VendorAdapter expectation
-            // FinCloud usually returns HTTP status 200/400 and JSON body
+
             return {
                 success: res.data.status === true || res.data.status === 'success' || (res.status >= 200 && res.status < 300),
                 data: res.data,
-                message: res.data.message || res.data.msg || ''
+                message: res.data.message || res.data.msg || '',
             };
         } catch (error) {
             if (error.response) {
@@ -47,26 +50,62 @@ class FincloudPPOBAdapter extends VendorAdapter {
                     success: false,
                     status: error.response.status,
                     message: error.response.data?.message || error.response.data?.msg || 'UNKNOWN_ERROR',
-                    data: error.response.data
+                    data: error.response.data,
                 };
             }
             return {
                 success: false,
                 status: 0,
                 message: 'NETWORK_ERROR',
-                data: { error: error.message }
+                data: { error: error.message },
             };
         }
     }
 
+    /**
+     * Fetch products list from Fincloud PPOB.
+     */
     async fetchProducts(params = {}) {
         const payload = {};
         if (params.category) payload.category = params.category;
         if (params.brand) payload.brand = params.brand;
-        
+
         return await this._post('/ppob/products', payload);
     }
 
+    /**
+     * Fincloud PPOB does not have a separate product detail endpoint.
+     */
+    async fetchProductDetail(externalId) {
+        return { success: true, data: null };
+    }
+
+    /**
+     * Fincloud does not provide real-time stock endpoints, returns default available.
+     */
+    async checkStock(variantId) {
+        return { success: true, available: true, stock: 9999 };
+    }
+
+    /**
+     * Fincloud PPOB uses target without separate pre-validation endpoint.
+     */
+    async validateAccount(params = {}) {
+        return { success: true, valid: true };
+    }
+
+    /**
+     * Default available for validation services.
+     */
+    async checkValidationServices(params = {}) {
+        return { success: true, available: true };
+    }
+
+    /**
+     * Create PPOB order on Fincloud.
+     * @param {string} refId - NX order ID (used as reff_id in Fincloud)
+     * @param {Object} orderData - { sku, target }
+     */
     async createOrder(refId, orderData) {
         const { sku, target } = orderData;
         if (!sku || !target) {
@@ -74,37 +113,56 @@ class FincloudPPOBAdapter extends VendorAdapter {
         }
 
         const signature = this._md5(`${this.apiKey}${refId}`);
-        return await this._post('/ppob/order', {
+        const res = await this._post('/ppob/order', {
             sku,
             target,
             uid: target,
             reff_id: refId,
-            signature
+            signature,
         });
+
+        return {
+            ...res,
+            vendorOrderId: refId,
+            invoice: res.data?.invoice || res.data?.sn || null,
+        };
     }
 
+    /**
+     * Check status of order on Fincloud.
+     */
     async checkOrderStatus(refId) {
         const signature = this._md5(`${this.apiKey}${refId}`);
-        return await this._post('/ppob/status', {
+        const res = await this._post('/ppob/status', {
             reff_id: refId,
-            signature
+            signature,
         });
+
+        return {
+            ...res,
+            status: res.data?.status || res.data?.data?.status,
+        };
     }
 
-    async validateAccount(params) {
-        // Fincloud PPOB documentation does not mention account validation endpoints
-        throw new Error('validateAccount() not supported by Fincloud PPOB');
-    }
-
+    /**
+     * Get account balance from Fincloud.
+     */
     async getBalance() {
-        return await this._post('/cek_saldo'); // Note: For PPOB check balance? Or is it same as PG balance?
+        const res = await this._post('/cek_saldo');
+        return {
+            ...res,
+            balance: res.data?.saldo || res.data?.balance || res.data?.data?.saldo,
+        };
     }
 
+    /**
+     * Verify incoming webhook signature from Fincloud PPOB.
+     */
     verifyWebhookSignature(payload, signature, secret) {
         if (!payload) return false;
-        
+
         const { reff_id, nominal, status, rrn, signature_hmac } = payload;
-        
+
         // Check MD5 signature first (basic validation)
         const expectedMd5 = this._md5(`${this.apiKey}${reff_id || ''}${status || ''}`);
         if (signature !== expectedMd5) return false;
@@ -115,7 +173,7 @@ class FincloudPPOBAdapter extends VendorAdapter {
             const expectedHmac = crypto.createHmac('sha256', secret)
                 .update(dataString)
                 .digest('hex');
-            
+
             try {
                 const bufSig = Buffer.from(signature_hmac, 'utf8');
                 const bufExpected = Buffer.from(expectedHmac, 'utf8');
@@ -125,9 +183,20 @@ class FincloudPPOBAdapter extends VendorAdapter {
                 return false;
             }
         }
-        
-        // If we reach here, MD5 matched and HMAC wasn't strictly required
+
         return true;
+    }
+
+    /**
+     * Parse webhook payload to standard event format.
+     */
+    parseWebhookEvent(body) {
+        return {
+            event: body.status === 'success' || body.status === 'sukses' ? 'order.completed' : 'order.status_update',
+            vendorOrderId: body.reff_id,
+            status: body.status,
+            data: body,
+        };
     }
 }
 

@@ -2,7 +2,6 @@ const supabase = require('../supabase');
 const paymentGatewayService = require('./paymentGatewayService');
 const sayabayarGatewayService = require('./sayabayarGatewayService');
 const dyqrisGatewayService = require('./dyqrisGatewayService');
-const sekalipayService = require('./sekalipayService');
 const orderFulfillmentService = require('./orderFulfillmentService');
 const { normalizeNotePhoneNumber } = require('../utils/phoneUtils');
 const vendorRegistry = require('./vendors/vendorRegistry');
@@ -24,11 +23,12 @@ class PaymentPollingService {
 
             const { data: orders, error } = await supabase
                 .from('orders')
-                .select('id, status, payment_method, pg_invoice, pg_provider, dyqris_ref_id, sayabayar_ref_id, timestamp')
+                .select('*')
                 .eq('status', 'PENDING')
                 .eq('payment_method', 'QRIS')
                 .not('pg_invoice', 'is', null)
                 .gte('timestamp', yesterday.toISOString());
+
 
             if (error) {
                 console.error('[Polling/PG] Gagal mengambil pending orders:', error.message);
@@ -265,7 +265,7 @@ class PaymentPollingService {
 
             const { data: orders, error } = await supabase
                 .from('orders')
-                .select('id, status, vendor, vendor_ref_id, account_details, timestamp')
+                .select('id, status, vendor, vendor_order_id, account_details, timestamp')
                 .eq('status', 'PROCESSING')
                 .eq('vendor', 'fincloud')
                 .gte('timestamp', yesterday.toISOString());
@@ -285,7 +285,7 @@ class PaymentPollingService {
             const adapter = vendorRegistry.get('fincloud');
 
             for (const order of orders) {
-                const refId = order.vendor_ref_id || order.id;
+                const refId = order.vendor_order_id || order.id;
                 console.log(`[Polling/H2H-FinCloud] Memeriksa status order ${order.id} (refId: ${refId})...`);
 
                 const checkResult = await adapter.checkOrderStatus(refId);
@@ -317,7 +317,8 @@ class PaymentPollingService {
                         .update({
                             status: 'COMPLETED',
                             account_details: accountDetails,
-                            vendor_status: 'success'
+                            vendor_status: 'success',
+                            vendor_invoice: rrn || null,
                         })
                         .eq('id', order.id);
 

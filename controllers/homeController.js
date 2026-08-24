@@ -1,5 +1,6 @@
 const supabase = require('../supabase');
 const cacheService = require('../services/cacheService');
+const { groupProducts } = require('../utils/productGrouping');
 
 /**
  * Generate URL-friendly slug from text.
@@ -13,28 +14,6 @@ function slugify(text) {
         .replace(/\s+/g, '-')
         .replace(/-+/g, '-')
         .trim();
-}
-
-/**
- * Map a product to public format (hide base_price/markup).
- * @param {object} product
- * @returns {object}
- */
-function toPublicProduct(product) {
-    return {
-        ...product,
-        variants: (product.variants || []).filter(v => !v.is_hidden).map(v => ({
-            id: v.id,
-            sku: v.sku,
-            name: v.name,
-            price: product.sekalipay_product_id ? v.sell_price : (v.price || v.sell_price),
-            stock: v.stock,
-            order_process: v.order_process,
-            required_fields: v.required_fields,
-            validation: v.validation,
-            provider_meta: v.provider_meta,
-        })),
-    };
 }
 
 /**
@@ -78,7 +57,7 @@ async function fetchHomePageData() {
     const [productsResult, servicesResult, testimonialsResult, settingsResult] = await Promise.all([
         supabase
             .from('products')
-            .select('id, sekalipay_item_id, sekalipay_product_id, category, name, icon, image, variants, is_active, synced_at, created_at, is_featured')
+            .select('*, product_variants(*)')
             .eq('is_active', true)
             .order('category', { ascending: true })
             .order('name', { ascending: true }),
@@ -108,17 +87,20 @@ async function fetchHomePageData() {
     };
     if (settingsResult.data) {
         settingsResult.data.forEach(s => {
-            if (s.key !== 'admin_auth' && s.key !== 'sekalipay_last_sync') {
+            if (s.key !== 'admin_auth' && !s.key.endsWith('_last_sync')) {
                 settingsMap[s.key] = s.value;
             }
         });
     }
 
-    // Build categories from products
-    const allProducts = productsResult.data || [];
+    // Deduplicate and group products across multiple vendors
+    const rawProducts = productsResult.data || [];
+    const dedupedProducts = groupProducts(rawProducts);
+
+    // Build categories from deduplicated products
     const categoryMap = {};
 
-    for (const product of allProducts) {
+    for (const product of dedupedProducts) {
         const cat = product.category || 'Uncategorized';
         if (!categoryMap[cat]) {
             categoryMap[cat] = {
@@ -144,16 +126,13 @@ async function fetchHomePageData() {
         };
     }
 
-    // Build featured products:
-    // Priority 1: Products marked as featured by admin
+    // Build featured products
     const featured = [];
-    const featuredIds = new Set();
     const MAX_FEATURED = 12;
 
-    for (const p of allProducts) {
+    for (const p of dedupedProducts) {
         if (p.is_featured && featured.length < MAX_FEATURED) {
-            featured.push(toPublicProduct(p));
-            featuredIds.add(p.id);
+            featured.push(p);
         }
     }
 
@@ -161,7 +140,7 @@ async function fetchHomePageData() {
         settings: settingsMap,
         categories: Object.values(categoryMap),
         featured_products: featured,
-        all_products: allProducts.map(toPublicProduct),
+        all_products: dedupedProducts,
         testimonials: testimonialsResult.data || [],
     };
 }
@@ -206,7 +185,7 @@ async function getCategoryProducts(req, res) {
         // Regular product category — find by matching slug
         const { data: allProducts, error } = await supabase
             .from('products')
-            .select('id, sekalipay_item_id, sekalipay_product_id, category, name, icon, image, variants, is_active, synced_at, created_at, is_featured')
+            .select('*, product_variants(*)')
             .eq('is_active', true)
             .order('name', { ascending: true });
 
@@ -222,6 +201,7 @@ async function getCategoryProducts(req, res) {
         }
 
         const categoryName = matchingProducts[0].category;
+        const dedupedCategoryProducts = groupProducts(matchingProducts);
 
         const responseData = {
             category: {
@@ -229,7 +209,7 @@ async function getCategoryProducts(req, res) {
                 name: categoryName,
                 type: 'product',
             },
-            products: matchingProducts.map(toPublicProduct),
+            products: dedupedCategoryProducts,
         };
 
         cacheService.set(cacheKey, responseData, 300);
@@ -241,3 +221,4 @@ async function getCategoryProducts(req, res) {
 }
 
 module.exports = { getHomePage, getCategoryProducts };
+

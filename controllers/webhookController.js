@@ -3,13 +3,12 @@ const supabase = require('../supabase');
 const paymentGatewayService = require('../services/paymentGatewayService');
 const sayabayarGatewayService = require('../services/sayabayarGatewayService');
 const dyqrisGatewayService = require('../services/dyqrisGatewayService');
-const sekalipayService = require('../services/sekalipayService');
 const emailService = require('../services/emailService');
 const orderFulfillmentService = require('../services/orderFulfillmentService');
 const vendorRegistry = require('../services/vendors/vendorRegistry');
+
 // ══════════════════════════════════════════════════════════════════════════
 // HELPER — Sekalipay Reseller Webhook Signature Verification
-// Format: SHA256(ref_id + ":" + invoice + ":" + status + ":" + webhook_secret)
 // ══════════════════════════════════════════════════════════════════════════
 
 function buildSekalipaySignature(refId, invoice, status, secret) {
@@ -29,33 +28,17 @@ function timingSafeCompare(a, b) {
 // ══════════════════════════════════════════════════════════════════════════
 // HANDLER 1 — POST /api/webhooks/payment-gateway
 // Dipanggil FinCloud saat pembayaran QRIS user berhasil dikonfirmasi.
-//
-// FinCloud mengirim callback via POST form-urlencoded dengan parameter:
-//   reff_id   — ID referensi invoice (= orderId kita)
-//   nominal   — Jumlah nominal yang dibayar
-//   status    — Status pembayaran ('success')
-//   signature — MD5(apikey + reff_id + status)
-//   is_test   — (opsional) true jika simulasi ping test dari dashboard
-//
-// Alur:
-//   1. Validasi signature MD5 dari FinCloud
-//   2. Handle ping test (is_test)
-//   3. Verify via API: panggil cek_status untuk konfirmasi ulang
-//   4. Cari order di Supabase via reff_id (= orderId)
-//   5. Jika status "success", buat transaksi ke Sekalipay Reseller
-//   6. Update order: status=PROCESSING atau FAILED (jika Sekalipay error)
 // ══════════════════════════════════════════════════════════════════════════
 
 async function handlePaymentGatewayWebhook(req, res) {
     const reffId = req.body?.reff_id || '';
-    const nominal = req.body?.nominal || '';
     const status = req.body?.status || '';
     const signature = req.body?.signature || '';
     const isTest = req.body?.is_test === 'true' || req.body?.is_test === true;
 
     console.log(`[Webhook/PG-FinCloud] Received callback for reff_id=${reffId}, status=${status}`);
 
-    // ── Validasi signature ────────────────────────────────────────────────
+    // 1. Validasi signature
     const isValidSig = paymentGatewayService.verifyWebhookSignature(
         reffId,
         status,
@@ -67,15 +50,11 @@ async function handlePaymentGatewayWebhook(req, res) {
         return res.status(401).json({ error: 'Invalid signature' });
     }
 
-    // ── Handle ping test dari FinCloud dashboard ──────────────────────────
     if (isTest) {
-        console.log('[Webhook/PG-FinCloud] Test webhook OK (is_test=true).');
         return res.status(200).send('TEST_OK');
     }
 
-    // ── Hanya proses jika status "success" ────────────────────────────────
     if (status !== 'success') {
-        console.log(`[Webhook/PG-FinCloud] Status bukan "success" (${status}), dilewati.`);
         return res.status(200).json({ message: 'Status not success, ignored' });
     }
 
@@ -83,7 +62,7 @@ async function handlePaymentGatewayWebhook(req, res) {
         return res.status(400).json({ error: 'reff_id missing' });
     }
 
-    // ── Ambil order dari Supabase (reff_id = orderId) ─────────────────────
+    // 2. Ambil order dari Supabase (reff_id = orderId)
     const { data: order, error: fetchError } = await supabase
         .from('orders')
         .select('*')
@@ -95,43 +74,19 @@ async function handlePaymentGatewayWebhook(req, res) {
         return res.status(404).json({ error: 'Order not found' });
     }
 
-    // ── Idempotency check — jangan proses dua kali ────────────────────────
     if (order.status !== 'PENDING') {
-        console.log(`[Webhook/PG-FinCloud] Order ${reffId} sudah diproses (status: ${order.status}), skip.`);
         return res.status(200).json({ message: 'Order already processed' });
     }
 
-    // ── Verifikasi via API (opsional, untuk extra security) ───────────────
-    const idDepo = order.pg_invoice; // id_depo disimpan di pg_invoice saat create
-    if (idDepo) {
-        const checkResult = await paymentGatewayService.checkInvoiceStatus(idDepo);
-        if (checkResult.success && checkResult.data) {
-            const apiStatus = checkResult.data.status;
-            if (apiStatus !== 'success') {
-                console.warn(`[Webhook/PG-FinCloud] API verification says status=${apiStatus}, bukan success. Skip.`);
-                return res.status(200).json({ message: 'API verification failed' });
-            }
-            console.log(`[Webhook/PG-FinCloud] API verification OK: id_depo=${idDepo}, status=${apiStatus}`);
-        } else {
-            // API check gagal, tapi signature sudah valid — lanjut proses
-            console.warn(`[Webhook/PG-FinCloud] API verification gagal untuk id_depo=${idDepo}, lanjut dengan signature.`);
-        }
-    }
-
-    // ── Update pg_paid_at & tandai sedang diproses ────────────────────────
+    // 3. Update pg_paid_at & proses fulfillment
     await supabase
         .from('orders')
         .update({ pg_paid_at: new Date().toISOString() })
         .eq('id', reffId);
 
-    // ── Buat transaksi ke Vendor (Sekalipay / Fincloud) via Fulfillment Service ──────────
-    // OrderFulfillmentService already has atomic lock and handles both vendors.
     const fulfillmentResult = await orderFulfillmentService.fulfillOrder(order);
-
     if (!fulfillmentResult.success && !fulfillmentResult.skipped) {
         console.error(`[Webhook/PG-FinCloud] Fulfillment order gagal untuk ${reffId}:`, fulfillmentResult.message);
-        // Order status is already updated to FAILED in fulfillOrder
-        return res.sendStatus(200); // Tetap 200 agar FinCloud tidak retry
     }
 
     return res.sendStatus(200);
@@ -140,15 +95,9 @@ async function handlePaymentGatewayWebhook(req, res) {
 // ══════════════════════════════════════════════════════════════════════════
 // HANDLER 2 — POST /api/webhooks/sekalipay
 // Dipanggil Sekalipay Reseller saat order selesai/gagal.
-//
-// Events yang diproses:
-//   order.completed — ambil licenses, update status=COMPLETED, simpan account_details
-//   order.canceled  — update status=FAILED
-//   webhook.test    — balas 200 saja
 // ══════════════════════════════════════════════════════════════════════════
 
 async function handleSekalipayWebhook(req, res) {
-    const rawBody = req.rawBody;
     const receivedSig = req.headers['x-signature'] || '';
     const event = req.headers['x-event'] || req.body?.event || '';
 
@@ -163,45 +112,37 @@ async function handleSekalipayWebhook(req, res) {
             ? 'test'
             : (data.status || data.item?.status || '');
 
-    // ── Verifikasi signature ──────────────────────────────────────────────
+    // 1. Verifikasi signature
     const webhookSecret = process.env.SEKALIPAY_WEBHOOK_SECRET || '';
     const expectedSig = buildSekalipaySignature(refId, invoice, dataStatus, webhookSecret);
-
-    // console.log(`[Webhook/Sekalipay] Signature debug: ref_id="${refId}", invoice="${invoice}", status="${dataStatus}"`);
-    // console.log(`[Webhook/Sekalipay] Signature received="${receivedSig}", expected="${expectedSig}"`);
 
     if (!timingSafeCompare(receivedSig, expectedSig)) {
         console.warn('[Webhook/Sekalipay] Invalid signature — request ditolak.');
         return res.status(401).json({ error: 'Invalid signature' });
     }
 
-    // ── webhook.test — hanya verifikasi konfigurasi ───────────────────────
     if (event === 'webhook.test') {
-        console.log('[Webhook/Sekalipay] Test webhook OK.');
         return res.sendStatus(200);
     }
 
-    // ── Ambil order dari Supabase via sekalipay_ref_id ────────────────────
+    // 2. Ambil order dari Supabase
     const { data: order, error: fetchError } = await supabase
         .from('orders')
         .select('*')
-        .eq('sekalipay_ref_id', refId)
-        .single();
+        .or(`vendor_order_id.eq.${refId},id.eq.${refId}`)
+        .maybeSingle();
 
     if (fetchError || !order) {
         console.error(`[Webhook/Sekalipay] Order ref_id=${refId} tidak ditemukan.`);
-        // Tetap 200 agar tidak di-retry terus
         return res.sendStatus(200);
     }
 
-    // ── order.completed ───────────────────────────────────────────────────
+    // 3. order.completed
     if (event === 'order.completed') {
         if (order.status === 'COMPLETED') {
-            console.log(`[Webhook/Sekalipay] Order ${refId} sudah COMPLETED, skip.`);
             return res.sendStatus(200);
         }
 
-        // Ekstrak licenses dari items (produk auto)
         const items = data.items || [];
         const allLicenses = [];
 
@@ -212,6 +153,7 @@ async function handleSekalipayWebhook(req, res) {
         });
 
         const accountDetails = {
+            ...order.account_details,
             type: 'auto',
             licenses: allLicenses,
             raw_items: items,
@@ -223,7 +165,8 @@ async function handleSekalipayWebhook(req, res) {
             .update({
                 status: 'COMPLETED',
                 account_details: accountDetails,
-                sekalipay_invoice: invoice,
+                vendor_status: 'success',
+                vendor_invoice: invoice,
             })
             .eq('id', order.id);
 
@@ -231,61 +174,39 @@ async function handleSekalipayWebhook(req, res) {
             console.error(`[Webhook/Sekalipay] Gagal update order ${order.id}:`, updateError.message);
         } else {
             console.log(`[Webhook/Sekalipay] Order ${order.id} COMPLETED. Licenses: ${allLicenses.length}`);
-
-            // Kirim email notifikasi sukses ke pembeli (fire-and-forget)
             emailService.sendOrderCompletedEmail({
                 ...order,
                 account_details: accountDetails,
-                sekalipay_invoice: invoice,
+                vendor_invoice: invoice,
             }).catch(err => console.error(`[Webhook/Sekalipay] Email completed gagal:`, err.message));
         }
 
         return res.sendStatus(200);
     }
 
-    // ── order.canceled ────────────────────────────────────────────────────
-    if (event === 'order.canceled') {
+    // 4. order.canceled / refunded
+    if (event === 'order.canceled' || event === 'order.refunded') {
+        const errorMsg = event === 'order.refunded'
+            ? 'Nomor tujuan salah atau tidak valid (refund)'
+            : 'Order dibatalkan oleh Sekalipay';
+
         await supabase
             .from('orders')
             .update({
                 status: 'FAILED',
-                error_message: 'Order dibatalkan oleh Sekalipay',
-                sekalipay_invoice: invoice,
+                error_message: errorMsg,
+                vendor_status: 'failed',
+                vendor_invoice: invoice,
             })
             .eq('id', order.id);
 
-        console.log(`[Webhook/Sekalipay] Order ${order.id} CANCELLED.`);
-
-        // Kirim email notifikasi gagal ke pembeli (fire-and-forget)
+        console.log(`[Webhook/Sekalipay] Order ${order.id} ${event}.`);
         emailService.sendOrderFailedEmail(order)
             .catch(err => console.error(`[Webhook/Sekalipay] Email failed gagal:`, err.message));
 
         return res.sendStatus(200);
     }
 
-    // ── order.refunded ──────────────────────────────────
-    if (event === 'order.refunded') {
-        const rawPayloadStr = JSON.stringify(payload);
-        await supabase
-            .from('orders')
-            .update({
-                status: 'FAILED',
-                error_message: `Nomor tujuan salah atau tidak valid (refund)`,
-                sekalipay_invoice: invoice,
-            })
-            .eq('id', order.id);
-
-        console.log(`[Webhook/Sekalipay] Order ${order.id} REFUNDED/REFOUNDED. Payload: ${rawPayloadStr}`);
-
-        // Kirim email notifikasi gagal ke pembeli (fire-and-forget)
-        emailService.sendOrderFailedEmail(order)
-            .catch(err => console.error(`[Webhook/Sekalipay] Email refunded gagal:`, err.message));
-
-        return res.sendStatus(200);
-    }
-
-    // ── Event lain — abaikan ──────────────────────────────────────────────
-    console.log(`[Webhook/Sekalipay] Event ${event} tidak diproses.`);
     return res.sendStatus(200);
 }
 
@@ -295,7 +216,7 @@ async function handleSekalipayWebhook(req, res) {
 // ══════════════════════════════════════════════════════════════════════════
 
 async function handleFincloudPPOBWebhook(req, res) {
-    const { reff_id, nominal, status, rrn, sn, signature, signature_hmac } = req.body;
+    const { reff_id, status, rrn, sn, signature } = req.body;
     
     console.log(`[Webhook/Fincloud-PPOB] Received callback for reff_id=${reff_id}, status=${status}`);
 
@@ -307,33 +228,30 @@ async function handleFincloudPPOBWebhook(req, res) {
     try {
         adapter = vendorRegistry.get('fincloud');
     } catch (err) {
-        console.error(`[Webhook/Fincloud-PPOB] Fincloud adapter not found`);
         return res.status(500).json({ error: 'Vendor adapter missing' });
     }
 
     const webhookSecret = process.env.FINCLOUD_PPOB_WEBHOOK_SECRET;
-    
     const isValidSig = adapter.verifyWebhookSignature(req.body, signature, webhookSecret);
     if (!isValidSig) {
         console.warn('[Webhook/Fincloud-PPOB] Invalid signature — request ditolak.');
         return res.status(401).json({ error: 'Invalid signature' });
     }
 
-    // ── Ambil order dari Supabase (vendor_ref_id = reff_id) ─────────────────────
+    // Ambil order dari Supabase
     const { data: order, error: fetchError } = await supabase
         .from('orders')
         .select('*')
-        .eq('vendor_ref_id', reff_id)
+        .or(`vendor_order_id.eq.${reff_id},id.eq.${reff_id}`)
         .eq('vendor', 'fincloud')
-        .single();
+        .maybeSingle();
 
     if (fetchError || !order) {
         console.error(`[Webhook/Fincloud-PPOB] Order ${reff_id} tidak ditemukan:`, fetchError?.message);
-        return res.sendStatus(200); // 200 to prevent retries
+        return res.sendStatus(200);
     }
 
     if (order.status === 'COMPLETED' || order.status === 'FAILED') {
-        console.log(`[Webhook/Fincloud-PPOB] Order ${reff_id} sudah final (${order.status}), skip.`);
         return res.sendStatus(200);
     }
 
@@ -352,13 +270,12 @@ async function handleFincloudPPOBWebhook(req, res) {
             .update({
                 status: 'COMPLETED',
                 account_details: accountDetails,
-                vendor_status: 'success'
+                vendor_status: 'success',
+                vendor_invoice: actualRrn,
             })
             .eq('id', order.id);
 
-        if (updateError) {
-            console.error(`[Webhook/Fincloud-PPOB] Gagal update order ${order.id}:`, updateError.message);
-        } else {
+        if (!updateError) {
             console.log(`[Webhook/Fincloud-PPOB] Order ${order.id} COMPLETED.`);
             emailService.sendOrderCompletedEmail({
                 ...order,
@@ -378,8 +295,6 @@ async function handleFincloudPPOBWebhook(req, res) {
         console.log(`[Webhook/Fincloud-PPOB] Order ${order.id} FAILED.`);
         emailService.sendOrderFailedEmail(order)
             .catch(err => console.error(`[Webhook/Fincloud-PPOB] Email failed gagal:`, err.message));
-    } else {
-        console.log(`[Webhook/Fincloud-PPOB] Unhandled status: ${status}`);
     }
 
     return res.sendStatus(200);
@@ -396,7 +311,6 @@ async function handleSayabayarWebhook(req, res) {
         const payloadString = req.rawBody || (typeof req.body === 'string' ? req.body : JSON.stringify(req.body));
         
         const { webhookSecret } = await sayabayarGatewayService.getConfig();
-        
         if (webhookSecret) {
             const isValid = sayabayarGatewayService.verifyWebhookSignature(payloadString, signature, webhookSecret);
             if (!isValid) {
@@ -418,7 +332,7 @@ async function handleSayabayarWebhook(req, res) {
         const { data: order, error: fetchError } = await supabase
             .from('orders')
             .select('*')
-            .or(`id.eq.${invoiceId},sayabayar_ref_id.eq.${invoiceId},pg_invoice.eq.${data.payment_url || invoiceId}`)
+            .or(`id.eq.${invoiceId},pg_invoice.eq.${data.payment_url || invoiceId}`)
             .maybeSingle();
 
         if (fetchError || !order) {
@@ -427,7 +341,6 @@ async function handleSayabayarWebhook(req, res) {
         }
 
         if (order.status !== 'PENDING') {
-            console.log(`[Webhook/Sayabayar] Order ${order.id} sudah diproses (status: ${order.status}), skip.`);
             return res.status(200).json({ received: true });
         }
 
@@ -466,7 +379,6 @@ async function handleDyqrisWebhook(req, res) {
         const payloadString = req.rawBody || (typeof req.body === 'string' ? req.body : JSON.stringify(req.body));
         
         const { webhookSecret } = await dyqrisGatewayService.getConfig();
-        
         if (webhookSecret) {
             const isValid = dyqrisGatewayService.verifyWebhookSignature(payloadString, signature, webhookSecret);
             if (!isValid) {
@@ -484,12 +396,11 @@ async function handleDyqrisWebhook(req, res) {
             return res.status(400).json({ error: 'Payload transaction ID missing' });
         }
 
-        // Cari order berdasarkan dyqris_ref_id (Dyqris transaction id) atau id (ref_id toko NX-...)
         let query = supabase.from('orders').select('*');
         if (id && ref_id) {
-            query = query.or(`dyqris_ref_id.eq.${id},id.eq.${ref_id}`);
+            query = query.or(`pg_invoice.eq.${id},id.eq.${ref_id}`);
         } else if (id) {
-            query = query.or(`dyqris_ref_id.eq.${id},id.eq.${id}`);
+            query = query.or(`pg_invoice.eq.${id},id.eq.${id}`);
         } else {
             query = query.eq('id', ref_id);
         }
@@ -502,7 +413,6 @@ async function handleDyqrisWebhook(req, res) {
         }
 
         if (order.status !== 'PENDING') {
-            console.log(`[Webhook/Dyqris] Order ${order.id} sudah diproses (status: ${order.status}), skip.`);
             return res.status(200).json({ received: true });
         }
 
@@ -530,11 +440,114 @@ async function handleDyqrisWebhook(req, res) {
     }
 }
 
+// ══════════════════════════════════════════════════════════════════════════
+// HANDLER 6 — GET / POST /api/webhooks/okeconnect
+// Callback dari OkeConnect saat transaksi Sukses/Gagal.
+// ══════════════════════════════════════════════════════════════════════════
+
+async function handleOkeconnectWebhook(req, res) {
+    try {
+        const queryParams = req.method === 'GET' ? req.query : { ...req.query, ...req.body };
+        const refId = queryParams.refid || queryParams.refID || '';
+        const message = queryParams.message || '';
+
+        console.log(`[Webhook/OkeConnect] Received callback for refId=${refId}, message=${message}`);
+
+        if (!refId && !message) {
+            return res.status(400).json({ error: 'Parameter refid atau message missing' });
+        }
+
+        let adapter;
+        try {
+            adapter = vendorRegistry.get('okeconnect');
+        } catch (err) {
+            return res.status(500).json({ error: 'Vendor adapter okeconnect missing' });
+        }
+
+        const isValid = adapter.verifyWebhookSignature(req, null, process.env.OKECONNECT_CALLBACK_SECRET);
+        if (!isValid) {
+            console.warn('[Webhook/OkeConnect] Invalid secret token — request ditolak.');
+            return res.status(401).json({ error: 'Invalid secret token' });
+        }
+
+        const event = adapter.parseWebhookEvent(req.body, req.headers, queryParams);
+
+        // Cari order di Supabase
+        const { data: order, error: fetchError } = await supabase
+            .from('orders')
+            .select('*')
+            .or(`vendor_order_id.eq.${refId},id.eq.${refId}`)
+            .eq('vendor', 'okeconnect')
+            .maybeSingle();
+
+        if (fetchError || !order) {
+            console.warn(`[Webhook/OkeConnect] Order refId=${refId} tidak ditemukan di database.`);
+            return res.status(200).json({ refid: refId, message, status: 'order_not_found' });
+        }
+
+        if (order.status === 'COMPLETED' || order.status === 'FAILED') {
+            return res.status(200).json({ refid: refId, message, status: 'already_processed' });
+        }
+
+        if (event.status === 'success') {
+            const sn = event.sn || order.vendor_invoice || null;
+            const accountDetails = {
+                ...order.account_details,
+                type: 'auto',
+                sn: sn,
+                serial_number: sn,
+                licenses: sn ? [sn] : [],
+                raw_callback_message: message,
+                completed_at: new Date().toISOString(),
+            };
+
+
+            const { error: updateError } = await supabase
+                .from('orders')
+                .update({
+                    status: 'COMPLETED',
+                    account_details: accountDetails,
+                    vendor_status: 'success',
+                    vendor_invoice: sn,
+                })
+                .eq('id', order.id);
+
+            if (!updateError) {
+                console.log(`[Webhook/OkeConnect] Order ${order.id} COMPLETED (SN: ${sn}).`);
+                emailService.sendOrderCompletedEmail({
+                    ...order,
+                    account_details: accountDetails,
+                    vendor_invoice: sn,
+                }).catch(err => console.error(`[Webhook/OkeConnect] Email completed gagal:`, err.message));
+            }
+        } else if (event.status === 'failed') {
+            await supabase
+                .from('orders')
+                .update({
+                    status: 'FAILED',
+                    error_message: message || 'Transaksi gagal di OkeConnect',
+                    vendor_status: 'failed',
+                })
+                .eq('id', order.id);
+
+            console.log(`[Webhook/OkeConnect] Order ${order.id} FAILED.`);
+            emailService.sendOrderFailedEmail(order)
+                .catch(err => console.error(`[Webhook/OkeConnect] Email failed gagal:`, err.message));
+        }
+
+        return res.status(200).json({ refid: refId, message: message || 'OK' });
+    } catch (err) {
+        console.error('[Webhook/OkeConnect] Internal error:', err);
+        return res.status(500).json({ error: err.message });
+    }
+}
+
 module.exports = {
     handlePaymentGatewayWebhook,
     handleSekalipayWebhook,
     handleFincloudPPOBWebhook,
     handleSayabayarWebhook,
-    handleDyqrisWebhook
+    handleDyqrisWebhook,
+    handleOkeconnectWebhook,
 };
 

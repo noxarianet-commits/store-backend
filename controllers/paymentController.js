@@ -3,7 +3,7 @@ const paymentGatewayService = require('../services/paymentGatewayService');
 const sayabayarGatewayService = require('../services/sayabayarGatewayService');
 const dyqrisGatewayService = require('../services/dyqrisGatewayService');
 const paymentPollingService = require('../services/paymentPollingService');
-const sekalipayService = require('../services/sekalipayService');
+const vendorRegistry = require('../services/vendors/vendorRegistry');
 const { normalizeNotePhoneNumber } = require('../utils/phoneUtils');
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -17,12 +17,9 @@ function generateOrderId() {
 }
 
 /**
- * Generate kode unik (1–999) yang belum dipakai oleh transaksi PENDING.
- * Kode unik ditambahkan ke nominal agar setiap pembayaran punya
- * total yang berbeda.
+ * Generate unique payment code (1–100) not used by any active PENDING order.
  */
 async function generateUniqueCode() {
-    // Ambil kode unik yang sudah dipakai oleh order PENDING
     const { data: pendingOrders } = await supabase
         .from('orders')
         .select('unique_code')
@@ -31,15 +28,13 @@ async function generateUniqueCode() {
 
     const usedCodes = new Set((pendingOrders || []).map(o => o.unique_code));
 
-    // Cari kode unik yang belum dipakai (1–100)
     let code;
     let attempts = 0;
     do {
-        code = Math.floor(Math.random() * 100) + 1; // 1–100
+        code = Math.floor(Math.random() * 100) + 1;
         attempts++;
     } while (usedCodes.has(code) && attempts < 200);
 
-    // Fallback jika semua terpakai
     if (usedCodes.has(code)) {
         code = Math.floor(Math.random() * 100) + 1;
     }
@@ -48,8 +43,8 @@ async function generateUniqueCode() {
 }
 
 /**
- * Baca setting payment_gateway dari Supabase.
- * Returns 'fincloud' (default) atau 'sayabayar'.
+ * Read active payment gateway setting from Supabase.
+ * Returns 'fincloud' (default) | 'sayabayar' | 'dyqris'.
  */
 async function getActivePaymentGateway() {
     try {
@@ -78,29 +73,16 @@ async function getActivePaymentGateway() {
 
 // ══════════════════════════════════════════════════════════════════════════
 // POST /api/payments/create
-// Buat order baru + invoice QRIS via gateway aktif (FinCloud / Saya Bayar).
-//
-// Body:
-//   product_id       (string)  — ID produk di DB kita
-//   variant_id       (integer) — ID variant Sekalipay Reseller
-//   variant_name     (string)
-//   product_name     (string)
-//   amount           (integer) — Harga jual (sell_price)
-//   customer_name    (string)
-//   wa_number        (string)
-//   email            (string)
-//
-// Note: payment_gateway dipilih otomatis dari setting admin.
 // ══════════════════════════════════════════════════════════════════════════
 
 async function createPayment(req, res) {
     try {
-        // ── Cek status toko (buka/tutup) ────────────────────────
+        // 1. Cek status toko (buka/tutup)
         const { data: statusSetting, error: statusError } = await supabase
             .from('settings')
             .select('*')
             .eq('key', 'shop_status')
-            .single();
+            .maybeSingle();
 
         let shopOpen = true;
         if (!statusError && statusSetting) {
@@ -114,191 +96,168 @@ async function createPayment(req, res) {
         }
 
         const {
-            vendor = 'sekalipay', // Default to sekalipay for backward compatibility
-            product_id, // For sekalipay: product.id, For fincloud: sku
-            variant_id, // For sekalipay
-            sku,        // For fincloud
+            vendor = 'sekalipay',
+            product_id,
+            variant_id,
+            sku,
             variant_name,
             product_name,
             amount,
             customer_name,
             wa_number,
             email,
-            note,           // string | json string (for sekalipay), string (target for fincloud)
+            note,
             customer_id,
             user_id,
             zone_id,
-            provider_qty,   // number (for open denom)
+            provider_qty,
         } = req.body;
 
-        // ── Validasi input umum ──────────────────────────────────────
+        // 2. Validasi input umum
         if (!amount || !wa_number || !email) {
-            return res.status(400).json({
-                error: 'amount, wa_number, dan email wajib diisi',
-            });
+            return res.status(400).json({ error: 'amount, wa_number, dan email wajib diisi' });
         }
         if (typeof amount !== 'number' || amount <= 0) {
             return res.status(400).json({ error: 'amount harus berupa angka positif' });
         }
-        
-        let expectedAmount = 0;
-        let dbVariantId = null;
-        let dbSku = null;
 
-        if (vendor === 'fincloud') {
-            if (!product_id && !sku) {
-                return res.status(400).json({ error: 'sku wajib diisi untuk fincloud' });
-            }
-            
-            dbSku = sku || product_id;
-
-            const { data: dbProduct, error: fetchError } = await supabase
-                .from('fincloud_products')
-                .select('*')
-                .eq('sku', dbSku)
-                .single();
-                
-            if (fetchError || !dbProduct) {
-                return res.status(404).json({ error: 'Produk Fincloud tidak ditemukan di sistem' });
-            }
-
-            if (!dbProduct.is_available) {
-                return res.status(400).json({ error: 'Maaf, produk Fincloud ini sedang tidak tersedia.' });
-            }
-            
-            expectedAmount = Math.ceil(dbProduct.sell_price || 0);
-            
-            // Note: Fincloud PPOB documentation doesn't specify a real-time stock check endpoint,
-            // so we skip real-time stock check for Fincloud PPOB.
-
-        } else {
-            // Default: sekalipay
-            if (!variant_id) {
-                return res.status(400).json({ error: 'variant_id wajib diisi untuk sekalipay' });
-            }
-            
-            dbVariantId = variant_id;
-            
-            // ── Ambil data produk dari DB untuk verifikasi harga ──────
-            const { data: dbProduct, error: fetchError } = await supabase
-                .from('products')
-                .select('*')
-                .eq('id', product_id)
-                .single();
-
-            if (fetchError || !dbProduct) {
-                return res.status(404).json({ error: 'Produk tidak ditemukan di sistem' });
-            }
-
-            // Cari variant yang sesuai
-            const variant = (dbProduct.variants || []).find(v => v.id === dbVariantId);
-            if (!variant) {
-                return res.status(404).json({ error: 'Variant tidak ditemukan' });
-            }
-
-            // Verifikasi Harga Secara Aman (Backend-side calculation)
-            if (variant.provider_meta && variant.provider_meta.open_denom) {
-                if (!provider_qty || typeof provider_qty !== 'number' || provider_qty <= 0) {
-                    return res.status(400).json({ error: 'Nominal (provider_qty) wajib diisi untuk produk ini' });
-                }
-                if (variant.provider_meta.min_qty && provider_qty < variant.provider_meta.min_qty) {
-                    return res.status(400).json({ error: `Nominal minimal adalah ${variant.provider_meta.min_qty}` });
-                }
-                if (variant.provider_meta.max_qty && provider_qty > variant.provider_meta.max_qty) {
-                    return res.status(400).json({ error: `Nominal maksimal adalah ${variant.provider_meta.max_qty}` });
-                }
-                expectedAmount = Math.ceil(provider_qty + (variant.sell_price || 0));
-            } else {
-                expectedAmount = Math.ceil(variant.sell_price || 0);
-            }
-            
-            // ── Cek stok real-time dari Sekalipay sebelum buat QRIS ──
-            if (dbProduct.sekalipay_product_id) {
-                const stockCheck = await sekalipayService.fetchItemDetail(dbVariantId);
-                
-                // JIKA API MERESPON ERROR ATAU PRODUK TIDAK VALID, BLOCK CHECKOUT
-                if (!stockCheck.success || !stockCheck.data) {
-                    console.warn(`[paymentController] Validasi gagal untuk variant ${dbVariantId}:`, stockCheck.message || 'Unknown Error');
-                    return res.status(400).json({ error: 'Produk saat ini sedang tidak tersedia atau tidak valid di sistem penyedia. Silakan coba beberapa saat lagi.' });
-                }
-
-                const liveStock = stockCheck.data.stock;
-                if (liveStock !== undefined && liveStock <= 0) {
-                    console.warn(`[paymentController] Stok habis untuk variant ${dbVariantId} (live stock: ${liveStock})`);
-                    // Update stok di DB lokal agar frontend segera update
-                    const updatedVariants = (dbProduct.variants || []).map(v =>
-                        v.id === dbVariantId ? { ...v, stock: 0 } : v
-                    );
-                    await supabase
-                        .from('products')
-                        .update({ variants: updatedVariants })
-                        .eq('id', product_id);
-                    return res.status(400).json({ error: 'Maaf, stok untuk varian ini sedang habis. Silakan pilih varian lain atau coba lagi nanti.' });
-                }
-            }
-
-            // ── Cek ketersediaan variant di layanan validasi (H2H/topup: ewallet/game) ──
-            // Pastikan data[].variants[].status = active/on/true sebelum create payment
-            if (variant.validation?.available && dbProduct.sekalipay_product_id) {
-                try {
-                    const svcCheck = await sekalipayService.checkValidationServices(dbProduct.name);
-                    if (svcCheck.success && Array.isArray(svcCheck.data)) {
-                        // Cari produk yang cocok berdasarkan nama atau sekalipay_product_id
-                        const matchedSvc = svcCheck.data.find(s =>
-                            s.product_id === dbProduct.sekalipay_product_id
-                            || s.product_name?.toLowerCase() === dbProduct.name?.toLowerCase()
-                        );
-
-                        // Cek status variant spesifik di response (harus active/on/true)
-                        if (matchedSvc?.variants && Array.isArray(matchedSvc.variants)) {
-                            const matchedVariant = matchedSvc.variants.find(v => v.item_id === dbVariantId);
-                            if (matchedVariant) {
-                                const vstatus = String(matchedVariant.status).toLowerCase();
-                                const isVariantActive = vstatus === 'active' || vstatus === 'on' || vstatus === 'true';
-                                if (!isVariantActive) {
-                                    console.warn(`[paymentController] Variant ${dbVariantId} status "${matchedVariant.status}" is not active in validation services`);
-                                    return res.status(400).json({
-                                        error: 'Varian produk ini sedang tidak aktif di penyedia layanan. Silakan pilih varian lain atau coba lagi nanti.'
-                                    });
-                                }
-                                console.log(`[paymentController] Validation service check passed for "${dbProduct.name}" variant ${dbVariantId} (status: ${matchedVariant.status})`);
-                            }
-                        }
-                    } else {
-                        // API gagal tapi bukan network error — tetap lanjut (fail-open)
-                        console.warn('[paymentController] checkValidationServices returned no data, proceeding with checkout (fail-open)');
-                    }
-                } catch (valErr) {
-                    // Network error atau unexpected crash — tetap lanjut (fail-open)
-                    console.warn('[paymentController] checkValidationServices error, proceeding with checkout (fail-open):', valErr.message);
-                }
-            }
+        const targetVariantId = String(variant_id || sku || '');
+        if (!targetVariantId && !product_id) {
+            return res.status(400).json({ error: 'variant_id / sku wajib diisi' });
         }
 
-        // Jika harga dari frontend berbeda dengan perhitungan backend, tolak request
+
+        // 3. Query produk & variant secara unified
+        let dbProduct = null;
+        if (product_id) {
+            // Bisa integer ID atau external_id / SKU
+            let query = supabase.from('products').select('*, product_variants(*)');
+            if (!isNaN(product_id)) {
+                query = query.or(`id.eq.${product_id},external_id.eq.${product_id}`);
+            } else {
+                query = query.eq('external_id', String(product_id));
+            }
+            const { data } = await query.maybeSingle();
+            dbProduct = data;
+        }
+
+        if (!dbProduct && sku) {
+            const { data } = await supabase
+                .from('products')
+                .select('*, product_variants(*)')
+                .eq('external_id', String(sku))
+                .maybeSingle();
+            dbProduct = data;
+        }
+
+        if (!dbProduct || dbProduct.is_active === false) {
+            return res.status(404).json({ error: 'Produk tidak ditemukan atau sedang tidak aktif' });
+        }
+
+        // Tentukan vendor sebenarnya dari produk di database
+        const actualVendor = dbProduct.vendor || vendor || 'sekalipay';
+        const adapter = vendorRegistry.get(actualVendor);
+        if (!adapter) {
+            return res.status(400).json({ error: `Vendor '${actualVendor}' tidak didukung di sistem` });
+        }
+
+        // Cari variant yang cocok di product_variants (atau fallback ke variants JSONB)
+        let matchedVariant = null;
+        if (dbProduct.product_variants && dbProduct.product_variants.length > 0) {
+            matchedVariant = dbProduct.product_variants.find(v =>
+                String(v.vendor_variant_id) === targetVariantId ||
+                String(v.id) === targetVariantId ||
+                String(v.metadata?.sku) === targetVariantId
+            );
+        } else if (Array.isArray(dbProduct.variants)) {
+            matchedVariant = dbProduct.variants.find(v =>
+                String(v.id) === targetVariantId || String(v.sku) === targetVariantId
+            );
+        }
+
+        if (!matchedVariant || matchedVariant.is_active === false || matchedVariant.is_hidden === true) {
+            return res.status(404).json({ error: 'Varian produk tidak ditemukan atau sedang tidak aktif' });
+        }
+
+        // 4. Hitung harga server-side
+        let expectedAmount = 0;
+        const sellPrice = matchedVariant.sell_price || matchedVariant.price || 0;
+
+        if (matchedVariant.provider_meta && matchedVariant.provider_meta.open_denom) {
+            if (!provider_qty || typeof provider_qty !== 'number' || provider_qty <= 0) {
+                return res.status(400).json({ error: 'Nominal (provider_qty) wajib diisi untuk produk ini' });
+            }
+            if (matchedVariant.provider_meta.min_qty && provider_qty < matchedVariant.provider_meta.min_qty) {
+                return res.status(400).json({ error: `Nominal minimal adalah ${matchedVariant.provider_meta.min_qty}` });
+            }
+            if (matchedVariant.provider_meta.max_qty && provider_qty > matchedVariant.provider_meta.max_qty) {
+                return res.status(400).json({ error: `Nominal maksimal adalah ${matchedVariant.provider_meta.max_qty}` });
+            }
+            expectedAmount = Math.ceil(provider_qty + sellPrice);
+        } else {
+            expectedAmount = Math.ceil(sellPrice);
+        }
+
         if (amount !== expectedAmount) {
             console.error(`[paymentController] Price mismatch. Expected: ${expectedAmount}, Got: ${amount}`);
             return res.status(400).json({ error: 'Terjadi ketidaksesuaian harga. Silakan refresh halaman.' });
         }
-
         if (expectedAmount < 1000) {
             return res.status(400).json({ error: 'Minimal pembayaran Rp 1.000' });
         }
 
-        // ── Generate order ID & kode unik ───────────────────────
+        // 5. Cek stok real-time via adapter (hanya untuk vendor yang mendukung)
+        if (actualVendor !== 'okeconnect') {
+            const stockCheck = await adapter.checkStock(matchedVariant.vendor_variant_id || targetVariantId);
+            if (!stockCheck.success || stockCheck.available === false) {
+                return res.status(400).json({
+                    error: stockCheck.message || 'Maaf, stok varian ini sedang habis. Silakan coba lagi nanti.'
+                });
+            }
+        }
+
+        // 6. Cek validasi service/akun (hanya untuk Sekalipay)
+        if (actualVendor === 'sekalipay' && matchedVariant.validation?.available) {
+            try {
+                const svcCheck = await adapter.checkValidationServices({
+                    product_name: dbProduct.name,
+                    search: dbProduct.name,
+                });
+                if (svcCheck.success && Array.isArray(svcCheck.data)) {
+                    const matchedSvc = svcCheck.data.find(s =>
+                        s.product_id === parseInt(dbProduct.external_id) ||
+                        s.product_name?.toLowerCase() === dbProduct.name?.toLowerCase()
+                    );
+                    if (matchedSvc?.variants && Array.isArray(matchedSvc.variants)) {
+                        const vItem = matchedSvc.variants.find(v => String(v.item_id) === targetVariantId);
+                        if (vItem) {
+                            const vstatus = String(vItem.status).toLowerCase();
+                            if (vstatus !== 'active' && vstatus !== 'on' && vstatus !== 'true') {
+                                return res.status(400).json({
+                                    error: 'Varian produk ini sedang tidak aktif di penyedia. Silakan pilih varian lain.'
+                                });
+                            }
+                        }
+                    }
+                }
+            } catch (valErr) {
+                console.warn('[paymentController] Validation check warning (fail-open):', valErr.message);
+            }
+        }
+
+
+        // 7. Generate order ID & unique code
         const orderId = generateOrderId();
         const uniqueCode = await generateUniqueCode();
         const totalWithUniqueCode = amount + uniqueCode;
 
-        // ── Tentukan payment gateway dari setting admin ─────────
+        // 8. Tentukan Payment Gateway & Buat Invoice
         const pgProvider = await getActivePaymentGateway();
-        console.log(`[paymentController] Using payment gateway: ${pgProvider}, unique_code: ${uniqueCode}`);
+        console.log(`[paymentController] Using PG: ${pgProvider}, unique_code: ${uniqueCode}`);
 
         let pgData, pgFee, pgTotal, pgInvoice, pgPaymentLink, pgQrLink;
 
         if (pgProvider === 'dyqris') {
-            // ── Buat Transaksi via Dyqris Gateway ──────────────
-            // Dyqris tidak memerlukan penambahan kode unik dari toko (unique_code = 0)
             const dyqrisResult = await dyqrisGatewayService.createTransaction({
                 refId: orderId,
                 amount: amount,
@@ -306,17 +265,12 @@ async function createPayment(req, res) {
                 metadata: {
                     customer_name: (customer_name || wa_number || 'Pelanggan').trim(),
                     email: (email || 'customer@noxarianet.web.id').trim(),
-                    product_name: product_name || 'NoxariaNet Store'
+                    product_name: product_name || dbProduct.name || 'NoxariaNet Store'
                 }
             });
-
             if (!dyqrisResult.success) {
-                console.error('[paymentController] Dyqris createTransaction failed:', dyqrisResult);
-                return res.status(dyqrisResult.status || 502).json({
-                    error: `Gagal membuat pembayaran Dyqris: ${dyqrisResult.message}`,
-                });
+                return res.status(dyqrisResult.status || 502).json({ error: `Gagal membuat pembayaran Dyqris: ${dyqrisResult.message}` });
             }
-
             pgData = dyqrisResult.data;
             pgFee = 0;
             pgTotal = pgData.actual_amount || amount;
@@ -325,51 +279,33 @@ async function createPayment(req, res) {
             pgQrLink = pgData.qr_image_url || (pgData.qr_string ? `https://api.qrserver.com/v1/create-qr-code/?size=350x350&data=${encodeURIComponent(pgData.qr_string)}` : null);
 
         } else if (pgProvider === 'sayabayar') {
-            // ── Buat Invoice via Saya Bayar ────────────────────
-            // Catatan: Saya Bayar secara otomatis menambahkan kode unik (unique_code) dan menghasilkan amount_to_pay
             const sayabayarResult = await sayabayarGatewayService.createInvoice({
                 customer_name: (customer_name || wa_number || 'Pelanggan').trim(),
                 customer_email: (email || 'customer@noxarianet.web.id').trim(),
                 amount: amount,
-                description: `Order ${orderId} - ${product_name || 'NoxariaNet Store'}`,
+                description: `Order ${orderId} - ${product_name || dbProduct.name}`,
                 redirect_url: `${process.env.FRONTEND_URL || 'http://localhost:5173'}/checkout/success?order_id=${orderId}`
             });
-
             if (!sayabayarResult.success) {
-                console.error('[paymentController] Saya Bayar createInvoice failed:', sayabayarResult);
-                return res.status(sayabayarResult.status || 502).json({
-                    error: `Gagal membuat pembayaran Saya Bayar: ${sayabayarResult.message}`,
-                });
+                return res.status(sayabayarResult.status || 502).json({ error: `Gagal membuat pembayaran Saya Bayar: ${sayabayarResult.message}` });
             }
-
             pgData = sayabayarResult.data;
-            pgFee = 0; // Saya Bayar 0% transaction fee
+            pgFee = 0;
             const sayabayarUniqueCode = pgData.unique_code ?? pgData.payment_channel?.unique_code ?? (pgData.amount_to_pay ? (pgData.amount_to_pay - amount) : 0);
             pgTotal = pgData.amount_to_pay || pgData.payment_channel?.amount_to_pay || (amount + sayabayarUniqueCode);
             pgInvoice = pgData.payment_url || pgData.invoice_number || pgData.id;
             pgPaymentLink = pgData.payment_url || null;
-            
             const qrisString = pgData.payment_channel?.qris_string;
-            if (qrisString) {
-                pgQrLink = `https://api.qrserver.com/v1/create-qr-code/?size=350x350&data=${encodeURIComponent(qrisString)}`;
-            } else {
-                pgQrLink = pgData.payment_url || null;
-            }
+            pgQrLink = qrisString ? `https://api.qrserver.com/v1/create-qr-code/?size=350x350&data=${encodeURIComponent(qrisString)}` : (pgData.payment_url || null);
 
         } else {
-            // ── Buat invoice QRIS via FinCloud (default) ────────
             const pgResult = await paymentGatewayService.createInvoice({
                 reffId: orderId,
                 nominal: totalWithUniqueCode,
             });
-
             if (!pgResult.success) {
-                console.error('[paymentController] FinCloud createInvoice failed:', pgResult);
-                return res.status(pgResult.status || 502).json({
-                    error: `Gagal membuat pembayaran: ${pgResult.message}`,
-                });
+                return res.status(pgResult.status || 502).json({ error: `Gagal membuat pembayaran: ${pgResult.message}` });
             }
-
             pgData = pgResult.data;
             pgFee = (pgData.nominal_total || totalWithUniqueCode) - (pgData.nominal_asli || totalWithUniqueCode);
             pgTotal = pgData.nominal_total || totalWithUniqueCode;
@@ -380,16 +316,17 @@ async function createPayment(req, res) {
 
         const effectiveUniqueCode = pgProvider === 'dyqris'
             ? (pgData.actual_amount ? (pgData.actual_amount - amount) : 0)
-            : pgProvider === 'sayabayar' 
-                ? (pgData.unique_code ?? pgData.payment_channel?.unique_code ?? (pgData.amount_to_pay ? (pgData.amount_to_pay - amount) : 0)) 
+            : pgProvider === 'sayabayar'
+                ? (pgData.unique_code ?? pgData.payment_channel?.unique_code ?? (pgData.amount_to_pay ? (pgData.amount_to_pay - amount) : 0))
                 : uniqueCode;
 
-        // ── Simpan order ke Supabase ────────────────────────────
+        // 9. Simpan order ke Supabase
+        const variantIdForOrder = matchedVariant.vendor_variant_id || targetVariantId;
         const { error: dbError } = await supabase.from('orders').insert([
             {
                 id: orderId,
-                product: product_name || 'Unknown',
-                variant: variant_name || '-',
+                product: product_name || dbProduct.name,
+                variant: variant_name || matchedVariant.name || '-',
                 price: amount,
                 wa_number,
                 email,
@@ -397,7 +334,7 @@ async function createPayment(req, res) {
                 payment_method: 'QRIS',
                 status: 'PENDING',
 
-                // Data PG
+                // PG fields
                 pg_provider: pgProvider,
                 pg_invoice: pgInvoice,
                 pg_payment_link: pgPaymentLink,
@@ -407,23 +344,15 @@ async function createPayment(req, res) {
                 pg_fee: pgFee,
                 pg_total: pgTotal,
                 pg_expired_at: pgData?.expired_at || null,
-
-                // Kode unik
                 unique_code: effectiveUniqueCode,
 
-                // Dyqris-specific (renamed from orkut_ref_id)
-                dyqris_ref_id: pgProvider === 'dyqris' ? (pgData.id || null) : null,
+                // Generic Vendor Fields
+                vendor: actualVendor,
+                vendor_order_id: null,
+                vendor_variant_id: variantIdForOrder,
+                vendor_status: 'none',
 
-                // Saya Bayar-specific
-                sayabayar_ref_id: pgProvider === 'sayabayar' ? (pgData.id || pgData.invoice_number || null) : null,
-
-                // Vendor Information
-                vendor,
-                fincloud_sku: dbSku,
-                sekalipay_ref_id: orderId,
-                sekalipay_variant_id: dbVariantId,
-
-                // Simpan note/target/zone_id ke account_details
+                // Account details
                 account_details: (() => {
                     const rawZoneId = zone_id || (req.body.fieldData && req.body.fieldData.zone_id);
                     const rawUserId = customer_id || user_id || (req.body.fieldData && req.body.fieldData.customer_id);
@@ -439,14 +368,17 @@ async function createPayment(req, res) {
                         }
                     }
 
-                    return note ? { 
-                        sekalipay_note: vendor === 'sekalipay' ? normalizeNotePhoneNumber(note) : null,
-                        target: vendor === 'fincloud' ? normalizeNotePhoneNumber(note) : null,
+                    return {
+                        vendor: actualVendor,
+                        note: note ? normalizeNotePhoneNumber(note) : null,
+                        target: note ? normalizeNotePhoneNumber(note) : null,
                         customer_id: finalUserId,
                         user_id: finalUserId,
                         zone_id: finalZoneId,
-                    } : null;
+                        provider_qty: provider_qty ? parseInt(provider_qty) : undefined,
+                    };
                 })(),
+
 
                 timestamp: new Date().toISOString(),
             },
@@ -454,14 +386,11 @@ async function createPayment(req, res) {
 
         if (dbError) {
             console.error('[paymentController] DB insert error:', dbError);
-            return res
-                .status(500)
-                .json({ error: `Gagal menyimpan order: ${dbError.message}` });
+            return res.status(500).json({ error: `Gagal menyimpan order: ${dbError.message}` });
         }
 
-        console.log(`[paymentController] Order ${orderId} created via ${pgProvider}, unique_code: ${uniqueCode}`);
+        console.log(`[paymentController] Order ${orderId} created via ${pgProvider}`);
 
-        // ── Response ke frontend ────────────────────────────────
         return res.status(201).json({
             success: true,
             data: {
@@ -474,8 +403,6 @@ async function createPayment(req, res) {
                 payment_code: 'QRIS',
                 payment_link: pgPaymentLink,
                 qr_link: pgQrLink,
-                virtual_account: null,
-                expired_at: null,
                 status: 'PENDING',
                 pg_provider: pgProvider,
             },
@@ -488,7 +415,6 @@ async function createPayment(req, res) {
 
 // ══════════════════════════════════════════════════════════════════════════
 // GET /api/payments/status/:orderId
-// Polling status order dari Supabase (dipakai frontend untuk real-time update).
 // ══════════════════════════════════════════════════════════════════════════
 
 async function getPaymentStatus(req, res) {
@@ -505,90 +431,53 @@ async function getPaymentStatus(req, res) {
             return res.status(404).json({ error: 'Order tidak ditemukan' });
         }
 
-        // TRIGGER POLLING ON DEMAND JIKA MASIH PENDING
         if (data.status === 'PENDING' && data.pg_invoice) {
-            console.log(`[paymentController] User requested status for ${orderId}, triggering manual poll...`);
             await paymentPollingService.processOrder(data);
-            
-            // Re-fetch data terbaru jika ada perubahan dari proses polling
             const { data: updatedData } = await supabase
                 .from('orders')
                 .select('*')
                 .eq('id', orderId)
                 .single();
-                
-            if (updatedData) {
-                return res.json({ data: updatedData });
-            }
+
+            if (updatedData) return res.json({ data: updatedData });
         }
 
-        // Hapus sekalipay_variant_id dari response untuk keamanan (optional)
-        delete data.sekalipay_variant_id;
         return res.json({ data });
     } catch (err) {
         console.error('[paymentController] getPaymentStatus error:', err.message);
-        return res.status(500).json({ error: err.message });
+        res.status(500).json({ error: err.message });
     }
 }
 
 // ══════════════════════════════════════════════════════════════════════════
 // POST /api/payments/cancel
-// Batalkan invoice (status → expired/cancelled).
-// Routing ke gateway yang sesuai berdasarkan pg_provider order.
 // ══════════════════════════════════════════════════════════════════════════
 
 async function cancelPayment(req, res) {
     try {
         const { order_id } = req.body;
+        if (!order_id) return res.status(400).json({ error: 'order_id wajib diisi' });
 
-        if (!order_id) {
-            return res.status(400).json({ error: 'order_id wajib diisi' });
-        }
-
-        // Cek order di Supabase
         const { data: order, error: fetchError } = await supabase
             .from('orders')
             .select('id, status, pg_provider')
             .eq('id', order_id)
             .single();
 
-        if (fetchError || !order) {
-            return res.status(404).json({ error: 'Order tidak ditemukan' });
-        }
-
+        if (fetchError || !order) return res.status(404).json({ error: 'Order tidak ditemukan' });
         if (order.status !== 'PENDING') {
-            return res.status(400).json({
-                error: `Order tidak bisa dibatalkan (status: ${order.status})`,
-            });
+            return res.status(400).json({ error: `Order tidak bisa dibatalkan (status: ${order.status})` });
         }
 
-        // Cancel berdasarkan gateway provider
-        if (order.pg_provider === 'sayabayar') {
-            console.log(`[paymentController] Saya Bayar order ${order_id} cancelled (no API cancel needed)`);
-        } else {
-            // Cancel di FinCloud
-            const cancelResult = await paymentGatewayService.cancelInvoice(order_id);
-
-            if (!cancelResult.success) {
-                console.error('[paymentController] FinCloud cancelInvoice failed:', cancelResult);
-                return res.status(502).json({
-                    error: `Gagal membatalkan: ${cancelResult.message}`,
-                });
-            }
+        if (order.pg_provider !== 'sayabayar' && order.pg_provider !== 'dyqris') {
+            await paymentGatewayService.cancelInvoice(order_id);
         }
 
-        // Update status di Supabase
-        await supabase
-            .from('orders')
-            .update({ status: 'CANCELLED' })
-            .eq('id', order_id);
-
-        console.log(`[paymentController] Order ${order_id} cancelled via ${order.pg_provider}`);
-
+        await supabase.from('orders').update({ status: 'CANCELLED' }).eq('id', order_id);
         return res.json({ success: true, message: 'Invoice berhasil dibatalkan' });
     } catch (err) {
         console.error('[paymentController] cancelPayment error:', err.message);
-        return res.status(500).json({ error: err.message });
+        res.status(500).json({ error: err.message });
     }
 }
 

@@ -49,13 +49,13 @@ router.post(
 );
 
 /**
- * POST /api/webhooks/sayabayar
- * Callback dari Saya Bayar Gateway (invoice.paid, invoice.expired, dll).
+ * POST /api/webhooks/sekalipay-gateway
+ * Callback dari Sekalipay Payment Gateway (QRIS).
  */
 router.post(
-    '/sayabayar',
+    '/sekalipay-gateway',
     rawBodyMiddleware,
-    webhookController.handleSayabayarWebhook
+    webhookController.handleSekalipayGatewayWebhook
 );
 
 /**

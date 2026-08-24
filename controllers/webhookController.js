@@ -1,7 +1,7 @@
 const crypto = require('crypto');
 const supabase = require('../supabase');
 const paymentGatewayService = require('../services/paymentGatewayService');
-const sayabayarGatewayService = require('../services/sayabayarGatewayService');
+const sekalipayGatewayService = require('../services/sekalipayGatewayService');
 const dyqrisGatewayService = require('../services/dyqrisGatewayService');
 const emailService = require('../services/emailService');
 const orderFulfillmentService = require('../services/orderFulfillmentService');
@@ -301,69 +301,83 @@ async function handleFincloudPPOBWebhook(req, res) {
 }
 
 // ══════════════════════════════════════════════════════════════════════════
-// HANDLER 4 — POST /api/webhooks/sayabayar
-// Callback dari Saya Bayar Gateway (invoice.paid, invoice.expired, dll).
+// HANDLER 4 — POST /api/webhooks/sekalipay-gateway
+// Callback dari Sekalipay Payment Gateway (QRIS).
 // ══════════════════════════════════════════════════════════════════════════
 
-async function handleSayabayarWebhook(req, res) {
+async function handleSekalipayGatewayWebhook(req, res) {
     try {
-        const signature = req.headers['x-webhook-signature'];
+        const signature = req.headers['x-signature'] || req.headers['x-webhook-signature'] || '';
         const payloadString = req.rawBody || (typeof req.body === 'string' ? req.body : JSON.stringify(req.body));
         
-        const { webhookSecret } = await sayabayarGatewayService.getConfig();
-        if (webhookSecret) {
-            const isValid = sayabayarGatewayService.verifyWebhookSignature(payloadString, signature, webhookSecret);
+        const { secretKey } = await sekalipayGatewayService.getConfig();
+        if (secretKey) {
+            const isValid = sekalipayGatewayService.verifyWebhookSignature(payloadString, signature, secretKey);
             if (!isValid) {
-                console.warn('[Webhook/Sayabayar] Invalid signature - request ditolak.');
+                console.warn('[Webhook/SekalipayGateway] Invalid signature - request ditolak.');
                 return res.status(401).json({ error: 'Invalid signature' });
             }
         }
 
-        const body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
-        const { event, data } = body || {};
+        const body = typeof req.body === 'string' ? JSON.parse(req.body) : (req.body || {});
+        const data = body.data || body;
+        const event = body.event || body.type || '';
 
-        if (!data) {
-            return res.status(400).json({ error: 'Payload data missing' });
+        const merchantRefId = data.merchant_ref_id || data.ref_id || data.order_id || body.merchant_ref_id;
+        const invoice = data.invoice || body.invoice;
+        const status = String(data.status || body.status || '').toLowerCase();
+
+        console.log(`[Webhook/SekalipayGateway] Received callback for ref=${merchantRefId}, invoice=${invoice}, status=${status}, event=${event}`);
+
+        if (!merchantRefId && !invoice) {
+            return res.status(400).json({ error: 'merchant_ref_id or invoice missing' });
         }
 
-        const invoiceId = data.invoice_id || data.id || data.invoice_number;
-        console.log(`[Webhook/Sayabayar] Received event ${event} for invoiceId=${invoiceId}`);
+        // Cari order di Supabase
+        let query = supabase.from('orders').select('*');
+        if (merchantRefId && invoice) {
+            query = query.or(`id.eq.${merchantRefId},pg_invoice.eq.${invoice}`);
+        } else if (merchantRefId) {
+            query = query.eq('id', merchantRefId);
+        } else {
+            query = query.eq('pg_invoice', invoice);
+        }
 
-        const { data: order, error: fetchError } = await supabase
-            .from('orders')
-            .select('*')
-            .or(`id.eq.${invoiceId},pg_invoice.eq.${data.payment_url || invoiceId}`)
-            .maybeSingle();
+        const { data: order, error: fetchError } = await query.maybeSingle();
 
         if (fetchError || !order) {
-            console.error(`[Webhook/Sayabayar] Order ${invoiceId} tidak ditemukan.`);
+            console.error(`[Webhook/SekalipayGateway] Order ref=${merchantRefId} invoice=${invoice} tidak ditemukan.`);
             return res.status(200).json({ received: true });
         }
 
         if (order.status !== 'PENDING') {
-            return res.status(200).json({ received: true });
+            return res.status(200).json({ received: true, message: 'Order already processed' });
         }
 
-        if (event === 'invoice.paid') {
+        // Cek status keberhasilan bayar
+        const isPaid = status === 'paid' || status === 'success' || status === 'completed' || event === 'payment.paid' || event === 'invoice.paid';
+
+        if (isPaid) {
+            const paidAt = data.paid_at || new Date().toISOString();
             await supabase
                 .from('orders')
-                .update({ pg_paid_at: data.paid_at || new Date().toISOString() })
+                .update({ pg_paid_at: paidAt })
                 .eq('id', order.id);
 
             const fulfillmentResult = await orderFulfillmentService.fulfillOrder(order);
             if (!fulfillmentResult.success && !fulfillmentResult.skipped) {
-                console.error(`[Webhook/Sayabayar] Fulfillment order gagal untuk ${order.id}:`, fulfillmentResult.message);
+                console.error(`[Webhook/SekalipayGateway] Fulfillment order gagal untuk ${order.id}:`, fulfillmentResult.message);
             }
-        } else if (event === 'invoice.expired' || event === 'invoice.cancelled') {
+        } else if (status === 'expired' || status === 'cancelled' || status === 'failed') {
             await supabase
                 .from('orders')
-                .update({ status: 'CANCELLED', error_message: `Invoice ${event} di Saya Bayar` })
+                .update({ status: 'CANCELLED', error_message: `Pembayaran ${status} di Sekalipay Gateway` })
                 .eq('id', order.id);
         }
 
-        return res.status(200).json({ received: true });
+        return res.status(200).json({ received: true, status: 'OK' });
     } catch (err) {
-        console.error('[Webhook/Sayabayar] Internal error:', err);
+        console.error('[Webhook/SekalipayGateway] Internal error:', err);
         return res.status(500).json({ error: err.message });
     }
 }
@@ -546,7 +560,7 @@ module.exports = {
     handlePaymentGatewayWebhook,
     handleSekalipayWebhook,
     handleFincloudPPOBWebhook,
-    handleSayabayarWebhook,
+    handleSekalipayGatewayWebhook,
     handleDyqrisWebhook,
     handleOkeconnectWebhook,
 };

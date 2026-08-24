@@ -1,6 +1,6 @@
 const supabase = require('../supabase');
 const paymentGatewayService = require('./paymentGatewayService');
-const sayabayarGatewayService = require('./sayabayarGatewayService');
+const sekalipayGatewayService = require('./sekalipayGatewayService');
 const dyqrisGatewayService = require('./dyqrisGatewayService');
 const orderFulfillmentService = require('./orderFulfillmentService');
 const { normalizeNotePhoneNumber } = require('../utils/phoneUtils');
@@ -8,7 +8,7 @@ const vendorRegistry = require('./vendors/vendorRegistry');
 const emailService = require('./emailService');
 
 /**
- * Service untuk mem-polling status pembayaran dari FinCloud, Saya Bayar, dan Dyqris
+ * Service untuk mem-polling status pembayaran dari Sekalipay Gateway, FinCloud, dan Dyqris
  * sebagai solusi jika webhook dari payment gateway gagal atau tidak masuk.
  */
 class PaymentPollingService {
@@ -56,8 +56,8 @@ class PaymentPollingService {
     async processOrder(order) {
         const pgProvider = order.pg_provider || 'fincloud';
         
-        if (pgProvider === 'sayabayar') {
-            return this._processSayabayarOrder(order);
+        if (pgProvider === 'sekalipay') {
+            return this._processSekalipayOrder(order);
         } else if (pgProvider === 'dyqris') {
             return this._processDyqrisOrder(order);
         } else {
@@ -120,30 +120,31 @@ class PaymentPollingService {
     }
 
     /**
-     * Proses polling untuk order Saya Bayar.
-     * Cek status via API Saya Bayar GET /v1/invoices/:id.
+     * Proses polling untuk order Sekalipay Payment Gateway (QRIS).
+     * Cek status via Sekalipay Gateway API GET /payment/:ref_id.
      */
-    async _processSayabayarOrder(order) {
-        const refId = order.sayabayar_ref_id || (order.pg_invoice && !order.pg_invoice.startsWith('http') ? order.pg_invoice : null);
+    async _processSekalipayOrder(order) {
+        const refId = order.id || order.pg_invoice;
         const orderId = order.id;
 
-        if (!refId || refId.startsWith('NX-')) {
-            console.warn(`[Polling/PG-Sayabayar] Order ${orderId} tidak memiliki sayabayar_ref_id valid, skip polling API.`);
+        if (!refId) {
+            console.warn(`[Polling/PG-Sekalipay] Order ${orderId} tidak memiliki ref_id valid, skip polling API.`);
             return;
         }
 
         try {
-            const checkResult = await sayabayarGatewayService.getInvoiceDetails(refId);
+            const checkResult = await sekalipayGatewayService.checkPaymentStatus(refId);
 
             if (!checkResult.success || !checkResult.data) {
                 return;
             }
 
-            if (checkResult.data.status !== 'paid') {
+            const status = String(checkResult.data.status || '').toLowerCase();
+            if (status !== 'paid' && status !== 'success' && status !== 'completed') {
                 return;
             }
 
-            console.log(`[Polling/PG-Sayabayar] Order ${orderId} ternyata sudah PAID (ref=${refId}). Memproses...`);
+            console.log(`[Polling/PG-Sekalipay] Order ${orderId} ternyata sudah PAID (ref=${refId}). Memproses...`);
 
             const { data: currentOrder } = await supabase
                 .from('orders')
@@ -152,24 +153,24 @@ class PaymentPollingService {
                 .single();
 
             if (currentOrder && currentOrder.status !== 'PENDING') {
-                console.log(`[Polling/PG-Sayabayar] Order ${orderId} sudah diproses. Skip.`);
+                console.log(`[Polling/PG-Sekalipay] Order ${orderId} sudah diproses. Skip.`);
                 return;
             }
 
             await supabase
                 .from('orders')
-                .update({ pg_paid_at: new Date().toISOString() })
+                .update({ pg_paid_at: checkResult.data.paid_at || new Date().toISOString() })
                 .eq('id', orderId);
 
             const fulfillmentResult = await orderFulfillmentService.fulfillOrder(currentOrder);
 
             if (!fulfillmentResult.success && !fulfillmentResult.skipped) {
-                console.error(`[Polling/PG-Sayabayar] Fulfillment order gagal untuk ${orderId}:`, fulfillmentResult.message);
+                console.error(`[Polling/PG-Sekalipay] Fulfillment order gagal untuk ${orderId}:`, fulfillmentResult.message);
             } else if (fulfillmentResult.success && !fulfillmentResult.skipped) {
-                console.log(`[Polling/PG-Sayabayar] Order ${orderId} berhasil diproses via polling.`);
+                console.log(`[Polling/PG-Sekalipay] Order ${orderId} berhasil diproses via polling.`);
             }
         } catch (err) {
-            console.error(`[Polling/PG-Sayabayar] Error memproses order ${orderId}:`, err);
+            console.error(`[Polling/PG-Sekalipay] Error memproses order ${orderId}:`, err);
         }
     }
 

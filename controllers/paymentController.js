@@ -1,6 +1,6 @@
 const supabase = require('../supabase');
 const paymentGatewayService = require('../services/paymentGatewayService');
-const sayabayarGatewayService = require('../services/sayabayarGatewayService');
+const sekalipayGatewayService = require('../services/sekalipayGatewayService');
 const dyqrisGatewayService = require('../services/dyqrisGatewayService');
 const paymentPollingService = require('../services/paymentPollingService');
 const vendorRegistry = require('../services/vendors/vendorRegistry');
@@ -44,7 +44,7 @@ async function generateUniqueCode() {
 
 /**
  * Read active payment gateway setting from Supabase.
- * Returns 'fincloud' (default) | 'sayabayar' | 'dyqris'.
+ * Returns 'fincloud' (default) | 'sekalipay' | 'dyqris'.
  */
 async function getActivePaymentGateway() {
     try {
@@ -63,7 +63,7 @@ async function getActivePaymentGateway() {
             val = val.provider || val.value || val.gateway || 'fincloud';
         }
         const strVal = String(val).toLowerCase().trim();
-        if (strVal === 'sayabayar') return 'sayabayar';
+        if (strVal === 'sekalipay') return 'sekalipay';
         if (strVal === 'dyqris') return 'dyqris';
         return 'fincloud';
     } catch {
@@ -278,25 +278,28 @@ async function createPayment(req, res) {
             pgPaymentLink = pgData.qr_image_url || null;
             pgQrLink = pgData.qr_image_url || (pgData.qr_string ? `https://api.qrserver.com/v1/create-qr-code/?size=350x350&data=${encodeURIComponent(pgData.qr_string)}` : null);
 
-        } else if (pgProvider === 'sayabayar') {
-            const sayabayarResult = await sayabayarGatewayService.createInvoice({
+        } else if (pgProvider === 'sekalipay') {
+            const sekalipayResult = await sekalipayGatewayService.createPayment({
+                merchant_ref_id: orderId,
+                amount: amount,
                 customer_name: (customer_name || wa_number || 'Pelanggan').trim(),
                 customer_email: (email || 'customer@noxarianet.web.id').trim(),
-                amount: amount,
-                description: `Order ${orderId} - ${product_name || dbProduct.name}`,
-                redirect_url: `${process.env.FRONTEND_URL || 'http://localhost:5173'}/checkout/success?order_id=${orderId}`
+                customer_phone: wa_number || '08123456789',
+                metadata: {
+                    source: 'website',
+                    order_id: orderId,
+                    product_name: product_name || dbProduct.name || 'NoxariaNet Store'
+                }
             });
-            if (!sayabayarResult.success) {
-                return res.status(sayabayarResult.status || 502).json({ error: `Gagal membuat pembayaran Saya Bayar: ${sayabayarResult.message}` });
+            if (!sekalipayResult.success) {
+                return res.status(sekalipayResult.status || 502).json({ error: `Gagal membuat pembayaran Sekalipay: ${sekalipayResult.message}` });
             }
-            pgData = sayabayarResult.data;
-            pgFee = 0;
-            const sayabayarUniqueCode = pgData.unique_code ?? pgData.payment_channel?.unique_code ?? (pgData.amount_to_pay ? (pgData.amount_to_pay - amount) : 0);
-            pgTotal = pgData.amount_to_pay || pgData.payment_channel?.amount_to_pay || (amount + sayabayarUniqueCode);
-            pgInvoice = pgData.payment_url || pgData.invoice_number || pgData.id;
-            pgPaymentLink = pgData.payment_url || null;
-            const qrisString = pgData.payment_channel?.qris_string;
-            pgQrLink = qrisString ? `https://api.qrserver.com/v1/create-qr-code/?size=350x350&data=${encodeURIComponent(qrisString)}` : (pgData.payment_url || null);
+            pgData = sekalipayResult.data;
+            pgFee = pgData.fee || 0;
+            pgTotal = pgData.total || (amount + pgFee);
+            pgInvoice = pgData.invoice || pgData.merchant_ref_id;
+            pgPaymentLink = pgData.payment_link || pgData.checkout_url || null;
+            pgQrLink = pgData.qr_link || pgData.payment_link || null;
 
         } else {
             const pgResult = await paymentGatewayService.createInvoice({
@@ -316,8 +319,8 @@ async function createPayment(req, res) {
 
         const effectiveUniqueCode = pgProvider === 'dyqris'
             ? (pgData.actual_amount ? (pgData.actual_amount - amount) : 0)
-            : pgProvider === 'sayabayar'
-                ? (pgData.unique_code ?? pgData.payment_channel?.unique_code ?? (pgData.amount_to_pay ? (pgData.amount_to_pay - amount) : 0))
+            : pgProvider === 'sekalipay'
+                ? 0
                 : uniqueCode;
 
         // 9. Simpan order ke Supabase
@@ -469,7 +472,7 @@ async function cancelPayment(req, res) {
             return res.status(400).json({ error: `Order tidak bisa dibatalkan (status: ${order.status})` });
         }
 
-        if (order.pg_provider !== 'sayabayar' && order.pg_provider !== 'dyqris') {
+        if (order.pg_provider !== 'sekalipay' && order.pg_provider !== 'dyqris') {
             await paymentGatewayService.cancelInvoice(order_id);
         }
 

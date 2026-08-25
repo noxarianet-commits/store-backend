@@ -218,36 +218,72 @@ class ProductSyncService {
 
         const externalIds = productList.map(p => p.external_id);
 
-        // 1. Fetch existing products and their variants to preserve admin settings
-        const { data: existingProducts } = await supabase
-            .from('products')
-            .select('id, external_id, is_active, is_featured')
-            .eq('vendor', vendorName)
-            .in('external_id', externalIds);
-
+        // 1. Fetch existing products and their variants with pagination to preserve admin settings
+        // Eliminates PostgREST default 1,000-row cap so all 2,000+ variants are mapped
         const existingMap = new Map();
         const existingIds = [];
-        if (existingProducts) {
-            for (const ep of existingProducts) {
-                existingMap.set(ep.external_id, ep);
-                existingIds.push(ep.id);
+
+        let pFrom = 0;
+        const P_PAGE_SIZE = 1000;
+        let pHasMore = true;
+        while (pHasMore) {
+            const { data: pChunk, error: pErr } = await supabase
+                .from('products')
+                .select('id, external_id, is_active, is_featured')
+                .eq('vendor', vendorName)
+                .range(pFrom, pFrom + P_PAGE_SIZE - 1);
+
+            if (pErr) {
+                console.error(`[ProductSyncService] Error fetching existing products for ${vendorName}:`, pErr.message);
+                break;
+            }
+            if (pChunk && pChunk.length > 0) {
+                for (const ep of pChunk) {
+                    existingMap.set(String(ep.external_id), ep);
+                    existingIds.push(ep.id);
+                }
+                pFrom += P_PAGE_SIZE;
+                if (pChunk.length < P_PAGE_SIZE) pHasMore = false;
+            } else {
+                pHasMore = false;
             }
         }
 
-        // Fetch existing variants to preserve custom markups and is_hidden
+        // Fetch existing variants using pagination loop across ID chunks
         const variantMap = new Map();
         if (existingIds.length > 0) {
-            const { data: existingVariants } = await supabase
-                .from('product_variants')
-                .select('product_id, vendor_variant_id, markup, is_hidden, is_active')
-                .in('product_id', existingIds);
+            const ID_CHUNK_SIZE = 100;
+            const V_PAGE_SIZE = 1000;
 
-            if (existingVariants) {
-                for (const ev of existingVariants) {
-                    variantMap.set(`${ev.product_id}:${ev.vendor_variant_id}`, ev);
+            for (let c = 0; c < existingIds.length; c += ID_CHUNK_SIZE) {
+                const idChunk = existingIds.slice(c, c + ID_CHUNK_SIZE);
+                let chunkFrom = 0;
+                let chunkHasMore = true;
+
+                while (chunkHasMore) {
+                    const { data: vChunk, error: vErr } = await supabase
+                        .from('product_variants')
+                        .select('product_id, vendor_variant_id, markup, is_hidden, is_active')
+                        .in('product_id', idChunk)
+                        .range(chunkFrom, chunkFrom + V_PAGE_SIZE - 1);
+
+                    if (vErr) {
+                        console.error(`[ProductSyncService] Error fetching variants for ${vendorName}:`, vErr.message);
+                        break;
+                    }
+                    if (vChunk && vChunk.length > 0) {
+                        for (const ev of vChunk) {
+                            variantMap.set(`${ev.product_id}:${String(ev.vendor_variant_id)}`, ev);
+                        }
+                        chunkFrom += V_PAGE_SIZE;
+                        if (vChunk.length < V_PAGE_SIZE) chunkHasMore = false;
+                    } else {
+                        chunkHasMore = false;
+                    }
                 }
             }
         }
+
 
         let productsUpserted = 0;
         let variantsUpserted = 0;

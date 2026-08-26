@@ -42,9 +42,12 @@ const PORT = process.env.PORT || 3000;
 
 // Rate Limiters
 const globalLimiter = rateLimit({
-    windowMs: 10 * 60 * 1000, max: 300,
+    windowMs: 10 * 60 * 1000,
+    max: 600,
+    skip: (req) => req.path.includes('/payments/status'),
     message: { error: 'Terlalu banyak request, silakan coba lagi nanti.' },
-    standardHeaders: true, legacyHeaders: false,
+    standardHeaders: true,
+    legacyHeaders: false,
 });
 
 // CORS — Allow all origins

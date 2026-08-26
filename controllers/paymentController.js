@@ -416,6 +416,19 @@ async function createPayment(req, res) {
     }
 }
 
+// In-memory map to throttle upstream Payment Gateway checks (orderId -> timestamp)
+const lastVendorCheckMap = new Map();
+
+// Periodic cleanup of stale throttle entries (every 10 minutes)
+setInterval(() => {
+    const now = Date.now();
+    for (const [key, timestamp] of lastVendorCheckMap.entries()) {
+        if (now - timestamp > 3600000) { // older than 1 hour
+            lastVendorCheckMap.delete(key);
+        }
+    }
+}, 600000);
+
 // ══════════════════════════════════════════════════════════════════════════
 // GET /api/payments/status/:orderId
 // ══════════════════════════════════════════════════════════════════════════
@@ -423,6 +436,7 @@ async function createPayment(req, res) {
 async function getPaymentStatus(req, res) {
     try {
         const { orderId } = req.params;
+        const force = req.query.force === 'true';
 
         const { data, error } = await supabase
             .from('orders')
@@ -434,15 +448,29 @@ async function getPaymentStatus(req, res) {
             return res.status(404).json({ error: 'Order tidak ditemukan' });
         }
 
+        // Jika order masih PENDING, throttle pengecekan ke API vendor Payment Gateway
+        // Regular poll: minimal interval 60 detik (1 menit++)
+        // Manual refresh (?force=true): minimal interval 15 detik
         if (data.status === 'PENDING' && data.pg_invoice) {
-            await paymentPollingService.processOrder(data);
-            const { data: updatedData } = await supabase
-                .from('orders')
-                .select('*')
-                .eq('id', orderId)
-                .single();
+            const now = Date.now();
+            const lastCheck = lastVendorCheckMap.get(orderId) || 0;
+            const minInterval = force ? 15000 : 60000;
 
-            if (updatedData) return res.json({ data: updatedData });
+            if (now - lastCheck >= minInterval) {
+                lastVendorCheckMap.set(orderId, now);
+                try {
+                    await paymentPollingService.processOrder(data);
+                    const { data: updatedData } = await supabase
+                        .from('orders')
+                        .select('*')
+                        .eq('id', orderId)
+                        .single();
+
+                    if (updatedData) return res.json({ data: updatedData });
+                } catch (vendorErr) {
+                    console.warn(`[paymentController] Outbound vendor check warning for order ${orderId}:`, vendorErr.message);
+                }
+            }
         }
 
         return res.json({ data });

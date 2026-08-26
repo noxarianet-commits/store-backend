@@ -17,12 +17,21 @@ const createPaymentLimiter = rateLimit({
  */
 router.post('/create', createPaymentLimiter, paymentController.createPayment);
 
+// Rate limiter khusus untuk polling status order (longgar untuk live polling frontend)
+const statusPollingLimiter = rateLimit({
+    windowMs: 60 * 1000, // 1 menit
+    max: 120, // max 120 request per menit per IP (sangat aman untuk polling 5-10s)
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: 'Terlalu banyak request pengecekan status. Harap tunggu sebentar.' },
+});
+
 /**
  * GET /api/payments/status/:orderId
  * Cek status order (polling dari frontend).
- * Public, tidak butuh auth.
+ * Public, rate-limited khusus polling.
  */
-router.get('/status/:orderId', paymentController.getPaymentStatus);
+router.get('/status/:orderId', statusPollingLimiter, paymentController.getPaymentStatus);
 
 /**
  * POST /api/payments/cancel

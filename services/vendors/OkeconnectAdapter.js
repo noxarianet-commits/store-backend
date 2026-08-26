@@ -1,5 +1,6 @@
 const VendorAdapter = require('./VendorAdapter');
 const axios = require('axios');
+const EventEmitter = require('events');
 
 /**
  * Helper to slugify text for external_id generation.
@@ -16,15 +17,56 @@ function slugify(text) {
 
 /**
  * Helper to extract SN from OkeConnect response/callback message.
- * Handles single codes as well as full formatted strings with spaces and slashes (e.g. DNID NAME/1000/REF).
+ * Handles single codes as well as full formatted strings with spaces and slashes (e.g. DNID NAME/1000/REF or NOMOR:.../NAMA:.../LIMIT:...).
  */
 function extractSN(text) {
     if (!text || typeof text !== 'string') return null;
-    const match = text.match(/SN:\s*([^\n\r]+?)(?:\.\s*Saldo|\s*@\d{2}\/\d{2}|\s*R#|$|\.\s*$)/i);
+    const match = text.match(/SN:\s*([^\n\r]+?)(?:\.\s*Saldo|\s*@\d{2}\/\d{2}|\s*@\d{2}:\d{2}|\s*R#|$|\.\s*$)/i);
     if (match) {
         return match[1].trim().replace(/\.$/, '');
     }
     return null;
+}
+
+/**
+ * Helper to extract customer name / player nickname from OkeConnect inquiry response/SN.
+ */
+function extractCustomerName(text, fallback = '') {
+    if (!text || typeof text !== 'string') return fallback;
+
+    const sn = extractSN(text) || text;
+
+    // 1. Format NOMOR:.../NAMA:XYZ/LIMIT:... or /NAMA:XYZ/ or NAMA:XYZ
+    const slashNameMatch = sn.match(/(?:^|\/)(?:NAMA|NAME|NICKNAME)\s*[:=]\s*([^/,\n\r]+)/i);
+    if (slashNameMatch) {
+        return slashNameMatch[1].trim();
+    }
+
+    // 2. Format a/n XYZ or Nama: XYZ or Nickname: XYZ
+    const nameMatch = text.match(/(?:Nama|NAMA|Name|A\/N|a\/n|A\.N|a\.n|Nickname|NICKNAME|\bAn\b|\ban\b)\s*[:=.]?\s*([^/.,\n\r]+)/i);
+    if (nameMatch) {
+        return nameMatch[1].replace(/^(?:a\/n|a\.n|\ban\b|nama|name|nickname)\s*[:=.]?\s*/i, '').trim();
+    }
+
+    // 3. Format SUKSES. XYZ. Saldo
+    const suksesMatch = text.match(/SUKSES\.\s*([^.]+)\./i);
+    if (suksesMatch && !suksesMatch[1].toLowerCase().includes('saldo') && !suksesMatch[1].toLowerCase().includes('sn:')) {
+        return suksesMatch[1].replace(/^(?:a\/n|a\.n|\ban\b|nama|name|nickname)\s*[:=.]?\s*/i, '').trim();
+    }
+
+    return fallback;
+}
+
+/**
+ * Helper to extract failure error reason from OkeConnect response (e.g. PAYEE_USER_STATUS_DISABLE).
+ */
+function extractErrorMessage(text) {
+    if (!text || typeof text !== 'string') return 'Validasi akun gagal';
+    const match = text.match(/GAGAL[.:\s]+([^\n\r]+?)(?:\.\s*Saldo|\s*@\d{2}\/\d{2}|\s*@\d{2}:\d{2}|$|\.\s*$)/i);
+    if (match) {
+        return match[1].trim().replace(/\.$/, '');
+    }
+    return text.trim();
 }
 
 /**
@@ -50,6 +92,7 @@ function parseStatusAndSn(text) {
 
     return { status, sn, message: trimmed };
 }
+
 
 
 /**
@@ -119,6 +162,9 @@ class OkeconnectAdapter extends VendorAdapter {
         this.priceListUrl = process.env.OKECONNECT_PRICE_LIST_URL || 'https://okeconnect.com/harga/json';
         this.callbackSecret = process.env.OKECONNECT_CALLBACK_SECRET || '';
 
+        this.inquiryEmitter = new EventEmitter();
+        this.inquiryEmitter.setMaxListeners(100);
+
         this.client = axios.create({
             baseURL: this.baseURL,
             timeout: 35000,
@@ -127,6 +173,15 @@ class OkeconnectAdapter extends VendorAdapter {
             },
         });
     }
+
+    /**
+     * Dispatch incoming callback event for pending inquiry checks.
+     */
+    handleInquiryCallback(refId, event) {
+        if (!refId) return;
+        this.inquiryEmitter.emit(refId, event);
+    }
+
 
     /**
      * Auth parameters required for all transaction / balance endpoints.
@@ -483,7 +538,19 @@ class OkeconnectAdapter extends VendorAdapter {
 
             const tempRefId = `INQ${Date.now().toString(36).toUpperCase()}`;
 
-            console.log(`[OkeconnectAdapter] Validating account with code=${inqCode}, dest=${dest}...`);
+            console.log(`[OkeconnectAdapter] Validating account with code=${inqCode}, dest=${dest}, refID=${tempRefId}...`);
+
+            // Setup a Promise to wait for callback
+            const waitForCallback = new Promise((resolve) => {
+                const onCallback = (event) => {
+                    resolve(event);
+                };
+                this.inquiryEmitter.once(tempRefId, onCallback);
+                setTimeout(() => {
+                    this.inquiryEmitter.removeListener(tempRefId, onCallback);
+                    resolve(null);
+                }, 8000);
+            });
 
             const res = await this.client.get('/trx', {
                 params: {
@@ -497,26 +564,47 @@ class OkeconnectAdapter extends VendorAdapter {
             const text = String(res.data || '').trim();
             console.log(`[OkeconnectAdapter] Inquiry response for ${dest}:`, text);
 
-            if (text.includes('GAGAL') || text.includes('Salah') || text.includes('Tidak Ditemukan') || text.includes('TIDAK ADA') || text.includes('Error')) {
-                return {
-                    success: false,
-                    valid: false,
-                    message: text || 'Akun tidak ditemukan atau ID salah',
-                };
-            }
+            const initialParsed = parseStatusAndSn(text);
 
-            // Extract customer name / nickname from response if present
-            let accountName = customerId;
-            const nameMatch = text.match(/(?:Nama|NAMA|Name|A\/N|a\/n|A\.N|a\.n|Nickname|NICKNAME|\bAn\b|\ban\b)\s*[:=.]?\s*([^.,\n\r]+)/i);
-            if (nameMatch) {
-                accountName = nameMatch[1].replace(/^(?:a\/n|a\.n|\ban\b|nama|name|nickname)\s*[:=.]?\s*/i, '').trim();
-            } else {
-                const suksesMatch = text.match(/SUKSES\.\s*([^.]+)\./i);
-                if (suksesMatch && !suksesMatch[1].toLowerCase().includes('saldo')) {
-                    accountName = suksesMatch[1].replace(/^(?:a\/n|a\.n|\ban\b|nama|name|nickname)\s*[:=.]?\s*/i, '').trim();
+            let finalText = text;
+            let finalStatus = initialParsed.status;
+            let finalSn = initialParsed.sn;
+
+            // If initial response is pending / "akan diproses", wait for webhook callback or poll
+            if (finalStatus === 'pending' || text.includes('akan diproses') || text.includes('Menunggu Jawaban')) {
+                console.log(`[OkeconnectAdapter] Waiting for inquiry callback for ${tempRefId}...`);
+                const callbackEvent = await waitForCallback;
+                if (callbackEvent) {
+                    finalText = callbackEvent.message || finalText;
+                    finalStatus = callbackEvent.status;
+                    finalSn = callbackEvent.sn;
+                    console.log(`[OkeconnectAdapter] Inquiry callback received for ${tempRefId}: status=${finalStatus}, sn=${finalSn}`);
+                } else {
+                    // Quick poll fallback if callback didn't arrive in time
+                    try {
+                        const checkRes = await this.checkOrderStatus(tempRefId, { product: inqCode, dest });
+                        if (checkRes.success && checkRes.status !== 'pending') {
+                            finalStatus = checkRes.status;
+                            finalSn = checkRes.sn;
+                            finalText = checkRes.data?.raw || finalText;
+                        }
+                    } catch (e) {
+                        // ignore
+                    }
                 }
             }
 
+            if (finalStatus === 'failed' || finalText.includes('GAGAL') || finalText.includes('Salah') || finalText.includes('Tidak Ditemukan') || finalText.includes('TIDAK ADA')) {
+                const errMsg = extractErrorMessage(finalText);
+                return {
+                    success: false,
+                    valid: false,
+                    message: errMsg || 'Akun tidak ditemukan atau ID salah',
+                };
+            }
+
+            // Extract customer name / nickname from response
+            const accountName = extractCustomerName(finalText, customerId);
 
             return {
                 success: true,
@@ -524,7 +612,8 @@ class OkeconnectAdapter extends VendorAdapter {
                 data: {
                     account_name: accountName,
                     display_name: accountName,
-                    raw: text,
+                    sn: finalSn,
+                    raw: finalText,
                 },
             };
         } catch (error) {
@@ -536,6 +625,7 @@ class OkeconnectAdapter extends VendorAdapter {
             };
         }
     }
+
 
 
     /**

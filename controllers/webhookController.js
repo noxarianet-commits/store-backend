@@ -486,6 +486,13 @@ async function handleOkeconnectWebhook(req, res) {
 
         const event = adapter.parseWebhookEvent(req.body, req.headers, queryParams);
 
+        // Check if this is an account inquiry callback (refId starts with INQ)
+        if (refId.startsWith('INQ') && typeof adapter.handleInquiryCallback === 'function') {
+            adapter.handleInquiryCallback(refId, event);
+            console.log(`[Webhook/OkeConnect] Dispatched inquiry callback for ${refId} (status: ${event.status}).`);
+            return res.status(200).json({ refid: refId, message: message || 'OK', status: 'inquiry_processed' });
+        }
+
         // Cari order di Supabase
         const { data: order, error: fetchError } = await supabase
             .from('orders')
@@ -498,6 +505,7 @@ async function handleOkeconnectWebhook(req, res) {
             console.warn(`[Webhook/OkeConnect] Order refId=${refId} tidak ditemukan di database.`);
             return res.status(200).json({ refid: refId, message, status: 'order_not_found' });
         }
+
 
         if (order.status === 'COMPLETED' || order.status === 'FAILED') {
             return res.status(200).json({ refid: refId, message, status: 'already_processed' });

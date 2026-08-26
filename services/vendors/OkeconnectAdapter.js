@@ -59,28 +59,49 @@ const INQUIRY_CODE_MAP = {
     // Games
     'mobile-legends': 'CEKML',
     'mobile legend': 'CEKML',
+    'magic chess': 'CEKML',
     'ml': 'CEKML',
     'free-fire': 'CEKFF',
     'free fire': 'CEKFF',
     'ff': 'CEKFF',
     'arena-of-valor': 'CEKAOV',
+    'arena of valor': 'CEKAOV',
     'aov': 'CEKAOV',
     'call-of-duty': 'CEKCODM',
+    'call of duty': 'CEKCODM',
     'codm': 'CEKCODM',
+    'honor of kings': 'CEKHOK',
+    'honor of king': 'CEKHOK',
+    'hok': 'CEKHOK',
+    'point-blank': 'CEKPB',
+    'point blank': 'CEKPB',
+    'pb': 'CEKPB',
+    'genshin': 'CEKGI',
+    'genshin impact': 'CEKGI',
+    'honkai': 'CEKHSR',
+    'honkai star rail': 'CEKHSR',
+    'valorant': 'CEKVALO',
+    'pubg': 'CEKPUBG',
 
     // E-Wallets
     'dana': 'CEKD',
     'ovo': 'CEKOVO',
     'gopay': 'CEKGJK',
     'gojek': 'CEKGJK',
+    'go-jek': 'CEKGJK',
     'shopee': 'CEKSHP',
     'shopeepay': 'CEKSHP',
     'linkaja': 'CEKLINK',
+    'link aja': 'CEKLINK',
     'grab': 'CEKGRB',
     'isaku': 'CEKISAKU',
     'i.saku': 'CEKISAKU',
+    'maxim': 'CEKMAXIM',
+    'astrapay': 'CEKASTRA',
+    'kaspro': 'CEKKASPRO',
     'pln': 'CEKPLN',
 };
+
 
 /**
  * Okeconnect H2H Vendor Adapter.
@@ -208,9 +229,9 @@ class OkeconnectAdapter extends VendorAdapter {
                 const brand = cleanName;
                 const displayName = `${cleanName} (OkeConnect)`;
 
-                // Determine required fields (no external validation needed for OkeConnect)
+                // Determine required fields and validation availability for OkeConnect
                 let requiredFields = [];
-                const hasValidation = false;
+                let hasValidation = false;
 
                 const lowerClean = cleanName.toLowerCase();
                 if (lowerClean.includes('mobile legend') || lowerClean.includes('magic chess')) {
@@ -218,19 +239,23 @@ class OkeconnectAdapter extends VendorAdapter {
                         { key: 'customer_id', label: 'User ID', type: 'text', required: true },
                         { key: 'zone_id', label: 'Zone ID', type: 'text', required: true },
                     ];
-                } else if (lowerClean.includes('free fire') || lowerClean.includes('call of duty') || lowerClean.includes('arena of valor')) {
+                    hasValidation = true;
+                } else if (lowerClean.includes('free fire') || lowerClean.includes('call of duty') || lowerClean.includes('arena of valor') || lowerClean.includes('honor of king') || lowerClean.includes('pubg') || lowerClean.includes('point blank')) {
                     requiredFields = [
                         { key: 'customer_id', label: 'User ID', type: 'text', required: true },
                     ];
+                    hasValidation = true;
                 } else if (grp.isEwallet) {
                     requiredFields = [
                         { key: 'customer_id', label: 'Nomor HP Tujuan', type: 'tel', required: true },
                     ];
+                    hasValidation = true;
                 } else {
                     requiredFields = [
                         { key: 'customer_id', label: 'Target / User ID', type: 'text', required: true },
                     ];
                 }
+
 
 
                 // Check if any variant is open denom and deduplicate by kode
@@ -390,9 +415,41 @@ class OkeconnectAdapter extends VendorAdapter {
      * Find inquiry code for account validation.
      */
     _resolveInquiryCode(params = {}) {
-        const queryStr = `${params.productName || ''} ${params.brand || ''} ${params.category || ''} ${params.variantId || ''}`.toLowerCase();
+        const name = `${params.productName || ''} ${params.brand || ''} ${params.category || ''}`.toLowerCase();
+        const vId = `${params.variantId || ''}`.toLowerCase();
+
+        // 1. Variant SKU prefix checks
+        if (/^dml/i.test(vId)) return 'CEKML';
+        if (/^dff/i.test(vId)) return 'CEKFF';
+        if (/^d\d+/i.test(vId) || /^bbsdn/i.test(vId)) return 'CEKD';
+        if (/^ovo/i.test(vId)) return 'CEKOVO';
+        if (/^gjk/i.test(vId) || /^gp/i.test(vId)) return 'CEKGJK';
+        if (/^shp/i.test(vId)) return 'CEKSHP';
+        if (/^la/i.test(vId) || /^link/i.test(vId)) return 'CEKLINK';
+
+        // 2. Product name & brand checks
+        if (name.includes('mobile legend') || name.includes('magic chess')) return 'CEKML';
+        if (name.includes('free fire')) return 'CEKFF';
+        if (name.includes('call of duty') || name.includes('codm')) return 'CEKCODM';
+        if (name.includes('arena of valor') || name.includes('aov')) return 'CEKAOV';
+        if (name.includes('honor of king') || name.includes('hok')) return 'CEKHOK';
+        if (name.includes('pubg')) return 'CEKPUBG';
+        if (name.includes('point blank')) return 'CEKPB';
+        if (name.includes('dana')) return 'CEKD';
+        if (name.includes('ovo')) return 'CEKOVO';
+        if (name.includes('gopay') || name.includes('go-jek') || name.includes('gojek')) return 'CEKGJK';
+        if (name.includes('shopee')) return 'CEKSHP';
+        if (name.includes('linkaja') || name.includes('link aja')) return 'CEKLINK';
+        if (name.includes('grab')) return 'CEKGRB';
+        if (name.includes('isaku') || name.includes('i.saku') || name.includes('i-saku')) return 'CEKISAKU';
+        if (name.includes('maxim')) return 'CEKMAXIM';
+        if (name.includes('astrapay')) return 'CEKASTRA';
+        if (name.includes('kaspro')) return 'CEKKASPRO';
+        if (name.includes('pln')) return 'CEKPLN';
+
+        // 3. Fallback map lookup
         for (const [key, code] of Object.entries(INQUIRY_CODE_MAP)) {
-            if (queryStr.includes(key)) {
+            if (name.includes(key) || vId.includes(key)) {
                 return code;
             }
         }
@@ -438,8 +495,9 @@ class OkeconnectAdapter extends VendorAdapter {
             });
 
             const text = String(res.data || '').trim();
+            console.log(`[OkeconnectAdapter] Inquiry response for ${dest}:`, text);
 
-            if (text.includes('GAGAL') || text.includes('Salah') || text.includes('Tidak Ditemukan') || text.includes('TIDAK ADA')) {
+            if (text.includes('GAGAL') || text.includes('Salah') || text.includes('Tidak Ditemukan') || text.includes('TIDAK ADA') || text.includes('Error')) {
                 return {
                     success: false,
                     valid: false,
@@ -449,10 +507,16 @@ class OkeconnectAdapter extends VendorAdapter {
 
             // Extract customer name / nickname from response if present
             let accountName = customerId;
-            const nameMatch = text.match(/(?:Nama|NAMA|Name|A\/N|a\/n|Nickname|NICKNAME)\s*[:=]\s*([^.,\n]+)/i);
+            const nameMatch = text.match(/(?:Nama|NAMA|Name|A\/N|a\/n|A\.N|a\.n|Nickname|NICKNAME|\bAn\b|\ban\b)\s*[:=.]?\s*([^.,\n\r]+)/i);
             if (nameMatch) {
-                accountName = nameMatch[1].trim();
+                accountName = nameMatch[1].replace(/^(?:a\/n|a\.n|\ban\b|nama|name|nickname)\s*[:=.]?\s*/i, '').trim();
+            } else {
+                const suksesMatch = text.match(/SUKSES\.\s*([^.]+)\./i);
+                if (suksesMatch && !suksesMatch[1].toLowerCase().includes('saldo')) {
+                    accountName = suksesMatch[1].replace(/^(?:a\/n|a\.n|\ban\b|nama|name|nickname)\s*[:=.]?\s*/i, '').trim();
+                }
             }
+
 
             return {
                 success: true,
@@ -464,10 +528,15 @@ class OkeconnectAdapter extends VendorAdapter {
                 },
             };
         } catch (error) {
-            console.warn('[OkeconnectAdapter] validateAccount failed (fail-open):', error.message);
-            return { success: true, valid: true, data: { account_name: customerId } };
+            console.warn('[OkeconnectAdapter] validateAccount error:', error.message);
+            return {
+                success: false,
+                valid: false,
+                message: error.message || 'Gagal memvalidasi akun ke OkeConnect',
+            };
         }
     }
+
 
     /**
      * Create order / transaction on OkeConnect.

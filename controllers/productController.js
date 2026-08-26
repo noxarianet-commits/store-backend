@@ -173,30 +173,59 @@ async function getById(req, res) {
 /**
  * POST /api/products/validate
  * Proxy customer validation to the appropriate vendor adapter.
- * Body: { vendor: 'sekalipay'|'okeconnect'|'fincloud', variant_id: string|number, customer_id: string, zone_id?: string }
+ * Body: { vendor?: string, variant_id?: string|number, customer_id: string, zone_id?: string, product_id?: number|string, product_name?: string }
  */
 async function validate(req, res) {
     try {
-        const { vendor = 'sekalipay', variant_id, item_id, customer_id, zone_id } = req.body;
+        let { vendor, variant_id, item_id, customer_id, zone_id, product_id, product_name, brand, category } = req.body;
         const targetVariantId = variant_id || item_id;
 
-        if (!targetVariantId || !customer_id) {
-            return res.status(400).json({ error: 'variant_id dan customer_id wajib diisi' });
+        if (!customer_id) {
+            return res.status(400).json({ error: 'customer_id / Target ID wajib diisi' });
         }
 
-        if (vendor === 'okeconnect') {
-            return res.json({ valid: true, account_name: customer_id, display_name: customer_id });
+        // Auto-resolve vendor and product details from database
+        let resolvedVendor = vendor;
+        let dbProduct = null;
+
+        if (product_id) {
+            const { data } = await supabase
+                .from('products')
+                .select('id, name, brand, category, vendor')
+                .eq('id', product_id)
+                .maybeSingle();
+            if (data) {
+                dbProduct = data;
+                if (!resolvedVendor) resolvedVendor = data.vendor;
+            }
         }
 
-        const adapter = vendorRegistry.get(vendor);
+        if (targetVariantId && (!resolvedVendor || resolvedVendor === 'sekalipay')) {
+            const { data: vRow } = await supabase
+                .from('product_variants')
+                .select('product_id, products(id, name, brand, category, vendor)')
+                .eq('vendor_variant_id', targetVariantId)
+                .maybeSingle();
+            if (vRow?.products) {
+                dbProduct = vRow.products;
+                resolvedVendor = vRow.products.vendor;
+            }
+        }
+
+        if (!resolvedVendor) resolvedVendor = 'sekalipay';
+
+        const adapter = vendorRegistry.get(resolvedVendor);
         if (!adapter) {
-            return res.status(400).json({ error: `Vendor '${vendor}' tidak ditemukan` });
+            return res.status(400).json({ error: `Vendor '${resolvedVendor}' tidak ditemukan` });
         }
 
         const result = await adapter.validateAccount({
             variantId: targetVariantId,
             customerId: customer_id,
             zoneId: zone_id,
+            productName: product_name || dbProduct?.name,
+            brand: brand || dbProduct?.brand,
+            category: category || dbProduct?.category,
         });
 
         if (!result.success || result.valid === false) {
@@ -207,12 +236,13 @@ async function validate(req, res) {
             });
         }
 
-        res.json(result.data || { valid: true });
+        res.json(result.data || { valid: true, account_name: customer_id, display_name: customer_id });
     } catch (err) {
         console.error('POST /api/products/validate error:', err.message);
         res.status(500).json({ error: err.message });
     }
 }
+
 
 /**
  * POST /api/products (Protected)

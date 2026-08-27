@@ -5,7 +5,7 @@ const dyqrisGatewayService = require('../services/dyqrisGatewayService');
 const paymentPollingService = require('../services/paymentPollingService');
 const vendorRegistry = require('../services/vendors/vendorRegistry');
 const cacheService = require('../services/cacheService');
-const { normalizeNotePhoneNumber } = require('../utils/phoneUtils');
+const { normalizePhoneNumber, normalizeNotePhoneNumber } = require('../utils/phoneUtils');
 
 // ══════════════════════════════════════════════════════════════════════════
 // HELPERS
@@ -235,7 +235,17 @@ async function createPayment(req, res) {
         let resolvedCustomerName = (customer_name || wa_number || 'Pelanggan').trim();
 
         if (actualVendor === 'okeconnect') {
-            const targetId = customer_id || user_id || (typeof note === 'string' && !note.startsWith('{') ? note : '');
+            let targetId = customer_id || user_id || (typeof note === 'string' && !note.startsWith('{') ? note : '');
+            const isEwallet = dbProduct?.category?.toLowerCase().includes('wallet') ||
+                /dana|ovo|gopay|gojek|shopee|linkaja|isaku|maxim/i.test(dbProduct?.name || '');
+
+            if (isEwallet || (!zone_id && /^[0-9\s\-\+\(\)]+$/.test(targetId))) {
+                const normalized = normalizePhoneNumber(targetId);
+                if (normalized && normalized.startsWith('08')) {
+                    targetId = normalized;
+                }
+            }
+
             const isValidationNeeded = matchedVariant.validation?.available ||
                                        (matchedVariant.required_fields && matchedVariant.required_fields.some(f => f.key === 'customer_id')) ||
                                        Boolean(targetId);

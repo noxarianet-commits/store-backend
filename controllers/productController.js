@@ -2,6 +2,7 @@ const supabase = require('../supabase');
 const vendorRegistry = require('../services/vendors/vendorRegistry');
 const cacheService = require('../services/cacheService');
 const { groupProducts, buildMultiServerProduct, getCanonicalKey } = require('../utils/productGrouping');
+const { normalizePhoneNumber } = require('../utils/phoneUtils');
 
 /**
  * Format a product row and its variants for public display.
@@ -219,9 +220,20 @@ async function validate(req, res) {
             return res.status(400).json({ error: `Vendor '${resolvedVendor}' tidak ditemukan` });
         }
 
+        // Normalize e-wallet number to 08xxx format (stripping spaces, dashes, +62)
+        const cat = (category || dbProduct?.category || '').toLowerCase();
+        const pName = (product_name || dbProduct?.name || '').toLowerCase();
+        let targetCustomerId = String(customer_id).trim();
+        if (cat.includes('wallet') || /dana|ovo|gopay|gojek|shopee|linkaja|isaku|maxim/i.test(pName) || (!zone_id && /^[0-9\s\-\+\(\)]+$/.test(targetCustomerId))) {
+            const normalized = normalizePhoneNumber(targetCustomerId);
+            if (normalized && normalized.startsWith('08')) {
+                targetCustomerId = normalized;
+            }
+        }
+
         const result = await adapter.validateAccount({
             variantId: targetVariantId,
-            customerId: customer_id,
+            customerId: targetCustomerId,
             zoneId: zone_id,
             productName: product_name || dbProduct?.name,
             brand: brand || dbProduct?.brand,

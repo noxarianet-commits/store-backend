@@ -2,6 +2,7 @@ const VendorAdapter = require('./VendorAdapter');
 const axios = require('axios');
 const EventEmitter = require('events');
 const cacheService = require('../cacheService');
+const { normalizePhoneNumber } = require('../../utils/phoneUtils');
 
 /**
  * Helper to slugify text for external_id generation.
@@ -533,20 +534,40 @@ class OkeconnectAdapter extends VendorAdapter {
      * @param {Object} params - { variantId, customerId, zoneId, productName, brand }
      */
     async validateAccount(params = {}) {
-        const customerId = params.customerId || params.customer_id || params.user_id || params.target;
+        const rawCustomerId = params.customerId || params.customer_id || params.user_id || params.target;
         const zoneId = params.zoneId || params.zone_id || null;
 
-        if (!customerId) {
+        if (!rawCustomerId) {
             return { success: false, valid: false, message: 'User ID / Nomor Tujuan wajib diisi' };
         }
 
+        let customerId = String(rawCustomerId).trim();
         const inqCode = this._resolveInquiryCode(params);
-        if (!inqCode || !this.memberID || !this.pin || !this.password) {
-            // Fail-open gracefully if no inquiry code available or credentials not yet added
-            return { success: true, valid: true, data: { account_name: customerId, display_name: customerId } };
+
+        // Check if it's an e-wallet inquiry or phone-based target
+        const isEwalletInquiry = inqCode && (
+            inqCode.startsWith('CEKD') || inqCode.startsWith('CEKOVO') || inqCode.startsWith('CEKGJK') ||
+            inqCode.startsWith('CEKSHP') || inqCode.startsWith('CEKLINK') || inqCode.startsWith('CEKGRB') ||
+            inqCode.startsWith('CEKISAKU') || inqCode.startsWith('CEKMAXIM') || inqCode.startsWith('CEKASTRA') ||
+            inqCode.startsWith('CEKKASPRO')
+        );
+        const isEwalletCat = (params.category && params.category.toLowerCase().includes('wallet')) ||
+            (params.productName && /dana|ovo|gopay|gojek|shopee|linkaja|isaku|maxim/i.test(params.productName));
+
+        if (isEwalletInquiry || isEwalletCat || (!zoneId && /^[0-9\s\-\+\(\)]+$/.test(customerId))) {
+            // Format nomor e-wallet harus menggunakan format 08 tanpa spasi dan strip (-)
+            const normalized = normalizePhoneNumber(customerId);
+            if (normalized && normalized.startsWith('08')) {
+                customerId = normalized;
+            }
         }
 
-        let dest = String(customerId).trim();
+        if (!inqCode || !this.memberID || !this.pin || !this.password) {
+            // Fail-open gracefully if no inquiry code available or credentials not yet added
+            return { success: true, valid: true, data: { account_name: customerId, display_name: customerId, customer_id: customerId } };
+        }
+
+        let dest = customerId;
         if (zoneId) {
             dest = `${dest}(${zoneId})`;
         }
@@ -679,6 +700,12 @@ class OkeconnectAdapter extends VendorAdapter {
 
             if (customerId && zoneId && !dest.includes('(')) {
                 dest = `${customerId}(${zoneId})`;
+            } else if (!zoneId && dest) {
+                // Normalize e-wallet / phone number to 08xxx format
+                const normalized = normalizePhoneNumber(dest);
+                if (normalized && normalized.startsWith('08')) {
+                    dest = normalized;
+                }
             }
 
             if (!dest) {

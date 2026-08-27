@@ -7,7 +7,6 @@
 const VENDOR_DISPLAY_NAMES = {
     sekalipay: 'Server 1 (Sekalipay)',
     okeconnect: 'Server 2 (OkeConnect)',
-    fincloud: 'Server 3 (Fincloud)',
 };
 
 /**

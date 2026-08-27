@@ -61,8 +61,6 @@ class ProductSyncService {
 
         if (vendorName === 'sekalipay') {
             return await this._syncSekalipay(adapter, { type, category });
-        } else if (vendorName === 'fincloud') {
-            return await this._syncFincloud(adapter, { type });
         } else {
             return await this._syncGenericVendor(adapter, vendorName, { type });
         }
@@ -136,56 +134,6 @@ class ProductSyncService {
 
         cacheService.invalidateHome();
         return { success: true, vendor: 'sekalipay', count: flattened.length, ...stats };
-    }
-
-    /**
-     * Fincloud PPOB sync handler (flat 1-SKU = 1-Product structure).
-     */
-    async _syncFincloud(adapter, { type = 'full' } = {}) {
-        const res = await adapter.fetchProducts();
-        if (!res.success || !res.data || !Array.isArray(res.data.data)) {
-            throw new Error(res.message || 'Gagal mengambil data produk dari Fincloud PPOB');
-        }
-
-        let rawList = res.data.data;
-        rawList = rawList.filter(p => {
-            const cat = p.category || p.kategori;
-            return cat === 'E-Money' || cat === 'Games';
-        });
-
-        const normalized = rawList.map(p => {
-            const isAvail = p.status === 'active' || p.status === 'normal' || p.status === 'tersedia' || p.status === true;
-            return {
-                vendor: 'fincloud',
-                external_id: String(p.sku),
-                category: p.category || p.kategori || 'Uncategorized',
-                name: p.product_name || p.name || p.produk || '',
-                brand: p.brand || p.provider || null,
-                icon: null,
-                image: null,
-                is_active: isAvail,
-                metadata: p,
-                variants: [{
-                    vendor_variant_id: String(p.sku),
-                    name: p.product_name || p.name || p.produk || '',
-                    base_price: Math.ceil(p.price || p.harga || 0),
-                    stock: 9999,
-                    order_process: 'auto',
-                    is_active: isAvail,
-                    metadata: { sku: p.sku },
-                }],
-            };
-        });
-
-        const stats = await this._persistUnifiedProducts('fincloud', normalized, type === 'full');
-        await this.setLastSyncTime('fincloud', {
-            type: 'full',
-            productCount: stats.productsUpserted,
-            total_products: normalized.length,
-        });
-
-        cacheService.invalidateHome();
-        return { success: true, vendor: 'fincloud', count: normalized.length, ...stats };
     }
 
     /**

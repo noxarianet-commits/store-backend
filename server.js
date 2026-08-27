@@ -11,10 +11,8 @@ const productSyncService = require('./services/productSyncService');
 // Initialize Vendor Registry
 const vendorRegistry = require('./services/vendors/vendorRegistry');
 const SekalipayAdapter = require('./services/vendors/SekalipayAdapter');
-const FincloudPPOBAdapter = require('./services/vendors/FincloudPPOBAdapter');
 const OkeconnectAdapter = require('./services/vendors/OkeconnectAdapter');
 vendorRegistry.register('sekalipay', new SekalipayAdapter());
-vendorRegistry.register('fincloud', new FincloudPPOBAdapter());
 vendorRegistry.register('okeconnect', new OkeconnectAdapter());
 
 
@@ -120,17 +118,6 @@ cron.schedule('0 3 * * *', async () => {
     }
 });
 
-// Fincloud full sync daily at 03:30
-cron.schedule('30 3 * * *', async () => {
-    console.log('[CRON] Starting Fincloud full sync...');
-    try {
-        const result = await productSyncService.syncVendor('fincloud', { type: 'full' });
-        console.log(`[CRON] Fincloud full sync completed:`, result);
-    } catch (err) {
-        console.error('[CRON] Fincloud full sync failed:', err.message);
-    }
-});
-
 // Okeconnect full sync daily at 04:00
 cron.schedule('0 4 * * *', async () => {
     console.log('[CRON] Starting Okeconnect full sync...');
@@ -167,7 +154,7 @@ cron.schedule('*/2 * * * *', async () => {
     }
 });
 
-console.log('[CRON] Unified Product Sync scheduled: Sekalipay (delta 1h, full 03:00), Fincloud (full 03:30), Okeconnect (full 04:00)');
+console.log('[CRON] Unified Product Sync scheduled: Sekalipay (delta 1h, full 03:00), Okeconnect (full 04:00)');
 console.log('[CRON] Payment polling scheduled: every 1 minute');
 
 

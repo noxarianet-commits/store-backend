@@ -229,7 +229,7 @@ class ProductSyncService {
         while (pHasMore) {
             const { data: pChunk, error: pErr } = await supabase
                 .from('products')
-                .select('id, external_id, is_active, is_featured')
+                .select('id, external_id, is_active, is_featured, image, icon')
                 .eq('vendor', vendorName)
                 .range(pFrom, pFrom + P_PAGE_SIZE - 1);
 
@@ -296,13 +296,17 @@ class ProductSyncService {
 
             const productRows = batch.map(p => {
                 const existing = existingMap.get(p.external_id);
+                // Preserve existing image & icon (crucial for OkeConnect which does not provide image URLs)
+                const preservedImage = (existing && existing.image) ? existing.image : (p.image || null);
+                const preservedIcon = (existing && existing.icon) ? existing.icon : (p.icon || null);
+
                 return {
                     vendor: vendorName,
                     external_id: p.external_id,
                     category: p.category,
                     name: p.name,
-                    icon: p.icon || null,
-                    image: p.image || null,
+                    icon: preservedIcon,
+                    image: preservedImage,
                     brand: p.brand || null,
                     is_active: existing ? existing.is_active : p.is_active,
                     is_featured: existing ? (existing.is_featured || false) : false,

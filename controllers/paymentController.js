@@ -4,6 +4,7 @@ const sekalipayGatewayService = require('../services/sekalipayGatewayService');
 const dyqrisGatewayService = require('../services/dyqrisGatewayService');
 const paymentPollingService = require('../services/paymentPollingService');
 const vendorRegistry = require('../services/vendors/vendorRegistry');
+const cacheService = require('../services/cacheService');
 const { normalizeNotePhoneNumber } = require('../utils/phoneUtils');
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -206,8 +207,22 @@ async function createPayment(req, res) {
             return res.status(400).json({ error: 'Minimal pembayaran Rp 1.000' });
         }
 
-        // 5. Cek stok real-time via adapter (hanya untuk vendor yang mendukung)
-        if (actualVendor !== 'okeconnect') {
+        // 5. Cek stok & saldo vendor
+        const requiredVendorCost = matchedVariant.provider_meta?.open_denom
+            ? (provider_qty || 0)
+            : (matchedVariant.base_price || matchedVariant.sell_price || amount);
+
+        if (actualVendor === 'okeconnect') {
+            const balanceRes = await adapter.getBalance();
+            if (balanceRes.success && typeof balanceRes.balance === 'number') {
+                if (balanceRes.balance < requiredVendorCost) {
+                    console.warn(`[paymentController] OkeConnect balance insufficient (${balanceRes.balance} < ${requiredVendorCost})`);
+                    return res.status(400).json({
+                        error: 'Mohon maaf, saldo server sedang dalam pengisian. Silakan coba beberapa saat lagi atau pilih server lain.'
+                    });
+                }
+            }
+        } else {
             const stockCheck = await adapter.checkStock(matchedVariant.vendor_variant_id || targetVariantId);
             if (!stockCheck.success || stockCheck.available === false) {
                 return res.status(400).json({
@@ -216,8 +231,40 @@ async function createPayment(req, res) {
             }
         }
 
-        // 6. Cek validasi service/akun (hanya untuk Sekalipay)
-        if (actualVendor === 'sekalipay' && matchedVariant.validation?.available) {
+        // 6. Validasi Akun Wajib (Khusus OkeConnect / Varian dengan validasi)
+        let resolvedCustomerName = (customer_name || wa_number || 'Pelanggan').trim();
+
+        if (actualVendor === 'okeconnect') {
+            const targetId = customer_id || user_id || (typeof note === 'string' && !note.startsWith('{') ? note : '');
+            const isValidationNeeded = matchedVariant.validation?.available ||
+                                       (matchedVariant.required_fields && matchedVariant.required_fields.some(f => f.key === 'customer_id')) ||
+                                       Boolean(targetId);
+
+            if (isValidationNeeded) {
+                if (!targetId) {
+                    return res.status(400).json({ error: 'User ID / Nomor Tujuan wajib diisi dan divalidasi terlebih dahulu' });
+                }
+
+                const valRes = await adapter.validateAccount({
+                    variantId: matchedVariant.vendor_variant_id || targetVariantId,
+                    customerId: targetId,
+                    zoneId: zone_id,
+                    productName: dbProduct.name,
+                    brand: dbProduct.brand,
+                    category: dbProduct.category,
+                });
+
+                if (!valRes.success || valRes.valid === false) {
+                    return res.status(400).json({
+                        error: valRes.message || 'ID Akun tujuan tidak valid atau tidak ditemukan. Mohon cek kembali ID Anda.'
+                    });
+                }
+
+                if (valRes.data?.account_name || valRes.data?.display_name) {
+                    resolvedCustomerName = valRes.data.account_name || valRes.data.display_name;
+                }
+            }
+        } else if (actualVendor === 'sekalipay' && matchedVariant.validation?.available) {
             try {
                 const svcCheck = await adapter.checkValidationServices({
                     product_name: dbProduct.name,
@@ -263,7 +310,7 @@ async function createPayment(req, res) {
                 amount: amount,
                 expiryMinutes: 15,
                 metadata: {
-                    customer_name: (customer_name || wa_number || 'Pelanggan').trim(),
+                    customer_name: resolvedCustomerName,
                     email: (email || 'customer@noxarianet.web.id').trim(),
                     product_name: product_name || dbProduct.name || 'NoxariaNet Store'
                 }
@@ -282,7 +329,7 @@ async function createPayment(req, res) {
             const sekalipayResult = await sekalipayGatewayService.createPayment({
                 merchant_ref_id: orderId,
                 amount: amount,
-                customer_name: (customer_name || wa_number || 'Pelanggan').trim(),
+                customer_name: resolvedCustomerName,
                 customer_email: (email || 'customer@noxarianet.web.id').trim(),
                 customer_phone: wa_number || '08123456789',
                 metadata: {
@@ -323,6 +370,11 @@ async function createPayment(req, res) {
                 ? 0
                 : uniqueCode;
 
+        // Optimistically deduct vendor balance in cache
+        if (actualVendor === 'okeconnect') {
+            cacheService.deductCachedBalance('okeconnect', requiredVendorCost);
+        }
+
         // 9. Simpan order ke Supabase
         const variantIdForOrder = matchedVariant.vendor_variant_id || targetVariantId;
         const { error: dbError } = await supabase.from('orders').insert([
@@ -333,7 +385,7 @@ async function createPayment(req, res) {
                 price: amount,
                 wa_number,
                 email,
-                customer_name: customer_name || wa_number,
+                customer_name: resolvedCustomerName,
                 payment_method: 'QRIS',
                 status: 'PENDING',
 

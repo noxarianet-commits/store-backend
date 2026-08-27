@@ -236,7 +236,10 @@ async function validate(req, res) {
             });
         }
 
-        res.json(result.data || { valid: true, account_name: customer_id, display_name: customer_id });
+        res.json({
+            valid: true,
+            ...(result.data || { account_name: customer_id, display_name: customer_id })
+        });
     } catch (err) {
         console.error('POST /api/products/validate error:', err.message);
         res.status(500).json({ error: err.message });

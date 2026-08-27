@@ -1,6 +1,7 @@
 const VendorAdapter = require('./VendorAdapter');
 const axios = require('axios');
 const EventEmitter = require('events');
+const cacheService = require('../cacheService');
 
 /**
  * Helper to slugify text for external_id generation.
@@ -417,8 +418,17 @@ class OkeconnectAdapter extends VendorAdapter {
 
     /**
      * Check vendor balance from `GET /trx/balance`.
+     * Supports caching (TTL 60s) unless options.force is true.
      */
-    async getBalance() {
+    async getBalance(options = {}) {
+        const cacheKey = cacheService.KEYS.VENDOR_BALANCE('okeconnect');
+        if (!options.force) {
+            const cached = cacheService.get(cacheKey);
+            if (cached !== undefined) {
+                return cached;
+            }
+        }
+
         try {
             if (!this.memberID || !this.pin || !this.password) {
                 return {
@@ -448,7 +458,7 @@ class OkeconnectAdapter extends VendorAdapter {
                 balance = parseInt(numMatch[1].replace(/[^0-9]/g, ''), 10) || 0;
             }
 
-            return {
+            const result = {
                 success: true,
                 balance,
                 data: {
@@ -457,6 +467,11 @@ class OkeconnectAdapter extends VendorAdapter {
                     raw: text,
                 },
             };
+
+            // Cache for 60 seconds
+            cacheService.set(cacheKey, result, 60);
+
+            return result;
         } catch (error) {
             console.error('[OkeconnectAdapter] getBalance error:', error.message);
             return {
@@ -514,6 +529,7 @@ class OkeconnectAdapter extends VendorAdapter {
     /**
      * Validate customer account/user ID via OkeConnect inquiry codes (e.g. CEKML, CEKD, CEKOVO).
      * If credentials are not set or no inquiry code matches, fails open gracefully.
+     * Results are cached for 30 minutes in memory.
      * @param {Object} params - { variantId, customerId, zoneId, productName, brand }
      */
     async validateAccount(params = {}) {
@@ -527,20 +543,28 @@ class OkeconnectAdapter extends VendorAdapter {
         const inqCode = this._resolveInquiryCode(params);
         if (!inqCode || !this.memberID || !this.pin || !this.password) {
             // Fail-open gracefully if no inquiry code available or credentials not yet added
-            return { success: true, valid: true, data: { account_name: customerId } };
+            return { success: true, valid: true, data: { account_name: customerId, display_name: customerId } };
+        }
+
+        let dest = String(customerId).trim();
+        if (zoneId) {
+            dest = `${dest}(${zoneId})`;
+        }
+
+        // Check in-memory cache first for instant (<2ms) response
+        const cacheKey = cacheService.KEYS.ACCOUNT_VALIDATION('okeconnect', `${inqCode}_${dest}`);
+        const cached = cacheService.get(cacheKey);
+        if (cached !== undefined) {
+            console.log(`[OkeconnectAdapter] Cache hit for account validation: ${dest}`);
+            return cached;
         }
 
         try {
-            let dest = String(customerId).trim();
-            if (zoneId) {
-                dest = `${dest}(${zoneId})`;
-            }
-
             const tempRefId = `INQ${Date.now().toString(36).toUpperCase()}`;
 
             console.log(`[OkeconnectAdapter] Validating account with code=${inqCode}, dest=${dest}, refID=${tempRefId}...`);
 
-            // Setup a Promise to wait for callback
+            // Setup a Promise to wait for callback with optimized 4s timeout
             const waitForCallback = new Promise((resolve) => {
                 const onCallback = (event) => {
                     resolve(event);
@@ -549,7 +573,7 @@ class OkeconnectAdapter extends VendorAdapter {
                 setTimeout(() => {
                     this.inquiryEmitter.removeListener(tempRefId, onCallback);
                     resolve(null);
-                }, 8000);
+                }, 4000);
             });
 
             const res = await this.client.get('/trx', {
@@ -606,7 +630,7 @@ class OkeconnectAdapter extends VendorAdapter {
             // Extract customer name / nickname from response
             const accountName = extractCustomerName(finalText, customerId);
 
-            return {
+            const result = {
                 success: true,
                 valid: true,
                 data: {
@@ -616,6 +640,11 @@ class OkeconnectAdapter extends VendorAdapter {
                     raw: finalText,
                 },
             };
+
+            // Cache successful validation result for 30 minutes
+            cacheService.set(cacheKey, result, 1800);
+
+            return result;
         } catch (error) {
             console.warn('[OkeconnectAdapter] validateAccount error:', error.message);
             return {

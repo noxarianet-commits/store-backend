@@ -155,6 +155,18 @@ cron.schedule('* * * * *', async () => {
     await paymentPollingService.pollProcessingOrders();
 });
 
+// Background balance refresh for OkeConnect every 2 minutes
+cron.schedule('*/2 * * * *', async () => {
+    try {
+        const okeAdapter = vendorRegistry.get('okeconnect');
+        if (okeAdapter) {
+            await okeAdapter.getBalance({ force: true });
+        }
+    } catch (e) {
+        // silent
+    }
+});
+
 console.log('[CRON] Unified Product Sync scheduled: Sekalipay (delta 1h, full 03:00), Fincloud (full 03:30), Okeconnect (full 04:00)');
 console.log('[CRON] Payment polling scheduled: every 1 minute');
 

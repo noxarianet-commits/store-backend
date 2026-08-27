@@ -11,6 +11,8 @@ const NodeCache = require('node-cache');
 const KEYS = {
     HOME_PAGE: 'home_page',
     HOME_CATEGORY: (slug) => `home_category_${slug}`,
+    VENDOR_BALANCE: (vendor) => `vendor_balance_${vendor}`,
+    ACCOUNT_VALIDATION: (vendor, key) => `val_${vendor}_${key}`,
 };
 
 class CacheService {
@@ -88,6 +90,29 @@ class CacheService {
         if (matchingKeys.length > 0) {
             this.cache.del(matchingKeys);
             console.log(`[Cache] Invalidated ${matchingKeys.length} keys with prefix "${prefix}"`);
+        }
+    }
+
+    /**
+     * Optimistically deduct cached balance for a vendor.
+     * @param {string} vendor
+     * @param {number} amount
+     */
+    deductCachedBalance(vendor, amount) {
+        const key = this.KEYS.VENDOR_BALANCE(vendor);
+        const cached = this.get(key);
+        if (cached && typeof cached.balance === 'number') {
+            const newBalance = Math.max(0, cached.balance - (amount || 0));
+            this.set(key, {
+                ...cached,
+                balance: newBalance,
+                data: {
+                    ...(cached.data || {}),
+                    balance: newBalance,
+                    formatted: `Rp ${newBalance.toLocaleString('id-ID')}`
+                }
+            }, 60);
+            console.log(`[Cache] Optimistically deducted ${amount} from ${vendor} balance. New: ${newBalance}`);
         }
     }
 

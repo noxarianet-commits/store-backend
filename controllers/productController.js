@@ -224,7 +224,16 @@ async function validate(req, res) {
         const cat = (category || dbProduct?.category || '').toLowerCase();
         const pName = (product_name || dbProduct?.name || '').toLowerCase();
         let targetCustomerId = String(customer_id).trim();
-        if (cat.includes('wallet') || /dana|ovo|gopay|gojek|shopee|linkaja|isaku|maxim/i.test(pName) || (!zone_id && /^[0-9\s\-\+\(\)]+$/.test(targetCustomerId))) {
+        if (cat.includes('wallet') || /dana|ovo|gopay|gojek|shopee|linkaja|isaku|maxim/i.test(pName)) {
+            if (/[a-zA-Z]/.test(targetCustomerId)) {
+                return res.status(400).json({ error: 'Nomor tujuan e-wallet tidak boleh mengandung huruf. Masukkan nomor HP yang valid (contoh: 08123456789)' });
+            }
+            const normalized = normalizePhoneNumber(targetCustomerId);
+            if (!normalized || !/^08[0-9]{8,13}$/.test(normalized)) {
+                return res.status(400).json({ error: 'Format nomor e-wallet tidak valid. Harus diawali 08 dengan 10-14 digit angka.' });
+            }
+            targetCustomerId = normalized;
+        } else if (!zone_id && /^[0-9\s\-\+\(\)]+$/.test(targetCustomerId)) {
             const normalized = normalizePhoneNumber(targetCustomerId);
             if (normalized && normalized.startsWith('08')) {
                 targetCustomerId = normalized;

@@ -554,8 +554,29 @@ class OkeconnectAdapter extends VendorAdapter {
         const isEwalletCat = (params.category && params.category.toLowerCase().includes('wallet')) ||
             (params.productName && /dana|ovo|gopay|gojek|shopee|linkaja|isaku|maxim/i.test(params.productName));
 
-        if (isEwalletInquiry || isEwalletCat || (!zoneId && /^[0-9\s\-\+\(\)]+$/.test(customerId))) {
+        if (isEwalletInquiry || isEwalletCat) {
+            // Strictly reject if alphabetic characters are present
+            if (/[a-zA-Z]/.test(rawCustomerId)) {
+                return { success: false, valid: false, message: 'Nomor tujuan e-wallet tidak boleh mengandung huruf. Masukkan nomor HP valid (contoh: 08123456789)' };
+            }
             // Format nomor e-wallet harus menggunakan format 08 tanpa spasi dan strip (-)
+            const normalized = normalizePhoneNumber(customerId);
+            if (!normalized || !/^08[0-9]{8,13}$/.test(normalized)) {
+                return { success: false, valid: false, message: 'Format nomor e-wallet tidak valid. Harus diawali 08 dengan 10-14 digit angka.' };
+            }
+            customerId = normalized;
+        } else if (inqCode === 'CEKML') {
+            if (!/^\d{4,12}$/.test(customerId)) {
+                return { success: false, valid: false, message: 'User ID Mobile Legends harus berupa 4-12 digit angka (tanpa huruf).' };
+            }
+            if (!zoneId || !/^\d{3,6}$/.test(zoneId)) {
+                return { success: false, valid: false, message: 'Zone ID Mobile Legends harus berupa 3-6 digit angka (tanpa huruf).' };
+            }
+        } else if (inqCode === 'CEKFF') {
+            if (!/^\d{6,14}$/.test(customerId)) {
+                return { success: false, valid: false, message: 'User ID Free Fire harus berupa 6-14 digit angka (tanpa huruf).' };
+            }
+        } else if (!zoneId && /^[0-9\s\-\+\(\)]+$/.test(customerId)) {
             const normalized = normalizePhoneNumber(customerId);
             if (normalized && normalized.startsWith('08')) {
                 customerId = normalized;
@@ -639,12 +660,18 @@ class OkeconnectAdapter extends VendorAdapter {
                 }
             }
 
-            if (finalStatus === 'failed' || finalText.includes('GAGAL') || finalText.includes('Salah') || finalText.includes('Tidak Ditemukan') || finalText.includes('TIDAK ADA')) {
+            // Check if result is NOT success
+            const isSuccess = (finalStatus === 'success' || /status\s+Sukses/i.test(finalText) || /\bSUKSES\b/i.test(finalText)) &&
+                              !/GAGAL|Salah|Tidak Ditemukan|TIDAK ADA|tidak terdaftar/i.test(finalText);
+
+            if (!isSuccess || finalStatus === 'failed' || finalStatus === 'pending') {
                 const errMsg = extractErrorMessage(finalText);
                 return {
                     success: false,
                     valid: false,
-                    message: errMsg || 'Akun tidak ditemukan atau ID salah',
+                    message: (errMsg && !errMsg.includes('akan diproses') && !errMsg.includes('Menunggu Jawaban')) 
+                        ? errMsg 
+                        : 'Akun / ID tidak ditemukan atau tidak valid',
                 };
             }
 

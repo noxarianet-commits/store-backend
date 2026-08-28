@@ -239,7 +239,16 @@ async function createPayment(req, res) {
             const isEwallet = dbProduct?.category?.toLowerCase().includes('wallet') ||
                 /dana|ovo|gopay|gojek|shopee|linkaja|isaku|maxim/i.test(dbProduct?.name || '');
 
-            if (isEwallet || (!zone_id && /^[0-9\s\-\+\(\)]+$/.test(targetId))) {
+            if (isEwallet) {
+                if (/[a-zA-Z]/.test(targetId)) {
+                    return res.status(400).json({ error: 'Nomor tujuan e-wallet tidak boleh mengandung huruf. Masukkan nomor HP yang valid (contoh: 08123456789)' });
+                }
+                const normalized = normalizePhoneNumber(targetId);
+                if (!normalized || !/^08[0-9]{8,13}$/.test(normalized)) {
+                    return res.status(400).json({ error: 'Format nomor e-wallet tidak valid. Harus diawali 08 dengan 10-14 digit angka.' });
+                }
+                targetId = normalized;
+            } else if (!zone_id && /^[0-9\s\-\+\(\)]+$/.test(targetId)) {
                 const normalized = normalizePhoneNumber(targetId);
                 if (normalized && normalized.startsWith('08')) {
                     targetId = normalized;

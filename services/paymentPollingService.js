@@ -176,28 +176,37 @@ class PaymentPollingService {
 
     /**
      * Proses polling untuk order FinCloud.
-     * Cek status via FinCloud API (id_depo).
+     * Cek status via FinCloud API (/cek_status dengan external_id / reff_id).
      */
     async _processFincloudOrder(order) {
-        const idDepo = order.pg_invoice;
-        const reffId = order.id;
+        const reffId = order.id || order.pg_invoice;
 
         try {
             // Cek status ke FinCloud API
-            const checkResult = await paymentGatewayService.checkInvoiceStatus(idDepo);
+            const checkResult = await paymentGatewayService.checkInvoiceStatus(reffId);
             
             if (!checkResult.success || !checkResult.data) {
                 return;
             }
 
-            const apiStatus = checkResult.data.status;
+            const apiStatus = String(checkResult.data.status || '').toLowerCase();
 
-            if (apiStatus !== 'success') {
+            if (apiStatus === 'expired' || apiStatus === 'cancelled') {
+                console.log(`[Polling/PG-FinCloud] Order ${reffId} berstatus ${apiStatus}. Menandai CANCELLED.`);
+                await supabase
+                    .from('orders')
+                    .update({ status: 'CANCELLED', error_message: `Tagihan ${apiStatus} di FinCloud` })
+                    .eq('id', reffId)
+                    .eq('status', 'PENDING');
+                return;
+            }
+
+            if (apiStatus !== 'success' && apiStatus !== 'paid') {
                 // Belum dibayar, abaikan
                 return;
             }
 
-            console.log(`[Polling/PG-FinCloud] Order ${reffId} ternyata sudah sukses dibayar (id_depo=${idDepo}). Memproses...`);
+            console.log(`[Polling/PG-FinCloud] Order ${reffId} ternyata sudah sukses dibayar (status=${apiStatus}). Memproses...`);
 
             // Pastikan belum diproses secara bersamaan oleh webhook
             const { data: currentOrder } = await supabase
@@ -217,7 +226,7 @@ class PaymentPollingService {
                 .update({ pg_paid_at: new Date().toISOString() })
                 .eq('id', reffId);
 
-            // ── Buat transaksi ke Vendor (Sekalipay / Fincloud) via Fulfillment Service ──────────
+            // ── Buat transaksi ke Vendor (Sekalipay / Okeconnect) via Fulfillment Service ──────────
             const fulfillmentResult = await orderFulfillmentService.fulfillOrder(currentOrder);
 
             if (!fulfillmentResult.success && !fulfillmentResult.skipped) {

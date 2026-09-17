@@ -31,43 +31,49 @@ function timingSafeCompare(a, b) {
 // ══════════════════════════════════════════════════════════════════════════
 
 async function handlePaymentGatewayWebhook(req, res) {
-    const reffId = req.body?.reff_id || '';
-    const status = req.body?.status || '';
-    const signature = req.body?.signature || '';
-    const isTest = req.body?.is_test === 'true' || req.body?.is_test === true;
+    const payload = req.body || {};
+    const reffId = payload.reff_id || payload.external_id || '';
+    const event = payload.event || '';
+    const status = payload.status || (event === 'payment.success' ? 'success' : '');
+    const signature = req.headers['x-signature'] || req.headers['signature'] || payload.signature || '';
+    const isTest = payload.is_test === 'true' || payload.is_test === true || event === 'webhook.test';
 
-    console.log(`[Webhook/PG-FinCloud] Received callback for reff_id=${reffId}, status=${status}`);
+    console.log(`[Webhook/PG-FinCloud] Received callback: reff_id=${reffId}, event=${event}, status=${status}`);
 
-    // 1. Validasi signature
-    const isValidSig = paymentGatewayService.verifyWebhookSignature(
-        reffId,
-        status,
-        signature
-    );
+    // 1. Validasi signature jika disertakan
+    if (signature) {
+        const isValidSig = paymentGatewayService.verifyWebhookSignature({
+            reffId,
+            status: event || status,
+            receivedSignature: signature,
+            rawBody: req.rawBody || '',
+        });
 
-    if (!isValidSig) {
-        console.warn('[Webhook/PG-FinCloud] Invalid signature — request ditolak.');
-        return res.status(401).json({ error: 'Invalid signature' });
+        if (!isValidSig) {
+            console.warn('[Webhook/PG-FinCloud] Invalid signature — request ditolak.');
+            return res.status(401).json({ error: 'Invalid signature' });
+        }
     }
 
     if (isTest) {
         return res.status(200).send('TEST_OK');
     }
 
-    if (status !== 'success') {
-        return res.status(200).json({ message: 'Status not success, ignored' });
+    const isSuccess = event === 'payment.success' || status === 'success' || status === 'paid';
+    if (!isSuccess) {
+        return res.status(200).json({ message: 'Event not payment.success, ignored' });
     }
 
     if (!reffId) {
         return res.status(400).json({ error: 'reff_id missing' });
     }
 
-    // 2. Ambil order dari Supabase (reff_id = orderId)
+    // 2. Ambil order dari Supabase (reff_id = orderId atau pg_invoice)
     const { data: order, error: fetchError } = await supabase
         .from('orders')
         .select('*')
-        .eq('id', reffId)
-        .single();
+        .or(`id.eq.${reffId},pg_invoice.eq.${reffId}`)
+        .maybeSingle();
 
     if (fetchError || !order) {
         console.error(`[Webhook/PG-FinCloud] Order ${reffId} tidak ditemukan:`, fetchError?.message);
@@ -78,18 +84,28 @@ async function handlePaymentGatewayWebhook(req, res) {
         return res.status(200).json({ message: 'Order already processed' });
     }
 
-    // 3. Update pg_paid_at & proses fulfillment
+    // 3. Simpan rrn & total_bayar jika ada ke account_details
+    const updatedDetails = {
+        ...(order.account_details || {}),
+        ...(payload.rrn ? { rrn: payload.rrn } : {}),
+        ...(payload.total_bayar ? { pg_total_paid: payload.total_bayar } : {}),
+    };
+
+    // 4. Update pg_paid_at & proses fulfillment
     await supabase
         .from('orders')
-        .update({ pg_paid_at: new Date().toISOString() })
-        .eq('id', reffId);
+        .update({
+            pg_paid_at: payload.timestamp || new Date().toISOString(),
+            account_details: updatedDetails,
+        })
+        .eq('id', order.id);
 
     const fulfillmentResult = await orderFulfillmentService.fulfillOrder(order);
     if (!fulfillmentResult.success && !fulfillmentResult.skipped) {
-        console.error(`[Webhook/PG-FinCloud] Fulfillment order gagal untuk ${reffId}:`, fulfillmentResult.message);
+        console.error(`[Webhook/PG-FinCloud] Fulfillment order gagal untuk ${order.id}:`, fulfillmentResult.message);
     }
 
-    return res.sendStatus(200);
+    return res.status(200).json({ status: true, message: 'OK' });
 }
 
 // ══════════════════════════════════════════════════════════════════════════

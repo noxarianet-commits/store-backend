@@ -370,24 +370,28 @@ async function createPayment(req, res) {
         } else {
             const pgResult = await paymentGatewayService.createInvoice({
                 reffId: orderId,
-                nominal: totalWithUniqueCode,
+                nominal: amount,
             });
             if (!pgResult.success) {
                 return res.status(pgResult.status || 502).json({ error: `Gagal membuat pembayaran: ${pgResult.message}` });
             }
             pgData = pgResult.data;
-            pgFee = (pgData.nominal_total || totalWithUniqueCode) - (pgData.nominal_asli || totalWithUniqueCode);
-            pgTotal = pgData.nominal_total || totalWithUniqueCode;
-            pgInvoice = String(pgData.id_depo || '');
-            pgPaymentLink = pgData.invoice_url || null;
-            pgQrLink = pgData.qr_url || null;
+            const nominalAsli = pgData.nominal || pgData.nominal_asli || amount;
+            const totalBayar = pgData.total_bayar || pgData.nominal_total || (nominalAsli + (pgData.kode_unik || 0));
+            pgFee = pgData.fee || 0;
+            pgTotal = totalBayar;
+            pgInvoice = String(pgData.reff_id || pgData.external_id || pgData.id_depo || orderId);
+            pgPaymentLink = pgData.checkout_url || pgData.invoice_url || null;
+            pgQrLink = pgData.qris_url || pgData.qr_url || (pgData.qris_string ? `https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${encodeURIComponent(pgData.qris_string)}` : null);
         }
 
         const effectiveUniqueCode = pgProvider === 'dyqris'
             ? (pgData.actual_amount ? (pgData.actual_amount - amount) : 0)
             : pgProvider === 'sekalipay'
                 ? 0
-                : uniqueCode;
+                : pgProvider === 'fincloud'
+                    ? (pgData.kode_unik !== undefined ? pgData.kode_unik : ((pgTotal || amount) - amount))
+                    : uniqueCode;
 
         // Optimistically deduct vendor balance in cache
         if (actualVendor === 'okeconnect') {

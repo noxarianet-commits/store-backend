@@ -15,13 +15,12 @@ const rawBodyMiddleware = express.json({
 
 /**
  * POST /api/webhooks/payment-gateway
- * Callback dari FinCloud ketika pembayaran QRIS user berhasil.
- * FinCloud mengirim data via application/x-www-form-urlencoded.
- *
- * Verifikasi: MD5(apikey + reff_id + status)
+ * Callback dari FinCloud ketika pembayaran QRIS user berhasil (payment.success).
+ * Mendukung payload JSON dan urlencoded.
  */
 router.post(
     '/payment-gateway',
+    rawBodyMiddleware,
     express.urlencoded({ extended: true }),
     webhookController.handlePaymentGatewayWebhook
 );

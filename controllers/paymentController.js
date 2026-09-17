@@ -131,15 +131,44 @@ async function createPayment(req, res) {
         // 3. Query produk & variant secara unified
         let dbProduct = null;
         if (product_id) {
-            // Bisa integer ID atau external_id / SKU
-            let query = supabase.from('products').select('*, product_variants(*)');
+            // Cek terlebih dahulu dengan primary key id jika berupa angka
             if (!isNaN(product_id)) {
-                query = query.or(`id.eq.${product_id},external_id.eq.${product_id}`);
-            } else {
-                query = query.eq('external_id', String(product_id));
+                const { data } = await supabase
+                    .from('products')
+                    .select('*, product_variants(*)')
+                    .eq('id', parseInt(product_id, 10))
+                    .maybeSingle();
+                dbProduct = data;
             }
-            const { data } = await query.maybeSingle();
-            dbProduct = data;
+
+            // Jika belum ditemukan, coba cari berdasarkan external_id
+            if (!dbProduct) {
+                const { data } = await supabase
+                    .from('products')
+                    .select('*, product_variants(*)')
+                    .eq('external_id', String(product_id))
+                    .maybeSingle();
+                dbProduct = data;
+            }
+        }
+
+        // Fallback: cari produk via targetVariantId di tabel product_variants
+        if (!dbProduct && targetVariantId) {
+            let vQuery = supabase.from('product_variants').select('product_id');
+            if (!isNaN(targetVariantId)) {
+                vQuery = vQuery.or(`id.eq.${targetVariantId},vendor_variant_id.eq.${targetVariantId}`);
+            } else {
+                vQuery = vQuery.eq('vendor_variant_id', String(targetVariantId));
+            }
+            const { data: vList } = await vQuery.limit(1);
+            if (vList && vList.length > 0) {
+                const { data } = await supabase
+                    .from('products')
+                    .select('*, product_variants(*)')
+                    .eq('id', vList[0].product_id)
+                    .maybeSingle();
+                dbProduct = data;
+            }
         }
 
         if (!dbProduct && sku) {
@@ -168,11 +197,16 @@ async function createPayment(req, res) {
             matchedVariant = dbProduct.product_variants.find(v =>
                 String(v.vendor_variant_id) === targetVariantId ||
                 String(v.id) === targetVariantId ||
-                String(v.metadata?.sku) === targetVariantId
+                String(v.metadata?.sku) === targetVariantId ||
+                (sku && (String(v.metadata?.sku) === String(sku) || String(v.vendor_variant_id) === String(sku))) ||
+                (variant_name && v.name === variant_name)
             );
         } else if (Array.isArray(dbProduct.variants)) {
             matchedVariant = dbProduct.variants.find(v =>
-                String(v.id) === targetVariantId || String(v.sku) === targetVariantId
+                String(v.id) === targetVariantId ||
+                String(v.sku) === targetVariantId ||
+                String(v.vendor_variant_id) === targetVariantId ||
+                (variant_name && v.name === variant_name)
             );
         }
 
@@ -255,9 +289,7 @@ async function createPayment(req, res) {
                 }
             }
 
-            const isValidationNeeded = matchedVariant.validation?.available ||
-                                       (matchedVariant.required_fields && matchedVariant.required_fields.some(f => f.key === 'customer_id')) ||
-                                       Boolean(targetId);
+            const isValidationNeeded = Boolean(matchedVariant.validation?.available);
 
             if (isValidationNeeded) {
                 if (!targetId) {
@@ -274,9 +306,11 @@ async function createPayment(req, res) {
                 });
 
                 if (!valRes.success || valRes.valid === false) {
-                    return res.status(400).json({
-                        error: valRes.message || 'ID Akun tujuan tidak valid atau tidak ditemukan. Mohon cek kembali ID Anda.'
-                    });
+                    if (valRes.message !== 'VALIDATION_NOT_AVAILABLE') {
+                        return res.status(400).json({
+                            error: valRes.message || 'ID Akun tujuan tidak valid atau tidak ditemukan. Mohon cek kembali ID Anda.'
+                        });
+                    }
                 }
 
                 if (valRes.data?.account_name || valRes.data?.display_name) {

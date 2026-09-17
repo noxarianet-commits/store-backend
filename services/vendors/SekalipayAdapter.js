@@ -195,6 +195,25 @@ class SekalipayAdapter extends VendorAdapter {
             };
         } catch (error) {
             const err = this._handleError(error, 'validateAccount');
+            const responseMsg = error.response?.data?.message || err.message;
+
+            // Jika produk tidak mendukung validasi ID (VALIDATION_NOT_AVAILABLE),
+            // jangan gagalkan flow pembelian pelanggan.
+            if (responseMsg === 'VALIDATION_NOT_AVAILABLE' || (typeof responseMsg === 'string' && responseMsg.includes('VALIDATION_NOT_AVAILABLE'))) {
+                const customerId = params.customerId || params.customer_id || params.user_id || params.target || '';
+                return {
+                    success: true,
+                    valid: true,
+                    validation_available: false,
+                    message: 'VALIDATION_NOT_AVAILABLE',
+                    data: {
+                        account_name: customerId,
+                        display_name: customerId,
+                        ...(error.response?.data?.data || {}),
+                    },
+                };
+            }
+
             return {
                 success: false,
                 valid: false,

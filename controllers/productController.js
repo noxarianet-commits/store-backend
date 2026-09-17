@@ -201,16 +201,31 @@ async function validate(req, res) {
             }
         }
 
-        if (targetVariantId && (!resolvedVendor || resolvedVendor === 'sekalipay')) {
+        let variantValidation = null;
+        if (targetVariantId) {
             const { data: vRow } = await supabase
                 .from('product_variants')
-                .select('product_id, products(id, name, brand, category, vendor)')
-                .eq('vendor_variant_id', targetVariantId)
+                .select('id, vendor_variant_id, validation, products(id, name, brand, category, vendor)')
+                .or(`id.eq.${targetVariantId},vendor_variant_id.eq.${targetVariantId}`)
                 .maybeSingle();
-            if (vRow?.products) {
-                dbProduct = vRow.products;
-                resolvedVendor = vRow.products.vendor;
+            if (vRow) {
+                variantValidation = vRow.validation;
+                if (vRow.products) {
+                    dbProduct = vRow.products;
+                    if (!resolvedVendor) resolvedVendor = vRow.products.vendor;
+                }
             }
+        }
+
+        // Jika produk / varian tidak memerlukan validasi akun (validation.available === false)
+        if (variantValidation && variantValidation.available === false) {
+            return res.json({
+                valid: true,
+                validation_available: false,
+                account_name: customer_id,
+                display_name: customer_id,
+                message: 'Produk ini tidak memerlukan validasi ID',
+            });
         }
 
         if (!resolvedVendor) resolvedVendor = 'sekalipay';
@@ -248,6 +263,17 @@ async function validate(req, res) {
             brand: brand || dbProduct?.brand,
             category: category || dbProduct?.category,
         });
+
+        if (result.validation_available === false) {
+            return res.json({
+                valid: true,
+                validation_available: false,
+                account_name: targetCustomerId,
+                display_name: targetCustomerId,
+                message: 'Produk ini tidak memerlukan validasi ID',
+                data: result.data,
+            });
+        }
 
         if (!result.success || result.valid === false) {
             const statusCode = result.status >= 500 ? 400 : (result.status || 400);

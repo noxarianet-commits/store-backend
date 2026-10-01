@@ -2,6 +2,7 @@ const express = require('express');
 const router = express.Router();
 const rateLimit = require('express-rate-limit');
 const paymentController = require('../controllers/paymentController');
+const optionalUser = require('../middleware/optionalUser');
 
 // Rate limiter khusus untuk pembuatan payment (mencegah spam)
 const createPaymentLimiter = rateLimit({
@@ -12,10 +13,10 @@ const createPaymentLimiter = rateLimit({
 
 /**
  * POST /api/payments/create
- * Buat order baru + invoice QRIS di FinCloud.
- * Public, rate-limited.
+ * Buat order baru + invoice QRIS di FinCloud atau menggunakan saldo balance.
+ * Public/Optional auth, rate-limited.
  */
-router.post('/create', createPaymentLimiter, paymentController.createPayment);
+router.post('/create', createPaymentLimiter, optionalUser, paymentController.createPayment);
 
 // Rate limiter khusus untuk polling status order (longgar untuk live polling frontend)
 const statusPollingLimiter = rateLimit({
@@ -29,15 +30,16 @@ const statusPollingLimiter = rateLimit({
 /**
  * GET /api/payments/status/:orderId
  * Cek status order (polling dari frontend).
- * Public, rate-limited khusus polling.
+ * Akses wajib dibuktikan: req.user.id pemilik order ATAU header X-Order-Token
+ * yang diberikan ke pembeli saat order dibuat.
  */
-router.get('/status/:orderId', statusPollingLimiter, paymentController.getPaymentStatus);
+router.get('/status/:orderId', statusPollingLimiter, optionalUser, paymentController.getPaymentStatus);
 
 /**
  * POST /api/payments/cancel
  * Batalkan invoice FinCloud (status → expired/cancelled).
- * Public, rate-limited.
+ * Akses wajib dibuktikan dengan cara yang sama seperti /status/:orderId.
  */
-router.post('/cancel', createPaymentLimiter, paymentController.cancelPayment);
+router.post('/cancel', createPaymentLimiter, optionalUser, paymentController.cancelPayment);
 
 module.exports = router;

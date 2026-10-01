@@ -25,6 +25,51 @@ class PaymentGatewayService {
             process.env.FINCLOUD_PPOB_WEBHOOK_SECRET ||
             ''
         ).trim();
+        this.userAgent = (process.env.FINCLOUD_USER_AGENT || 'fincloud-api-client/1.0').trim();
+    }
+
+    /**
+     * Header standar FinCloud API.
+     * Menggunakan User-Agent, Accept, dan Authorization Bearer token untuk
+     * menghindari Cloudflare challenge / WAF blocking pada server / VPS.
+     */
+    _getHeaders() {
+        const headers = {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+            'User-Agent': this.userAgent,
+        };
+        if (this.apiKey) {
+            headers['Authorization'] = `Bearer ${this.apiKey}`;
+        }
+        return headers;
+    }
+
+    /**
+     * Centralized POST request handler ke FinCloud API.
+     * Menangani JSON parsing secara aman jika respons berupa text/HTML (e.g. status 502/Cloudflare).
+     */
+    async _post(endpoint, payload) {
+        const url = `${this.baseURL}${endpoint}`;
+        const res = await fetch(url, {
+            method: 'POST',
+            headers: this._getHeaders(),
+            body: JSON.stringify(payload),
+            signal: AbortSignal.timeout(30000),
+        });
+
+        const rawText = await res.text();
+        let json;
+        try {
+            json = JSON.parse(rawText);
+        } catch {
+            json = {
+                status: false,
+                msg: rawText && rawText.length <= 200 ? rawText : `HTTP ${res.status} response error`,
+            };
+        }
+
+        return { res, json };
     }
 
     // ══════════════════════════════════════════════════════════════
@@ -172,14 +217,7 @@ class PaymentGatewayService {
                 signature,
             };
 
-            const res = await fetch(`${this.baseURL}/create_invoice`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payload),
-                signal: AbortSignal.timeout(30000),
-            });
-
-            const json = await res.json();
+            const { res, json } = await this._post('/create_invoice', payload);
 
             if (!res.ok || !json.status) {
                 console.error('[PaymentGatewayService] createInvoice failed:', json);
@@ -238,14 +276,7 @@ class PaymentGatewayService {
                 reff_id: externalId,
             };
 
-            const res = await fetch(`${this.baseURL}/cek_status`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payload),
-                signal: AbortSignal.timeout(30000),
-            });
-
-            const json = await res.json();
+            const { res, json } = await this._post('/cek_status', payload);
 
             if (!res.ok) {
                 console.error('[PaymentGatewayService] checkInvoiceStatus HTTP error:', json);
@@ -288,14 +319,7 @@ class PaymentGatewayService {
                 reff_id: externalId,
             };
 
-            const res = await fetch(`${this.baseURL}/cancel_invoice`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payload),
-                signal: AbortSignal.timeout(30000),
-            });
-
-            const json = await res.json();
+            const { res, json } = await this._post('/cancel_invoice', payload);
 
             if (!res.ok || !json.status) {
                 console.error('[PaymentGatewayService] cancelInvoice failed:', json);
@@ -332,18 +356,11 @@ class PaymentGatewayService {
             const timestamp = Math.floor(Date.now() / 1000).toString();
             const signature = this.generateMD5Signature(timestamp, this.apiKey);
 
-            const res = await fetch(`${this.baseURL}/profile`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    apikey: this.apiKey,
-                    timestamp,
-                    signature,
-                }),
-                signal: AbortSignal.timeout(30000),
+            const { res, json } = await this._post('/profile', {
+                apikey: this.apiKey,
+                timestamp,
+                signature,
             });
-
-            const json = await res.json();
 
             if (!res.ok || !json.status) {
                 console.error('[PaymentGatewayService] checkBalance failed:', json);

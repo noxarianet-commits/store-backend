@@ -53,6 +53,82 @@ class PaymentPollingService {
         }
     }
 
+    async pollPendingTopups() {
+        try {
+            console.log('[Polling/PG] Memulai pengecekan status pending topups...');
+            
+            const yesterday = new Date();
+            yesterday.setHours(yesterday.getHours() - 24);
+
+            const { data: topups, error } = await supabase
+                .from('balance_transactions')
+                .select('*')
+                .eq('status', 'pending')
+                .not('pg_invoice', 'is', null)
+                .gte('created_at', yesterday.toISOString());
+
+            if (error) {
+                console.error('[Polling/PG] Gagal mengambil pending topups:', error.message);
+                return;
+            }
+
+            if (!topups || topups.length === 0) {
+                return;
+            }
+            
+            const balanceService = require('./balanceService');
+
+            for (const tx of topups) {
+                let isPaid = false;
+                let isExpired = false;
+                const now = new Date();
+                const createdAt = new Date(tx.created_at);
+                const isTimeout = (now - createdAt >= 30 * 60 * 1000) || (tx.pg_expired_at && now >= new Date(tx.pg_expired_at));
+
+                try {
+                    if (tx.pg_provider === 'dyqris') {
+                        const statusRes = await dyqrisGatewayService.getTransactionDetails(tx.pg_invoice || tx.reference_id);
+                        const s = statusRes.success && statusRes.data ? (statusRes.data.status || '').toUpperCase() : '';
+                        if (s === 'PAID') isPaid = true;
+                        else if (s === 'EXPIRED' || s === 'CANCELLED') isExpired = true;
+                    } else if (tx.pg_provider === 'sekalipay') {
+                        const statusRes = await sekalipayGatewayService.checkPaymentStatus(tx.reference_id || tx.pg_invoice);
+                        const s = statusRes.success && statusRes.data ? (statusRes.data.status || '').toUpperCase() : '';
+                        if (s === 'PAID' || s === 'SUCCESS' || s === 'COMPLETED') isPaid = true;
+                        else if (s === 'EXPIRED' || s === 'CANCELLED' || s === 'FAILED') isExpired = true;
+                    } else {
+                        // fincloud
+                        const statusRes = await paymentGatewayService.checkInvoiceStatus(tx.pg_invoice || tx.reference_id);
+                        const s = statusRes.success && statusRes.data ? (statusRes.data.status || '').toUpperCase() : '';
+                        if (s === 'PAID' || s === 'SUCCESS') isPaid = true;
+                        else if (s === 'EXPIRED' || s === 'CANCELLED') isExpired = true;
+                    }
+                } catch (pgError) {
+                    console.error(`Error polling status for topup ${tx.reference_id}:`, pgError.message);
+                }
+
+                if (isPaid) {
+                    try {
+                        const creditRes = await balanceService.creditTopup(tx);
+                        if (creditRes?.alreadyProcessed) {
+                            // Sering terjadi: webhook sudah lebih duluan. Ini normal,
+                            // creditTopup yang idempoten jadi tidak ada kredit ganda.
+                            console.log(`[Polling/PG] Topup ${tx.reference_id} sudah dikreditkan sebelumnya, dilewati.`);
+                        } else {
+                            console.log(`[Polling/PG] Topup ${tx.reference_id} berhasil dikreditkan via polling.`);
+                        }
+                    } catch (creditErr) {
+                        console.error('Error crediting balance for topup:', creditErr);
+                    }
+                } else if (isExpired || isTimeout) {
+                    await supabase.from('balance_transactions').update({ status: 'cancelled' }).eq('id', tx.id);
+                }
+            }
+        } catch (err) {
+            console.error('[Polling/PG] Error dalam proses polling topups:', err);
+        }
+    }
+
     async processOrder(order) {
         const pgProvider = order.pg_provider || 'fincloud';
         
@@ -262,6 +338,34 @@ class PaymentPollingService {
             }
         } catch (err) {
             console.error('[Polling/PG] Error dalam membatalkan order kedaluwarsa:', err);
+        }
+    }
+
+    async cancelExpiredTopups() {
+        try {
+            // Waktu 30 menit yang lalu
+            const expiredTime = new Date();
+            expiredTime.setMinutes(expiredTime.getMinutes() - 30);
+            const now = new Date();
+
+            const { data: topups, error } = await supabase
+                .from('balance_transactions')
+                .update({ status: 'cancelled' })
+                .eq('type', 'topup')
+                .eq('status', 'pending')
+                .or(`created_at.lt.${expiredTime.toISOString()},pg_expired_at.lt.${now.toISOString()}`)
+                .select('id, reference_id');
+
+            if (error) {
+                console.error('[Polling/PG] Gagal update status topup expired:', error.message);
+                return;
+            }
+
+            if (topups && topups.length > 0) {
+                console.log(`[Polling/PG] Berhasil membatalkan ${topups.length} transaksi top-up kedaluwarsa (> 30 menit).`);
+            }
+        } catch (err) {
+            console.error('[Polling/PG] Error dalam membatalkan top-up kedaluwarsa:', err);
         }
     }
 

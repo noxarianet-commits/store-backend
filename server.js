@@ -27,8 +27,11 @@ const testimonialRoutes = require('./routes/testimonialRoutes');
 const paymentRoutes = require('./routes/paymentRoutes');
 const webhookRoutes = require('./routes/webhookRoutes');
 const homeRoutes = require('./routes/homeRoutes');
+const authRoutes = require('./routes/authRoutes');
+const balanceRoutes = require('./routes/balanceRoutes');
 
 const verifyAdmin = require('./middleware/verifyAdmin');
+const verifyUser = require('./middleware/verifyUser');
 
 // ══════════════════════════════════════════════════════════════════════════
 // APP SETUP
@@ -83,6 +86,8 @@ app.use('/api/services', serviceRoutes);
 app.use('/api/settings', settingsRoutes);
 app.use('/api/testimonials', testimonialRoutes);
 app.use('/api/payments', paymentRoutes);
+app.use('/api/auth', authRoutes);
+app.use('/api/balance', verifyUser, balanceRoutes);
 
 // ══════════════════════════════════════════════════════════════════════════
 // ROUTES — Protected (Admin)
@@ -138,7 +143,9 @@ const paymentPollingService = require('./services/paymentPollingService');
 cron.schedule('* * * * *', async () => {
     // Run every minute
     await paymentPollingService.pollPendingOrders();
+    await paymentPollingService.pollPendingTopups();
     await paymentPollingService.cancelExpiredOrders();
+    await paymentPollingService.cancelExpiredTopups();
     await paymentPollingService.pollProcessingOrders();
 });
 

@@ -68,6 +68,35 @@ async function handlePaymentGatewayWebhook(req, res) {
         return res.status(400).json({ error: 'reff_id missing' });
     }
 
+    // --- TOPUP FLOW ---
+    if (reffId.startsWith('TOPUP-')) {
+        const balanceService = require('../services/balanceService');
+        const { data: tx, error: fetchTxErr } = await supabase
+            .from('balance_transactions')
+            .select('*')
+            .or(`reference_id.eq.${reffId},pg_invoice.eq.${reffId}`)
+            .maybeSingle();
+
+        if (fetchTxErr || !tx) {
+            console.error(`[Webhook/PG-FinCloud] Topup ${reffId} tidak ditemukan.`);
+            return res.status(404).json({ error: 'Topup not found' });
+        }
+
+        if (tx.status !== 'pending') {
+            return res.status(200).json({ message: 'Topup already processed' });
+        }
+
+        try {
+            await balanceService.creditTopup(tx);
+            console.log(`[Webhook/PG-FinCloud] Topup ${reffId} berhasil dikreditkan.`);
+            return res.status(200).json({ status: true, message: 'Topup success' });
+        } catch (err) {
+            console.error(`[Webhook/PG-FinCloud] Gagal kredit saldo untuk ${reffId}:`, err.message);
+            return res.status(500).json({ error: 'Failed to credit balance' });
+        }
+    }
+    // ------------------
+
     // 2. Ambil order dari Supabase (reff_id = orderId atau pg_invoice)
     const { data: order, error: fetchError } = await supabase
         .from('orders')
@@ -216,6 +245,15 @@ async function handleSekalipayWebhook(req, res) {
             })
             .eq('id', order.id);
 
+        if (order.payment_type === 'balance' && order.user_id) {
+            const balanceService = require('../services/balanceService');
+            try {
+                await balanceService.refundBalance(order.user_id, order.price, order.id, `Refund otomatis: ${errorMsg}`);
+            } catch (err) {
+                console.error(`[Webhook/Sekalipay] Auto-refund gagal untuk ${order.id}:`, err.message);
+            }
+        }
+
         console.log(`[Webhook/Sekalipay] Order ${order.id} ${event}.`);
         emailService.sendOrderFailedEmail(order)
             .catch(err => console.error(`[Webhook/Sekalipay] Email failed gagal:`, err.message));
@@ -258,6 +296,49 @@ async function handleSekalipayGatewayWebhook(req, res) {
         if (!merchantRefId && !invoice) {
             return res.status(400).json({ error: 'merchant_ref_id or invoice missing' });
         }
+
+        // --- TOPUP FLOW ---
+        const refForTopup = merchantRefId || invoice || '';
+        if (refForTopup.startsWith('TOPUP-') || (invoice && invoice.startsWith('TOPUP-'))) {
+             const balanceService = require('../services/balanceService');
+             let tQuery = supabase.from('balance_transactions').select('*');
+             if (merchantRefId && invoice) tQuery = tQuery.or(`reference_id.eq.${merchantRefId},pg_invoice.eq.${invoice}`);
+             else if (merchantRefId) tQuery = tQuery.eq('reference_id', merchantRefId);
+             else tQuery = tQuery.eq('pg_invoice', invoice);
+             
+             const { data: tx, error: fetchTxErr } = await tQuery.maybeSingle();
+
+             if (fetchTxErr || !tx) {
+                 console.error(`[Webhook/SekalipayGateway] Topup ${merchantRefId} tidak ditemukan.`);
+                 return res.status(200).json({ received: true });
+             }
+
+             if (tx.status !== 'pending') {
+                 return res.status(200).json({ received: true, message: 'Topup already processed' });
+             }
+
+             const isPaidTx = status === 'paid' || status === 'success' || status === 'completed' || event === 'payment.paid' || event === 'invoice.paid';
+             
+             if (isPaidTx) {
+                 try {
+                     // creditTopup (bukan creditBalance) — atomik & idempoten.
+                     // creditBalance akan meng-INSERT baris ledger kedua untuk
+                     // top-up yang sama dan tidak punya proteksi double-credit.
+                     const creditRes = await balanceService.creditTopup(tx);
+                     if (creditRes?.alreadyProcessed) {
+                         console.log(`[Webhook/SekalipayGateway] Topup ${tx.reference_id} sudah pernah dikreditkan, diabaikan.`);
+                     } else {
+                         console.log(`[Webhook/SekalipayGateway] Topup ${tx.reference_id} berhasil dikreditkan.`);
+                     }
+                 } catch (err) {
+                     console.error(`[Webhook/SekalipayGateway] Gagal kredit saldo untuk ${tx.reference_id}:`, err.message);
+                 }
+             } else if (status === 'expired' || status === 'cancelled' || status === 'failed') {
+                 await supabase.from('balance_transactions').update({ status: 'cancelled' }).eq('id', tx.id);
+             }
+             return res.status(200).json({ received: true, status: 'OK' });
+        }
+        // ------------------
 
         // Cari order di Supabase
         let query = supabase.from('orders').select('*');
@@ -335,6 +416,45 @@ async function handleDyqrisWebhook(req, res) {
         if (!id && !ref_id) {
             return res.status(400).json({ error: 'Payload transaction ID missing' });
         }
+
+        // --- TOPUP FLOW ---
+        const refForTopup = ref_id || id || '';
+        if (refForTopup.startsWith('TOPUP-') || (id && id.startsWith('TOPUP-'))) {
+            const balanceService = require('../services/balanceService');
+            let tQuery = supabase.from('balance_transactions').select('*');
+            if (id && ref_id) tQuery = tQuery.or(`pg_invoice.eq.${id},reference_id.eq.${ref_id}`);
+            else if (id) tQuery = tQuery.or(`pg_invoice.eq.${id},reference_id.eq.${id}`);
+            else tQuery = tQuery.eq('reference_id', ref_id);
+
+            const { data: tx, error: fetchTxErr } = await tQuery.maybeSingle();
+
+            if (fetchTxErr || !tx) {
+                console.error(`[Webhook/Dyqris] Topup id=${id} ref_id=${ref_id} tidak ditemukan.`);
+                return res.status(200).json({ received: true });
+            }
+
+            if (tx.status !== 'pending') {
+                return res.status(200).json({ received: true });
+            }
+
+            if (event === 'transaction.paid' || status === 'paid') {
+                try {
+                    // creditTopup (bukan creditBalance) — atomik & idempoten.
+                    const creditRes = await balanceService.creditTopup(tx);
+                    if (creditRes?.alreadyProcessed) {
+                        console.log(`[Webhook/Dyqris] Topup ${tx.reference_id} sudah pernah dikreditkan, diabaikan.`);
+                    } else {
+                        console.log(`[Webhook/Dyqris] Topup ${tx.reference_id} berhasil dikreditkan.`);
+                    }
+                } catch (err) {
+                    console.error(`[Webhook/Dyqris] Gagal kredit saldo untuk ${tx.reference_id}:`, err.message);
+                }
+            } else if (status === 'expired' || status === 'cancelled') {
+                 await supabase.from('balance_transactions').update({ status: 'cancelled' }).eq('id', tx.id);
+            }
+            return res.status(200).json({ received: true });
+        }
+        // ------------------
 
         let query = supabase.from('orders').select('*');
         if (id && ref_id) {
@@ -477,6 +597,15 @@ async function handleOkeconnectWebhook(req, res) {
                     vendor_status: 'failed',
                 })
                 .eq('id', order.id);
+                
+            if (order.payment_type === 'balance' && order.user_id) {
+                const balanceService = require('../services/balanceService');
+                try {
+                    await balanceService.refundBalance(order.user_id, order.price, order.id, `Refund otomatis: Transaksi gagal di OkeConnect`);
+                } catch (err) {
+                    console.error(`[Webhook/Okeconnect] Auto-refund gagal untuk ${order.id}:`, err.message);
+                }
+            }
 
             console.log(`[Webhook/OkeConnect] Order ${order.id} FAILED.`);
             emailService.sendOrderFailedEmail(order)

@@ -19,6 +19,14 @@ const verifyAdmin = (req, res, next) => {
         const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : authHeader;
 
         const decoded = jwt.verify(token, JWT_SECRET);
+
+        // Wajib: token admin dan token user memakai JWT_SECRET yang sama.
+        // Tanpa cek claim ini, token user biasa (= hasil daftar publik) diterima
+        // sebagai admin di seluruh route protected. Bandingkan verifyUser.js.
+        if (decoded.type !== 'admin') {
+            return res.status(403).json({ error: 'Token bukan token admin.' });
+        }
+
         req.admin = { id: decoded.id, username: decoded.username };
         next();
     } catch (err) {

@@ -119,6 +119,7 @@ class SekalipayGatewayService {
         customer_phone,
         callback_url,
         return_url,
+        access_token,
         metadata
     }) {
         const config = await this.getConfig();
@@ -151,7 +152,7 @@ class SekalipayGatewayService {
             customer_email: customer_email || 'customer@noxarianet.web.id',
             customer_phone: customer_phone || '08123456789',
             callback_url: callback_url || `${backendUrl}/api/webhooks/sekalipay-gateway`,
-            return_url: return_url || `${frontendUrl}/checkout/success?order_id=${merchant_ref_id}`,
+            return_url: return_url || `${frontendUrl}/checkout/success?order_id=${merchant_ref_id}${access_token ? `&access_token=${encodeURIComponent(access_token)}` : ''}`,
             metadata: metadata || {
                 source: 'website',
                 order_id: merchant_ref_id
@@ -200,18 +201,72 @@ class SekalipayGatewayService {
     }
 
     /**
+     * Helper untuk mencari merchant_ref_id asli jika input berupa nomor invoice Sekalipay (SPY... / INV/...).
+     * Sekalipay Gateway API GET /payment/:merchant_ref_id membutuhkan merchant_ref_id kita, bukan nomor invoice Sekalipay.
+     * @param {string} identifier 
+     * @returns {Promise<string>}
+     */
+    async resolveMerchantRefId(identifier) {
+        if (!identifier || typeof identifier !== 'string') return identifier;
+        const trimmed = identifier.trim();
+
+        try {
+            // 1. Cek di balance_transactions (topup saldo)
+            const { data: tx } = await supabase
+                .from('balance_transactions')
+                .select('reference_id')
+                .eq('pg_invoice', trimmed)
+                .maybeSingle();
+
+            if (tx && tx.reference_id) {
+                return tx.reference_id;
+            }
+
+            // 2. Cek di orders
+            const { data: order } = await supabase
+                .from('orders')
+                .select('id')
+                .eq('pg_invoice', trimmed)
+                .maybeSingle();
+
+            if (order && order.id) {
+                return order.id;
+            }
+        } catch (dbErr) {
+            console.warn('[SekalipayGatewayService] resolveMerchantRefId DB lookup warning:', dbErr.message);
+        }
+
+        return trimmed;
+    }
+
+    /**
      * GET /payment/:merchant_ref_id
      * Cek status pembayaran transaksi via merchant_ref_id.
+     * Menerima merchant_ref_id atau invoice number (SPY... / INV/...) dengan resolusi otomatis.
      */
     async checkPaymentStatus(merchantRefId) {
+        if (!merchantRefId) {
+            return { success: false, message: 'merchantRefId tidak boleh kosong' };
+        }
+
         const { baseURL, apiKey } = await this.getConfig();
 
         if (!apiKey) {
             return { success: false, message: 'API Key Sekalipay Gateway belum dikonfigurasi' };
         }
 
+        // Jika identifier memiliki format invoice Sekalipay (diawali SPY atau INV), resolve ke merchant_ref_id asli terlebih dahulu
+        let targetRefId = String(merchantRefId).trim();
+        if (/^(SPY|INV[\/_])/i.test(targetRefId)) {
+            const resolved = await this.resolveMerchantRefId(targetRefId);
+            if (resolved && resolved !== targetRefId) {
+                console.log(`[SekalipayGatewayService] Resolving invoice ${targetRefId} -> merchant_ref_id: ${resolved}`);
+                targetRefId = resolved;
+            }
+        }
+
         try {
-            const response = await axios.get(`${baseURL}/payment/${encodeURIComponent(merchantRefId)}`, {
+            const response = await axios.get(`${baseURL}/payment/${encodeURIComponent(targetRefId)}`, {
                 headers: {
                     'X-API-Key': apiKey
                 },
@@ -230,8 +285,36 @@ class SekalipayGatewayService {
                 message: response.data?.message || 'Transaksi tidak ditemukan di Sekalipay Gateway'
             };
         } catch (err) {
-            console.error(`[SekalipayGatewayService] checkPaymentStatus(${merchantRefId}) error:`, err.response?.data || err.message);
-            return { success: false, message: err.message };
+            const errData = err.response?.data;
+
+            // Fallback: Jika gagal dengan PAYMENT_NOT_FOUND atau 404, coba cari di DB jika belum di-resolve
+            if (targetRefId === merchantRefId && (errData?.message === 'PAYMENT_NOT_FOUND' || err.response?.status === 404)) {
+                const resolved = await this.resolveMerchantRefId(merchantRefId);
+                if (resolved && resolved !== merchantRefId) {
+                    console.log(`[SekalipayGatewayService] Fallback resolving invoice ${merchantRefId} -> merchant_ref_id: ${resolved}`);
+                    try {
+                        const retryResponse = await axios.get(`${baseURL}/payment/${encodeURIComponent(resolved)}`, {
+                            headers: {
+                                'X-API-Key': apiKey
+                            },
+                            timeout: 10000
+                        });
+
+                        if (retryResponse.data && (retryResponse.data.status === true || retryResponse.data.status === 1 || retryResponse.status === 200)) {
+                            return {
+                                success: true,
+                                data: retryResponse.data.data
+                            };
+                        }
+                    } catch (retryErr) {
+                        console.error(`[SekalipayGatewayService] Retry checkPaymentStatus(${resolved}) error:`, retryErr.response?.data || retryErr.message);
+                    }
+                }
+            }
+
+            const errorMsg = errData?.message || errData?.error || err.message;
+            console.error(`[SekalipayGatewayService] checkPaymentStatus(${merchantRefId}) error:`, errData || err.message);
+            return { success: false, message: errorMsg };
         }
     }
 

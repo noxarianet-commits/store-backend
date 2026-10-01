@@ -1,10 +1,13 @@
 const supabase = require('../supabase');
+const crypto = require('crypto');
 const paymentGatewayService = require('../services/paymentGatewayService');
 const sekalipayGatewayService = require('../services/sekalipayGatewayService');
 const dyqrisGatewayService = require('../services/dyqrisGatewayService');
 const paymentPollingService = require('../services/paymentPollingService');
 const vendorRegistry = require('../services/vendors/vendorRegistry');
 const cacheService = require('../services/cacheService');
+const balanceService = require('../services/balanceService');
+const orderFulfillmentService = require('../services/orderFulfillmentService');
 const { normalizePhoneNumber, normalizeNotePhoneNumber } = require('../utils/phoneUtils');
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -15,6 +18,44 @@ function generateOrderId() {
     const ts = Date.now().toString(36).toUpperCase();
     const rand = Math.random().toString(36).substr(2, 5).toUpperCase();
     return `NX-${ts}-${rand}`;
+}
+
+/**
+ * Token akses order. Order ID bisa ditebak, jadi ID bukan bukti kepemilikan.
+ * Token ini yang membuktikan request benar-benar berasal dari pembeli.
+ */
+function generateOrderAccessToken() {
+    return crypto.randomBytes(32).toString('hex');
+}
+
+/**
+ * Perbandingan string yang aman terhadap timing attack.
+ * Returns true hanya bila keduanya identik.
+ */
+function safeEqual(a, b) {
+    if (typeof a !== 'string' || typeof b !== 'string' || a.length !== b.length) return false;
+    try {
+        return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
+    } catch (err) {
+        return false;
+    }
+}
+
+/**
+ * Caller (pembeli) sah untuk order ini bila salah satu terpenuhi:
+ *   - req.user.id cocok dengan order.user_id, atau
+ *   - header X-Order-Token cocok dengan order.order_access_token
+ *
+ * Mengembalikan null bila tidak sah. Penolakan sengaja disamarkan jadi 404
+ * supaya penyerang tidak bisa membedakan "order tidak ada" dari "bukan milikmu".
+ */
+function authorizeOrderAccess(req, order) {
+    if (req.user && order.user_id && req.user.id === order.user_id) return order;
+
+    const provided = req.headers['x-order-token'];
+    if (order.order_access_token && safeEqual(provided, order.order_access_token)) return order;
+
+    return null;
 }
 
 /**
@@ -112,6 +153,7 @@ async function createPayment(req, res) {
             user_id,
             zone_id,
             provider_qty,
+            payment_type = 'gateway',
         } = req.body;
 
         // 2. Validasi input umum
@@ -348,6 +390,96 @@ async function createPayment(req, res) {
 
         // 7. Generate order ID & unique code
         const orderId = generateOrderId();
+        const orderAccessToken = generateOrderAccessToken();
+        
+        const variantIdForOrder = matchedVariant.vendor_variant_id || targetVariantId;
+        
+        // --- BALANCE PAYMENT FLOW ---
+        if (payment_type === 'balance') {
+            if (!req.user || !req.user.id) {
+                return res.status(401).json({ error: 'Harap login untuk menggunakan saldo' });
+            }
+            
+            try {
+                await balanceService.debitBalance(req.user.id, amount, orderId, `Pembelian ${product_name || dbProduct.name}`);
+            } catch (balErr) {
+                return res.status(400).json({ error: balErr.message || 'Saldo tidak mencukupi atau terjadi kesalahan' });
+            }
+            
+            // Simpan order
+            const { error: dbError } = await supabase.from('orders').insert([
+                {
+                    id: orderId,
+                    product: product_name || dbProduct.name,
+                    variant: variant_name || matchedVariant.name || '-',
+                    price: amount,
+                    wa_number,
+                    email,
+                    customer_name: resolvedCustomerName,
+                    payment_method: 'BALANCE',
+                    payment_type: 'balance',
+                    user_id: req.user.id,
+                    order_access_token: orderAccessToken,
+                    status: 'PENDING',
+                    pg_provider: 'balance',
+                    vendor: actualVendor,
+                    vendor_variant_id: variantIdForOrder,
+                    vendor_status: 'none',
+                    pg_paid_at: new Date().toISOString(),
+                    account_details: (() => {
+                        const rawZoneId = zone_id || (req.body.fieldData && req.body.fieldData.zone_id);
+                        const rawUserId = customer_id || user_id || (req.body.fieldData && req.body.fieldData.customer_id);
+                        let finalZoneId = rawZoneId ? String(rawZoneId).trim() : null;
+                        let finalUserId = rawUserId ? String(rawUserId).trim() : null;
+                        if (!finalZoneId && note && typeof note === 'string') {
+                            const match = note.match(/^([^\(\)]+)\(([^\(\)]+)\)$/);
+                            if (match) {
+                                finalUserId = finalUserId || match[1].trim();
+                                finalZoneId = match[2].trim();
+                            }
+                        }
+                        return {
+                            vendor: actualVendor,
+                            note: note ? normalizeNotePhoneNumber(note) : null,
+                            target: note ? normalizeNotePhoneNumber(note) : null,
+                            customer_id: finalUserId,
+                            user_id: finalUserId,
+                            zone_id: finalZoneId,
+                            provider_qty: provider_qty ? parseInt(provider_qty) : undefined,
+                        };
+                    })(),
+                    timestamp: new Date().toISOString(),
+                }
+            ]);
+            
+            if (dbError) {
+                console.error('[paymentController] DB insert error:', dbError);
+                // Refund balance
+                await balanceService.refundBalance(req.user.id, amount, orderId, 'Refund otomatis karena gagal simpan order');
+                return res.status(500).json({ error: `Gagal menyimpan order: ${dbError.message}` });
+            }
+            
+            // Ambil data terbaru untuk fulfillment
+            const { data: latestOrder } = await supabase.from('orders').select('*').eq('id', orderId).single();
+            
+            // Jalankan fulfillment di background tanpa await
+            orderFulfillmentService.fulfillOrder(latestOrder).catch(err => {
+                console.error(`[paymentController] Fulfillment error for balance order ${orderId}:`, err);
+            });
+            
+            return res.status(201).json({
+                success: true,
+                data: {
+                    order_id: orderId,
+                    access_token: orderAccessToken,
+                    amount,
+                    status: 'PROCESSING',
+                    pg_provider: 'balance'
+                }
+            });
+        }
+        
+        // --- GATEWAY PAYMENT FLOW ---
         const uniqueCode = await generateUniqueCode();
         const totalWithUniqueCode = amount + uniqueCode;
 
@@ -385,6 +517,7 @@ async function createPayment(req, res) {
                 customer_name: resolvedCustomerName,
                 customer_email: (email || 'customer@noxarianet.web.id').trim(),
                 customer_phone: wa_number || '08123456789',
+                access_token: orderAccessToken,
                 metadata: {
                     source: 'website',
                     order_id: orderId,
@@ -433,7 +566,6 @@ async function createPayment(req, res) {
         }
 
         // 9. Simpan order ke Supabase
-        const variantIdForOrder = matchedVariant.vendor_variant_id || targetVariantId;
         const { error: dbError } = await supabase.from('orders').insert([
             {
                 id: orderId,
@@ -444,6 +576,9 @@ async function createPayment(req, res) {
                 email,
                 customer_name: resolvedCustomerName,
                 payment_method: 'QRIS',
+                payment_type: 'gateway',
+                user_id: req.user ? req.user.id : null,
+                order_access_token: orderAccessToken,
                 status: 'PENDING',
 
                 // PG fields
@@ -507,6 +642,7 @@ async function createPayment(req, res) {
             success: true,
             data: {
                 order_id: orderId,
+                access_token: orderAccessToken,
                 invoice: pgInvoice,
                 amount,
                 unique_code: uniqueCode,
@@ -557,6 +693,12 @@ async function getPaymentStatus(req, res) {
             return res.status(404).json({ error: 'Order tidak ditemukan' });
         }
 
+        // Akses harus dibuktikan: pemilik order (req.user.id) atau X-Order-Token.
+        // Order ID bisa ditebak, jadi id saja tidak cukup.
+        if (!authorizeOrderAccess(req, data)) {
+            return res.status(404).json({ error: 'Order tidak ditemukan' });
+        }
+
         // Jika order masih PENDING, throttle pengecekan ke API vendor Payment Gateway
         // Regular poll: minimal interval 60 detik (1 menit++)
         // Manual refresh (?force=true): minimal interval 15 detik
@@ -600,11 +742,17 @@ async function cancelPayment(req, res) {
 
         const { data: order, error: fetchError } = await supabase
             .from('orders')
-            .select('id, status, pg_provider')
+            .select('id, status, pg_provider, user_id, order_access_token')
             .eq('id', order_id)
             .single();
 
         if (fetchError || !order) return res.status(404).json({ error: 'Order tidak ditemukan' });
+
+        // Cegah orang membatalkan invoice milik orang lain hanya dengan.order_id
+        if (!authorizeOrderAccess(req, order)) {
+            return res.status(404).json({ error: 'Order tidak ditemukan' });
+        }
+
         if (order.status !== 'PENDING') {
             return res.status(400).json({ error: `Order tidak bisa dibatalkan (status: ${order.status})` });
         }
@@ -621,4 +769,4 @@ async function cancelPayment(req, res) {
     }
 }
 
-module.exports = { createPayment, getPaymentStatus, cancelPayment };
+module.exports = { createPayment, getPaymentStatus, cancelPayment, getActivePaymentGateway };

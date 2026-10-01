@@ -17,4 +17,15 @@ router.post('/login', loginLimiter, adminController.login);
 // PUT /api/admin/password — protected
 router.put('/password', verifyAdmin, adminController.changePassword);
 
+// User Management Routes — protected
+router.get('/users', verifyAdmin, adminController.getUsers);
+router.patch('/users/:id/balance', verifyAdmin, adminController.adjustBalance);
+router.patch('/users/:id/limit', verifyAdmin, adminController.updateLimit);
+router.patch('/users/:id/status', verifyAdmin, adminController.toggleStatus);
+
+// Balance Transactions Routes — protected
+router.get('/balance-transactions', verifyAdmin, adminController.getBalanceTransactions);
+router.get('/balance-transactions/stats', verifyAdmin, adminController.getBalanceTransactionStats);
+
 module.exports = router;
+

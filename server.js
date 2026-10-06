@@ -164,6 +164,21 @@ cron.schedule('*/2 * * * *', async () => {
 console.log('[CRON] Unified Product Sync scheduled: Sekalipay (delta 1h, full 03:00), Okeconnect (full 04:00)');
 console.log('[CRON] Payment polling scheduled: every 1 minute');
 
+// ══════════════════════════════════════════════════════════════════════════
+// OTP CLEANUP CRON
+// ══════════════════════════════════════════════════════════════════════════
+
+// `email_otps` dan `pending_registrations` bukan tabel arsip. Baris yang sudah
+// lewat masa berlaku tidak pernah dibaca lagi, jadi dibuang setiap hari supaya
+// keduanya tidak tumbuh tanpa batas.
+const otpService = require('./services/otpService');
+
+cron.schedule('15 5 * * *', async () => {
+    await otpService.purgeExpired();
+});
+
+console.log('[CRON] OTP cleanup scheduled: daily 05:15');
+
 
 // ══════════════════════════════════════════════════════════════════════════
 // START / EXPORT

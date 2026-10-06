@@ -20,7 +20,12 @@
 
 const nodemailer = require('nodemailer');
 const supabase = require('../supabase');
-const { buildCompletedEmailHtml, buildFailedEmailHtml } = require('../templates/emailTemplates');
+const {
+    buildCompletedEmailHtml,
+    buildFailedEmailHtml,
+    buildVerificationEmailHtml,
+    buildResetPasswordEmailHtml,
+} = require('../templates/emailTemplates');
 
 /**
  * Fetch WhatsApp CS setting from Supabase with fallback
@@ -226,10 +231,45 @@ async function sendOrderFailedEmail(order) {
     });
 }
 
+/**
+ * Kirim email OTP verifikasi.
+ *
+ * Berbeda dengan email notifikasi order, PENGIRIMAN DI-AWAIT oleh pemanggil.
+ * Email OTP adalah satu-satunya jalan melewati verifikasi, jadi kegagalan
+ * pengiriman tidak boleh diam-diam diabaikan — pemanggil harus membatalkan
+ * pending data dan memberi tahu user agar tidak terkunci di layar OTP.
+ *
+ * @param {Object} options
+ * @param {string} options.to - Email penerima
+ * @param {string} options.code - Kode OTP 6 digit
+ * @param {'register'|'reset_password'} options.purpose - Menentukan template
+ * @param {string} [options.displayName] - Nama untuk sapaan
+ * @param {number} [options.expiresMinutes=10]
+ * @returns {Promise<{success: boolean, messageId?: string, provider?: string, error?: string}>}
+ */
+async function sendOtpEmail({ to, code, purpose, displayName, expiresMinutes = 10 }) {
+    const waNumber = await getWaCsNumber();
+    const isRegister = purpose === 'register';
+
+    const html = isRegister
+        ? buildVerificationEmailHtml({ code, displayName, expiresMinutes, waNumber })
+        : buildResetPasswordEmailHtml({ code, displayName, expiresMinutes, waNumber });
+
+    return sendEmail({
+        to,
+        subject: isRegister
+            ? `Verifikasi Email — Kode ${code} — Noxarianet Store`
+            : `Reset Password — Kode ${code} — Noxarianet Store`,
+        html,
+    });
+}
+
 module.exports = {
     sendEmail,
     sendOrderCompletedEmail,
     sendOrderFailedEmail,
+    sendOtpEmail,
+    getWaCsNumber,
     getResendTransporter,
     getBrevoTransporter,
 };

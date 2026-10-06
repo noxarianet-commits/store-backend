@@ -652,4 +652,175 @@ function buildFailedEmailHtml(order, waNumber = '6285199605580') {
 </html>`;
 }
 
-module.exports = { buildCompletedEmailHtml, buildFailedEmailHtml };
+// ══════════════════════════════════════════════════════════════════════════
+// OTP EMAIL TEMPLATES (registrasi & lupa password)
+// ══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Bangun kerangka HTML bersama untuk email OTP.
+ * Memakai bahasa visual yang sama dengan template order (indigo #1a237e,
+ * kartu 600px, footer WhatsApp) supaya email OTP tidak terlihat seperti mail
+ * dari situs lain.
+ *
+ * @param {Object} options
+ * @param {string} options.heading - Judul besar di header
+ * @param {string} options.subtitle - Baris kecil di header
+ * @param {string} options.introHtml - Paragraf pembuka (sudah berupa HTML)
+ * @param {string} options.code - Kode OTP 6 digit
+ * @param {number} options.expiresMinutes - Masa berlaku
+ * @param {string} options.footnoteHtml - Catatan di bawah kotak kode
+ * @param {string} [options.waNumber] - Nomor WhatsApp CS
+ * @returns {string} HTML string
+ */
+function buildOtpLayoutHtml({ heading, subtitle, introHtml, code, expiresMinutes, footnoteHtml, waNumber }) {
+    const cleanWa = String(waNumber || '6285199605580').replace(/\D/g, '') || '6285199605580';
+
+    return `
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>${escapeHtml(heading)} — Noxarianet Store</title>
+</head>
+<body style="margin:0; padding:0; background:#f4f6fb; font-family:'Segoe UI',Roboto,Arial,sans-serif;">
+    <table width="100%" cellpadding="0" cellspacing="0" style="background:#f4f6fb; padding:30px 0;">
+        <tr>
+            <td align="center">
+                <table width="600" cellpadding="0" cellspacing="0" style="background:#ffffff; border-radius:16px; overflow:hidden; box-shadow:0 4px 24px rgba(0,0,0,0.08);">
+
+                    <!-- Header -->
+                    <tr>
+                        <td style="background:linear-gradient(135deg,#1a237e 0%,#3949ab 100%); padding:32px 40px; text-align:center;">
+                            <h1 style="margin:0; color:#ffffff; font-size:24px; font-weight:700; letter-spacing:0.5px;">${escapeHtml(heading)}</h1>
+                            <p style="margin:8px 0 0; color:rgba(255,255,255,0.85); font-size:14px;">${escapeHtml(subtitle)}</p>
+                        </td>
+                    </tr>
+
+                    <!-- Body -->
+                    <tr>
+                        <td style="padding:32px 40px;">
+
+                            ${introHtml}
+
+                            <!-- Kode OTP -->
+                            <table width="100%" cellpadding="0" cellspacing="0" style="background:#f8f9fe; border-radius:10px; margin:0 0 20px;">
+                                <tr>
+                                    <td style="padding:28px 24px; text-align:center;">
+                                        <p style="margin:0 0 12px; color:#666; font-size:12px; text-transform:uppercase; letter-spacing:1px;">Kode Verifikasi Anda</p>
+                                        <p style="margin:0; font-size:38px; font-weight:700; color:#1a237e; letter-spacing:14px; font-family:'Courier New',Consolas,monospace;">${escapeHtml(code)}</p>
+                                        <p style="margin:14px 0 0; color:#888; font-size:12px;">Berlaku ${expiresMinutes} menit sejak dikirim</p>
+                                    </td>
+                                </tr>
+                            </table>
+
+                            ${footnoteHtml}
+
+                        </td>
+                    </tr>
+
+                    <!-- Footer -->
+                    <tr>
+                        <td style="background:#f5f5f7; padding:24px 40px; text-align:center; border-top:1px solid #eee;">
+                            <p style="margin:0 0 6px; color:#888; font-size:12px;">Butuh bantuan? Hubungi Admin kami</p>
+                            <p style="margin:0 0 12px; color:#1a237e; font-size:13px; font-weight:600;">wa.me/${cleanWa}</p>
+                            <p style="margin:0; color:#bbb; font-size:11px;">© ${new Date().getFullYear()} Noxarianet Store — noxarianet.web.id</p>
+                        </td>
+                    </tr>
+
+                </table>
+            </td>
+        </tr>
+    </table>
+</body>
+</html>`;
+}
+
+/**
+ * Email verifikasi email untuk registrasi akun baru.
+ * Dipanggil SETELAH OTP dibuat, jadi email ini adalah bukti kepemilikan —
+ * tanpa kode di dalamnya, akun tidak akan pernah dibuat.
+ *
+ * @param {Object} options
+ * @param {string} options.code - Kode OTP 6 digit
+ * @param {string} [options.displayName] - Nama yang diisi user di form registrasi
+ * @param {number} [options.expiresMinutes=10]
+ * @param {string} [options.waNumber] - Nomor WhatsApp CS
+ * @returns {string} HTML string
+ */
+function buildVerificationEmailHtml({ code, displayName, expiresMinutes = 10, waNumber }) {
+    const greeting = displayName
+        ? `Halo <strong>${escapeHtml(displayName)}</strong>,`
+        : 'Halo,';
+
+    return buildOtpLayoutHtml({
+        heading: 'Verifikasi Email Anda',
+        subtitle: 'Satu langkah lagi sebelum akun aktif',
+        expiresMinutes,
+        waNumber,
+        introHtml: `
+                            <p style="color:#333; font-size:15px; line-height:1.6; margin:0 0 24px;">
+                                ${greeting}<br/>
+                                Terima kasih sudah mendaftar di Noxarianet Store. Masukkan kode di bawah ini di halaman
+                                pendaftaran untuk mengaktifkan akun Anda.
+                            </p>`,
+        code,
+        footnoteHtml: `
+                            <div style="background:#fff8e1; border-left:4px solid #f9a825; padding:14px 18px; border-radius:6px; margin-bottom:20px;">
+                                <p style="margin:0; color:#7a5c00; font-size:13px; line-height:1.6;">
+                                    <strong>Jangan bagikan kode ini kepada siapa pun</strong>, termasuk pihak yang mengaku sebagai admin Noxarianet Store.
+                                    Kami tidak pernah meminta kode ini lewat telepon, WhatsApp, atau chat.
+                                </p>
+                            </div>
+                            <p style="color:#888; font-size:13px; line-height:1.6; margin:0;">
+                                Tidak menerima email ini? Periksa folder spam, atau kembali ke halaman pendaftaran untuk meminta kode baru.
+                            </p>`,
+    });
+}
+
+/**
+ * Email OTP untuk lupa password.
+ *
+ * @param {Object} options
+ * @param {string} options.code - Kode OTP 6 digit
+ * @param {string} [options.displayName]
+ * @param {number} [options.expiresMinutes=10]
+ * @param {string} [options.waNumber] - Nomor WhatsApp CS
+ * @returns {string} HTML string
+ */
+function buildResetPasswordEmailHtml({ code, displayName, expiresMinutes = 10, waNumber }) {
+    const greeting = displayName
+        ? `Halo <strong>${escapeHtml(displayName)}</strong>,`
+        : 'Halo,';
+
+    return buildOtpLayoutHtml({
+        heading: 'Reset Password',
+        subtitle: 'Kode untuk mengatur ulang password akun Anda',
+        expiresMinutes,
+        waNumber,
+        introHtml: `
+                            <p style="color:#333; font-size:15px; line-height:1.6; margin:0 0 24px;">
+                                ${greeting}<br/>
+                                Kami menerima permintaan untuk mengatur ulang password akun Anda. Masukkan kode di bawah ini,
+                                lalu tentukan password baru Anda.
+                            </p>`,
+        code,
+        footnoteHtml: `
+                            <div style="background:#ffebee; border-left:4px solid #e53935; padding:14px 18px; border-radius:6px; margin-bottom:20px;">
+                                <p style="margin:0; color:#8c1d18; font-size:13px; line-height:1.6;">
+                                    <strong>Tidak pernah meminta reset password?</strong> Abaikan email ini. Password Anda tidak akan berubah
+                                    selama kode ini tidak dipakai.
+                                </p>
+                            </div>
+                            <p style="color:#888; font-size:13px; line-height:1.6; margin:0;">
+                                Selesai? Kode ini langsung hangus dan tidak bisa dipakai lagi.
+                            </p>`,
+    });
+}
+
+module.exports = {
+    buildCompletedEmailHtml,
+    buildFailedEmailHtml,
+    buildVerificationEmailHtml,
+    buildResetPasswordEmailHtml,
+};

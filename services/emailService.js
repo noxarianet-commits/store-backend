@@ -7,6 +7,10 @@
  * - Primary  : Resend SMTP relay (smtp.resend.com:465)
  * - Fallback : Brevo SMTP relay (smtp-relay.brevo.com:587) jika Resend limit / error.
  *
+ * Saat Resend kena limit / quota, relay primary di-MARK COOLDOWN sehingga email
+ * berikutnya langsung dikirim via Brevo tanpa mencoba Resend lagi. Cooldown
+ * berakhir otomatis setelah SMTP_FAILOVER_COOLDOWN_MS (default 15 menit).
+ *
  * Env Variables:
  *   RESEND_API_KEY    — API key dari Resend (digunakan sebagai SMTP password)
  *   BREVO_SMTP_USER   — Username / email akun Brevo
@@ -16,6 +20,7 @@
  *   BREVO_SMTP_SECURE — Boolean string 'true' / 'false' (default: false pada port 587)
  *   SMTP_FROM_EMAIL   — Alamat pengirim (harus verified di Resend / Brevo)
  *   SMTP_FROM_NAME    — Nama pengirim (display name)
+ *   SMTP_FAILOVER_COOLDOWN_MS — Lama cooldown Resend setelah kena limit (default: 900000 = 15 menit)
  */
 
 const nodemailer = require('nodemailer');
@@ -52,6 +57,53 @@ async function getWaCsNumber() {
 
 const FROM_EMAIL = process.env.SMTP_FROM_EMAIL || 'noreply@noxarianet.web.id';
 const FROM_NAME = process.env.SMTP_FROM_NAME || 'Noxarianet Store';
+
+// ══════════════════════════════════════════════════════════════════════════
+// FAILOVER STATE (in-memory, per-process)
+// ══════════════════════════════════════════════════════════════════════════
+
+const DEFAULT_COOLDOWN_MS = 15 * 60 * 1000;
+const RESEND_COOLDOWN_MS = (() => {
+    const raw = parseInt(process.env.SMTP_FAILOVER_COOLDOWN_MS, 10);
+    return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_COOLDOWN_MS;
+})();
+
+/** Timestamp (ms) kapan Resend boleh dicoba lagi. 0 = tidak dalam cooldown. */
+let resendCooldownUntil = 0;
+
+function isResendInCooldown() {
+    return Date.now() < resendCooldownUntil;
+}
+
+function getResendCooldownRemainingMs() {
+    return Math.max(0, resendCooldownUntil - Date.now());
+}
+
+/**
+ * Format durasi ms jadi string yang enak dibaca untuk log.
+ * @param {number} ms
+ * @returns {string} contoh: "15 menit" / "30 detik"
+ */
+function formatCooldownDuration(ms) {
+    if (ms < 60000) {
+        return `${Math.max(1, Math.round(ms / 1000))} detik`;
+    }
+    return `${Math.round(ms / 60000)} menit`;
+}
+
+function markResendCooldown(reason) {
+    resendCooldownUntil = Date.now() + RESEND_COOLDOWN_MS;
+    console.warn(
+        `[EmailService] Resend masuk cooldown ${formatCooldownDuration(RESEND_COOLDOWN_MS)} (${reason}). ` +
+        'Email berikutnya dialihkan ke Brevo SMTP.'
+    );
+}
+
+/**
+ * Pola error yang menandakan limit / quota (bukan error konfigurasi permanen).
+ * 450 = SMTP "greylisting" / throttling, 429 = HTTP rate limit.
+ */
+const LIMIT_ERROR_PATTERN = /limit|quota|429|450|exceeded|too many|throttl/i;
 
 /**
  * Lazy-initialized Nodemailer transporters.
@@ -123,7 +175,7 @@ function getBrevoTransporter() {
  * @param {string} options.to - Email penerima
  * @param {string} options.subject - Subject email
  * @param {string} options.html - Body email dalam HTML
- * @returns {Promise<{success: boolean, messageId?: string, provider?: string, fallback?: boolean, error?: string}>}
+ * @returns {Promise<{success: boolean, messageId?: string, provider?: string, fallback?: boolean, failover?: boolean, error?: string}>}
  */
 async function sendEmail({ to, subject, html }) {
     if (!to) {
@@ -159,20 +211,52 @@ async function sendEmail({ to, subject, html }) {
         }
     }
 
-    // 2. Coba kirim via Resend terlebih dahulu (Primary)
+    // 2. Resend sedang cooldown → skip percobaan ke primary, langsung ke fallback.
+    //    Kalau Brevo tidak tersedia, tetap coba Resend (tidak ada alternatif lain).
+    if (isResendInCooldown()) {
+        const remaining = formatCooldownDuration(getResendCooldownRemainingMs());
+
+        if (brevoSmtp) {
+            console.log(
+                `[EmailService] Resend dalam cooldown (sisa ~${remaining}). ` +
+                `Mengirim langsung via Brevo SMTP ke ${to}...`
+            );
+            try {
+                const info = await brevoSmtp.sendMail(mailOptions);
+                console.log(`[EmailService] Email terkirim via Brevo (failover cooldown) ke ${to} — messageId: ${info.messageId}`);
+                return { success: true, messageId: info.messageId, provider: 'brevo', failover: true };
+            } catch (brevoErr) {
+                console.error(`[EmailService] Failover Brevo (cooldown) gagal ke ${to}:`, brevoErr.message);
+                return {
+                    success: false,
+                    error: brevoErr.message,
+                    provider: 'brevo',
+                    failover: true,
+                };
+            }
+        }
+
+        console.warn(
+            `[EmailService] Resend dalam cooldown (sisa ~${remaining}) dan Brevo tidak dikonfigurasi — ` +
+            'tetap mencoba kirim via Resend.'
+        );
+    }
+
+    // 3. Coba kirim via Resend terlebih dahulu (Primary)
     try {
         const info = await resendSmtp.sendMail(mailOptions);
         console.log(`[EmailService] Email terkirim via Resend ke ${to} — messageId: ${info.messageId}`);
         return { success: true, messageId: info.messageId, provider: 'resend' };
     } catch (resendErr) {
-        const isLimit = /limit|quota|429|exceeded|too many|throttl/i.test(resendErr.message || '');
+        const isLimit = LIMIT_ERROR_PATTERN.test(resendErr.message || '');
         if (isLimit) {
             console.warn(`[EmailService] Resend limit/quota terdeteksi (${resendErr.message}).`);
+            markResendCooldown(resendErr.message);
         } else {
             console.warn(`[EmailService] Gagal kirim via Resend (${resendErr.message}).`);
         }
 
-        // 3. Jika Brevo tersedia, coba fallback
+        // 4. Jika Brevo tersedia, coba fallback
         if (brevoSmtp) {
             console.log(`[EmailService] Mengalihkan pengiriman email ke fallback Brevo SMTP untuk ${to}...`);
             try {
@@ -196,6 +280,18 @@ async function sendEmail({ to, subject, html }) {
 // ══════════════════════════════════════════════════════════════════════════
 // PUBLIC API
 // ══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Status failover SMTP saat ini (untuk debugging / observability).
+ * @returns {{resendInCooldown: boolean, resendCooldownRemainingMs: number, cooldownMs: number}}
+ */
+function getSmtpFailoverStatus() {
+    return {
+        resendInCooldown: isResendInCooldown(),
+        resendCooldownRemainingMs: getResendCooldownRemainingMs(),
+        cooldownMs: RESEND_COOLDOWN_MS,
+    };
+}
 
 /**
  * Kirim email notifikasi ORDER COMPLETED (sukses) ke pembeli.
@@ -272,4 +368,5 @@ module.exports = {
     getWaCsNumber,
     getResendTransporter,
     getBrevoTransporter,
+    getSmtpFailoverStatus,
 };

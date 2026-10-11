@@ -1,15 +1,17 @@
 /**
  * ═══════════════════════════════════════════════════════════════════════════
- * NOXARIANET STORE — Email Service (Nodemailer + Resend SMTP & Brevo Fallback)
+ * NOXARIANET STORE — Email Service (Resend → Brevo → Mailketing Fallback)
  * ═══════════════════════════════════════════════════════════════════════════
  *
- * Service untuk pengiriman email transaksional menggunakan Nodemailer.
- * - Primary  : Resend SMTP relay (smtp.resend.com:465)
- * - Fallback : Brevo SMTP relay (smtp-relay.brevo.com:587) jika Resend limit / error.
+ * Service untuk pengiriman email transaksional dengan 3-tier fallback:
+ * - Primary    : Resend SMTP relay (smtp.resend.com:465)
+ * - Fallback 1 : Brevo SMTP relay (smtp-relay.brevo.com:587)
+ * - Fallback 2 : Mailketing HTTP API (api.mailketing.co.id/api/v2/send)
  *
- * Saat Resend kena limit / quota, relay primary di-MARK COOLDOWN sehingga email
- * berikutnya langsung dikirim via Brevo tanpa mencoba Resend lagi. Cooldown
- * berakhir otomatis setelah SMTP_FAILOVER_COOLDOWN_MS (default 15 menit).
+ * Saat provider kena limit / quota / error, relay tersebut di-MARK COOLDOWN
+ * sehingga email berikutnya langsung dikirim via provider berikutnya tanpa
+ * mencoba lagi. Cooldown berakhir otomatis setelah SMTP_FAILOVER_COOLDOWN_MS
+ * (default 15 menit).
  *
  * Env Variables:
  *   RESEND_API_KEY    — API key dari Resend (digunakan sebagai SMTP password)
@@ -18,9 +20,11 @@
  *   BREVO_SMTP_HOST   — Host Brevo SMTP (default: smtp-relay.brevo.com)
  *   BREVO_SMTP_PORT   — Port Brevo SMTP (default: 587)
  *   BREVO_SMTP_SECURE — Boolean string 'true' / 'false' (default: false pada port 587)
- *   SMTP_FROM_EMAIL   — Alamat pengirim (harus verified di Resend / Brevo)
+ *   MAILKETING_API_TOKEN — API token dari Mailketing (menu API Integration)
+ *   MAILKETING_FROM_EMAIL — Alamat pengirim Mailketing (opsional, default: SMTP_FROM_EMAIL)
+ *   SMTP_FROM_EMAIL   — Alamat pengirim (harus verified di Resend / Brevo / Mailketing)
  *   SMTP_FROM_NAME    — Nama pengirim (display name)
- *   SMTP_FAILOVER_COOLDOWN_MS — Lama cooldown Resend setelah kena limit (default: 900000 = 15 menit)
+ *   SMTP_FAILOVER_COOLDOWN_MS — Lama cooldown per-provider setelah kena limit (default: 900000 = 15 menit)
  */
 
 const nodemailer = require('nodemailer');
@@ -70,13 +74,23 @@ const RESEND_COOLDOWN_MS = (() => {
 
 /** Timestamp (ms) kapan Resend boleh dicoba lagi. 0 = tidak dalam cooldown. */
 let resendCooldownUntil = 0;
+/** Timestamp (ms) kapan Brevo boleh dicoba lagi. 0 = tidak dalam cooldown. */
+let brevoCooldownUntil = 0;
 
 function isResendInCooldown() {
     return Date.now() < resendCooldownUntil;
 }
 
+function isBrevoInCooldown() {
+    return Date.now() < brevoCooldownUntil;
+}
+
 function getResendCooldownRemainingMs() {
     return Math.max(0, resendCooldownUntil - Date.now());
+}
+
+function getBrevoCooldownRemainingMs() {
+    return Math.max(0, brevoCooldownUntil - Date.now());
 }
 
 /**
@@ -95,7 +109,15 @@ function markResendCooldown(reason) {
     resendCooldownUntil = Date.now() + RESEND_COOLDOWN_MS;
     console.warn(
         `[EmailService] Resend masuk cooldown ${formatCooldownDuration(RESEND_COOLDOWN_MS)} (${reason}). ` +
-        'Email berikutnya dialihkan ke Brevo SMTP.'
+        'Email berikutnya dialihkan ke Brevo / Mailketing.'
+    );
+}
+
+function markBrevoCooldown(reason) {
+    brevoCooldownUntil = Date.now() + RESEND_COOLDOWN_MS;
+    console.warn(
+        `[EmailService] Brevo masuk cooldown ${formatCooldownDuration(RESEND_COOLDOWN_MS)} (${reason}). ` +
+        'Email berikutnya dialihkan ke Mailketing.'
     );
 }
 
@@ -166,11 +188,124 @@ function getBrevoTransporter() {
 }
 
 // ══════════════════════════════════════════════════════════════════════════
-// SEND EMAIL (with automatic fallback to Brevo)
+// MAILKETING HTTP API SENDER
+// ══════════════════════════════════════════════════════════════════════════
+
+const MAILKETING_BASE_URL = 'https://api.mailketing.co.id/api/v2';
+
+/**
+ * Cek apakah Mailketing API token terkonfigurasi.
+ * @returns {boolean}
+ */
+function isMailketingConfigured() {
+    return !!process.env.MAILKETING_API_TOKEN;
+}
+
+/**
+ * Kirim email via Mailketing HTTP API (POST /send).
+ * @param {Object} options
+ * @param {string} options.to - Email penerima
+ * @param {string} options.subject - Subject email
+ * @param {string} options.html - Body email (HTML)
+ * @returns {Promise<{success: boolean, messageId?: string, error?: string}>}
+ */
+async function sendViaMailketing({ to, subject, html }) {
+    const apiToken = process.env.MAILKETING_API_TOKEN;
+    if (!apiToken) {
+        return { success: false, error: 'MAILKETING_API_TOKEN not configured' };
+    }
+
+    const fromEmail = process.env.MAILKETING_FROM_EMAIL || FROM_EMAIL;
+
+    const body = JSON.stringify({
+        from_name: FROM_NAME,
+        from_email: fromEmail,
+        subject,
+        recipient: to,
+        content: html,
+    });
+
+    const res = await fetch(`${MAILKETING_BASE_URL}/send`, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'X-Api-Token': apiToken,
+        },
+        body,
+    });
+
+    const json = await res.json();
+
+    if (!res.ok || !json.success) {
+        const errMsg = json.message || `HTTP ${res.status}`;
+        return { success: false, error: errMsg };
+    }
+
+    const messageId = json.data?.message_id || null;
+    return { success: true, messageId };
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// SEND EMAIL (Resend → Brevo → Mailketing fallback chain)
 // ══════════════════════════════════════════════════════════════════════════
 
 /**
- * Kirim email menggunakan Resend SMTP dengan fallback ke Brevo SMTP jika terjadi limit / error.
+ * Coba kirim via Brevo SMTP. Mengembalikan result atau null jika tidak bisa dicoba.
+ * @param {import('nodemailer').Transporter|null} brevoSmtp
+ * @param {Object} mailOptions
+ * @param {string} to
+ * @param {string} context - label untuk log (e.g. 'fallback', 'failover cooldown')
+ * @returns {Promise<{success: boolean, messageId?: string, provider: string, fallback?: boolean, failover?: boolean, error?: string}|null>}
+ */
+async function tryBrevo(brevoSmtp, mailOptions, to, context) {
+    if (!brevoSmtp || isBrevoInCooldown()) return null;
+
+    console.log(`[EmailService] Mengirim via Brevo SMTP (${context}) ke ${to}...`);
+    try {
+        const info = await brevoSmtp.sendMail(mailOptions);
+        console.log(`[EmailService] Email terkirim via Brevo (${context}) ke ${to} — messageId: ${info.messageId}`);
+        return { success: true, messageId: info.messageId, provider: 'brevo', fallback: context !== 'primary' };
+    } catch (brevoErr) {
+        const isLimit = LIMIT_ERROR_PATTERN.test(brevoErr.message || '');
+        if (isLimit) {
+            console.warn(`[EmailService] Brevo limit/quota terdeteksi (${brevoErr.message}).`);
+            markBrevoCooldown(brevoErr.message);
+        } else {
+            console.warn(`[EmailService] Gagal kirim via Brevo (${context}) ke ${to}: ${brevoErr.message}`);
+        }
+        return null; // signal: lanjut ke provider berikutnya
+    }
+}
+
+/**
+ * Coba kirim via Mailketing HTTP API. Mengembalikan result atau null.
+ * @param {Object} params
+ * @param {string} params.to
+ * @param {string} params.subject
+ * @param {string} params.html
+ * @param {string} context - label untuk log
+ * @returns {Promise<{success: boolean, messageId?: string, provider: string, fallback?: boolean, error?: string}|null>}
+ */
+async function tryMailketing({ to, subject, html }, context) {
+    if (!isMailketingConfigured()) return null;
+
+    console.log(`[EmailService] Mengirim via Mailketing API (${context}) ke ${to}...`);
+    try {
+        const result = await sendViaMailketing({ to, subject, html });
+        if (result.success) {
+            console.log(`[EmailService] Email terkirim via Mailketing (${context}) ke ${to} — messageId: ${result.messageId}`);
+            return { success: true, messageId: result.messageId, provider: 'mailketing', fallback: true };
+        }
+        console.warn(`[EmailService] Mailketing API gagal (${context}) ke ${to}: ${result.error}`);
+        return null;
+    } catch (mkErr) {
+        console.error(`[EmailService] Mailketing API error (${context}) ke ${to}:`, mkErr.message);
+        return null;
+    }
+}
+
+/**
+ * Kirim email menggunakan 3-tier fallback: Resend → Brevo → Mailketing.
  * @param {Object} options
  * @param {string} options.to - Email penerima
  * @param {string} options.subject - Subject email
@@ -192,89 +327,54 @@ async function sendEmail({ to, subject, html }) {
 
     const resendSmtp = getResendTransporter();
     const brevoSmtp = getBrevoTransporter();
+    const hasMailketing = isMailketingConfigured();
 
-    if (!resendSmtp && !brevoSmtp) {
-        console.warn('[EmailService] Tidak ada transporter SMTP yang terkonfigurasi (Resend & Brevo belum diset di .env) — skip pengiriman email.');
-        return { success: false, error: 'No SMTP transporter configured' };
+    if (!resendSmtp && !brevoSmtp && !hasMailketing) {
+        console.warn('[EmailService] Tidak ada provider email yang terkonfigurasi (Resend, Brevo, Mailketing belum diset di .env) — skip pengiriman email.');
+        return { success: false, error: 'No email provider configured' };
     }
 
-    // 1. Jika Resend tidak dikonfigurasi tetapi Brevo ada, langsung kirim via Brevo
-    if (!resendSmtp) {
-        console.log('[EmailService] RESEND_API_KEY tidak diset. Mengirim langsung via Brevo SMTP...');
+    const errors = [];
+
+    // ── 1. Resend (Primary) ──────────────────────────────────────────────
+    if (resendSmtp && !isResendInCooldown()) {
         try {
-            const info = await brevoSmtp.sendMail(mailOptions);
-            console.log(`[EmailService] Email terkirim via Brevo ke ${to} — messageId: ${info.messageId}`);
-            return { success: true, messageId: info.messageId, provider: 'brevo' };
-        } catch (brevoErr) {
-            console.error(`[EmailService] Gagal kirim email via Brevo ke ${to}:`, brevoErr.message);
-            return { success: false, error: brevoErr.message, provider: 'brevo' };
+            const info = await resendSmtp.sendMail(mailOptions);
+            console.log(`[EmailService] Email terkirim via Resend ke ${to} — messageId: ${info.messageId}`);
+            return { success: true, messageId: info.messageId, provider: 'resend' };
+        } catch (resendErr) {
+            const isLimit = LIMIT_ERROR_PATTERN.test(resendErr.message || '');
+            if (isLimit) {
+                console.warn(`[EmailService] Resend limit/quota terdeteksi (${resendErr.message}).`);
+                markResendCooldown(resendErr.message);
+            } else {
+                console.warn(`[EmailService] Gagal kirim via Resend (${resendErr.message}).`);
+            }
+            errors.push(`Resend: ${resendErr.message}`);
         }
-    }
-
-    // 2. Resend sedang cooldown → skip percobaan ke primary, langsung ke fallback.
-    //    Kalau Brevo tidak tersedia, tetap coba Resend (tidak ada alternatif lain).
-    if (isResendInCooldown()) {
+    } else if (resendSmtp && isResendInCooldown()) {
         const remaining = formatCooldownDuration(getResendCooldownRemainingMs());
-
-        if (brevoSmtp) {
-            console.log(
-                `[EmailService] Resend dalam cooldown (sisa ~${remaining}). ` +
-                `Mengirim langsung via Brevo SMTP ke ${to}...`
-            );
-            try {
-                const info = await brevoSmtp.sendMail(mailOptions);
-                console.log(`[EmailService] Email terkirim via Brevo (failover cooldown) ke ${to} — messageId: ${info.messageId}`);
-                return { success: true, messageId: info.messageId, provider: 'brevo', failover: true };
-            } catch (brevoErr) {
-                console.error(`[EmailService] Failover Brevo (cooldown) gagal ke ${to}:`, brevoErr.message);
-                return {
-                    success: false,
-                    error: brevoErr.message,
-                    provider: 'brevo',
-                    failover: true,
-                };
-            }
-        }
-
-        console.warn(
-            `[EmailService] Resend dalam cooldown (sisa ~${remaining}) dan Brevo tidak dikonfigurasi — ` +
-            'tetap mencoba kirim via Resend.'
-        );
+        console.log(`[EmailService] Resend dalam cooldown (sisa ~${remaining}) — skip.`);
     }
 
-    // 3. Coba kirim via Resend terlebih dahulu (Primary)
-    try {
-        const info = await resendSmtp.sendMail(mailOptions);
-        console.log(`[EmailService] Email terkirim via Resend ke ${to} — messageId: ${info.messageId}`);
-        return { success: true, messageId: info.messageId, provider: 'resend' };
-    } catch (resendErr) {
-        const isLimit = LIMIT_ERROR_PATTERN.test(resendErr.message || '');
-        if (isLimit) {
-            console.warn(`[EmailService] Resend limit/quota terdeteksi (${resendErr.message}).`);
-            markResendCooldown(resendErr.message);
-        } else {
-            console.warn(`[EmailService] Gagal kirim via Resend (${resendErr.message}).`);
-        }
-
-        // 4. Jika Brevo tersedia, coba fallback
-        if (brevoSmtp) {
-            console.log(`[EmailService] Mengalihkan pengiriman email ke fallback Brevo SMTP untuk ${to}...`);
-            try {
-                const info = await brevoSmtp.sendMail(mailOptions);
-                console.log(`[EmailService] Email berhasil terkirim via Brevo (fallback) ke ${to} — messageId: ${info.messageId}`);
-                return { success: true, messageId: info.messageId, provider: 'brevo', fallback: true };
-            } catch (brevoErr) {
-                console.error(`[EmailService] Fallback Brevo juga gagal ke ${to}:`, brevoErr.message);
-                return {
-                    success: false,
-                    error: `Resend error: ${resendErr.message} | Brevo error: ${brevoErr.message}`,
-                };
-            }
-        }
-
-        console.warn('[EmailService] Fallback Brevo tidak terkonfigurasi di .env.');
-        return { success: false, error: resendErr.message, provider: 'resend' };
+    // ── 2. Brevo (Fallback 1) ────────────────────────────────────────────
+    const brevoResult = await tryBrevo(brevoSmtp, mailOptions, to, errors.length ? 'fallback' : 'failover cooldown');
+    if (brevoResult) return brevoResult;
+    if (brevoSmtp && isBrevoInCooldown()) {
+        const remaining = formatCooldownDuration(getBrevoCooldownRemainingMs());
+        console.log(`[EmailService] Brevo dalam cooldown (sisa ~${remaining}) — skip.`);
     }
+
+    // ── 3. Mailketing (Fallback 2) ───────────────────────────────────────
+    const mkResult = await tryMailketing({ to, subject, html }, 'fallback');
+    if (mkResult) return mkResult;
+
+    // ── Semua provider gagal ─────────────────────────────────────────────
+    const errorSummary = errors.length
+        ? errors.join(' | ')
+        : 'Semua provider gagal atau tidak terkonfigurasi';
+    console.error(`[EmailService] Semua provider gagal mengirim email ke ${to}: ${errorSummary}`);
+    return { success: false, error: errorSummary };
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -282,13 +382,16 @@ async function sendEmail({ to, subject, html }) {
 // ══════════════════════════════════════════════════════════════════════════
 
 /**
- * Status failover SMTP saat ini (untuk debugging / observability).
- * @returns {{resendInCooldown: boolean, resendCooldownRemainingMs: number, cooldownMs: number}}
+ * Status failover saat ini (untuk debugging / observability).
+ * @returns {{resendInCooldown: boolean, resendCooldownRemainingMs: number, brevoInCooldown: boolean, brevoCooldownRemainingMs: number, mailketingConfigured: boolean, cooldownMs: number}}
  */
 function getSmtpFailoverStatus() {
     return {
         resendInCooldown: isResendInCooldown(),
         resendCooldownRemainingMs: getResendCooldownRemainingMs(),
+        brevoInCooldown: isBrevoInCooldown(),
+        brevoCooldownRemainingMs: getBrevoCooldownRemainingMs(),
+        mailketingConfigured: isMailketingConfigured(),
         cooldownMs: RESEND_COOLDOWN_MS,
     };
 }

@@ -86,6 +86,39 @@ function getProductNameFromDetails(accountDetails) {
 }
 
 /**
+ * Build HTML untuk catatan penting dari penjual (seller_note).
+ * Catatan diambil dari setiap raw_item, dibersihkan, dideduplikasi, lalu
+ * di-escape agar aman ditampilkan di email.
+ *
+ * @param {Object} accountDetails - field account_details dari order
+ * @returns {string} HTML string, atau string kosong jika tidak ada catatan
+ */
+function buildSellerNoteHtml(accountDetails) {
+    const rawItems = accountDetails?.raw_items || [];
+    const notes = [];
+
+    rawItems.forEach(item => {
+        const note = typeof item?.seller_note === 'string' ? item.seller_note.trim() : '';
+        if (note && !notes.includes(note)) {
+            notes.push(note);
+        }
+    });
+
+    if (notes.length === 0) return '';
+
+    const notesHtml = notes.map((note, idx) => `
+        <div style="margin:0 0 ${idx === notes.length - 1 ? 0 : 10}px; color:#4e342e; font-size:13px; line-height:1.7;">
+            ${escapeHtml(note).replace(/\r\n|\r|\n/g, '<br/>')}
+        </div>`).join('');
+
+    return `
+        <div style="background:#fff8e1; border-left:4px solid #f9a825; padding:14px 18px; border-radius:0 8px 8px 0; margin:20px 0;">
+            <p style="margin:0 0 10px; color:#7a5c00; font-size:13px; font-weight:700;">📌 Catatan Penting dari Penjual</p>
+            ${notesHtml}
+        </div>`;
+}
+
+/**
  * Mengekstrak dan memformat data akun/license dari account_details.
  * Renders different layouts based on product type.
  * @param {Object} accountDetails - field account_details dari order
@@ -460,6 +493,9 @@ function getSectionTitle(productType) {
  */
 function buildCompletedEmailHtml(order, waNumber = '6285199605580') {
     const { html: accountHtml, productType } = buildAccountDetailsHtml(order.account_details);
+    const sellerNoteHtml = productType === 'premium_app'
+        ? buildSellerNoteHtml(order.account_details)
+        : '';
     const warningHtml = buildWarningHtml(productType);
     const sectionTitle = getSectionTitle(productType);
     const cleanWa = String(waNumber || '6285199605580').replace(/\D/g, '') || '6285199605580';
@@ -528,6 +564,9 @@ function buildCompletedEmailHtml(order, waNumber = '6285199605580') {
                                 ${sectionTitle}
                             </h2>
                             ${accountHtml}
+                            
+                            <!-- Seller Note (premium app only) -->
+                            ${sellerNoteHtml}
                             
                             <!-- Warning / Info Box (conditional) -->
                             ${warningHtml}

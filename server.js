@@ -29,6 +29,8 @@ const webhookRoutes = require('./routes/webhookRoutes');
 const homeRoutes = require('./routes/homeRoutes');
 const authRoutes = require('./routes/authRoutes');
 const balanceRoutes = require('./routes/balanceRoutes');
+const ticketRoutes = require('./routes/ticketRoutes');
+const adminTicketRoutes = require('./routes/adminTicketRoutes');
 
 const verifyAdmin = require('./middleware/verifyAdmin');
 const verifyUser = require('./middleware/verifyUser');
@@ -45,7 +47,11 @@ const PORT = process.env.PORT || 3000;
 const globalLimiter = rateLimit({
     windowMs: 10 * 60 * 1000,
     max: 600,
-    skip: (req) => req.path.includes('/payments/status'),
+    // SSE stream tiket berumur panjang dan otomatis reconnect — jangan
+    // sampai koneksi itu menghabiskan kuota request halaman lain.
+    // Path pelanggan mengandung nomor tiket (mis. /api/tickets/TK-.../stream),
+    // jadi cocokkan suffix '/stream', bukan '/tickets/stream'.
+    skip: (req) => req.path.includes('/payments/status') || req.path.endsWith('/stream'),
     message: { error: 'Terlalu banyak request, silakan coba lagi nanti.' },
     standardHeaders: true,
     legacyHeaders: false,
@@ -56,7 +62,7 @@ app.use(cors({
     origin: true,
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'x-admin-token', 'x-signature', 'x-event', 'x-webhook-signature', 'x-callback-secret', '*'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'x-admin-token', 'x-order-token', 'x-ticket-token', 'x-signature', 'x-event', 'x-webhook-signature', 'x-callback-secret', '*'],
     optionsSuccessStatus: 200
 }));
 
@@ -88,12 +94,14 @@ app.use('/api/testimonials', testimonialRoutes);
 app.use('/api/payments', paymentRoutes);
 app.use('/api/auth', authRoutes);
 app.use('/api/balance', verifyUser, balanceRoutes);
+app.use('/api/tickets', ticketRoutes);
 
 // ══════════════════════════════════════════════════════════════════════════
 // ROUTES — Protected (Admin)
 // ══════════════════════════════════════════════════════════════════════════
 
 app.use('/api/admin/products', adminProductRoutes);
+app.use('/api/admin/tickets', adminTicketRoutes);
 app.use('/api/orders', verifyAdmin, orderRoutes);
 app.use('/api/admin', adminRoutes);
 

@@ -2,6 +2,9 @@ const supabase = require('../supabase');
 const vendorRegistry = require('../services/vendors/vendorRegistry');
 const productSyncService = require('../services/productSyncService');
 const cacheService = require('../services/cacheService');
+const { toBigIntId } = require('../utils/dbIds');
+const { findVariantByPublicId, findVariantInProduct } = require('../utils/productLookup');
+const { logger } = require('../utils/logger');
 
 /**
  * Admin Product Controller.
@@ -23,7 +26,7 @@ async function sync(req, res) {
             ...result,
         });
     } catch (err) {
-        console.error('[AdminProductController] sync error:', err.message);
+        logger.error('admin_product_sync_failed', { vendor, type, error: err });
         res.status(500).json({ success: false, error: err.message });
     }
 }
@@ -113,7 +116,7 @@ async function getProducts(req, res) {
 
         res.json(normalized);
     } catch (err) {
-        console.error('[AdminProductController] getProducts error:', err.message);
+        logger.error('admin_products_list_failed', { error: err });
         res.status(500).json({ error: err.message });
     }
 }
@@ -124,9 +127,12 @@ async function getProducts(req, res) {
  */
 async function updateMarkup(req, res) {
     try {
-        const productId = parseInt(req.params.id);
+        const productId = toBigIntId(req.params.id);
         const { variantId, markup } = req.body;
 
+        if (!productId) {
+            return res.status(400).json({ error: 'ID produk tidak valid' });
+        }
         if (markup === undefined || markup === null) {
             return res.status(400).json({ error: 'Markup harus diisi' });
         }
@@ -153,7 +159,10 @@ async function updateMarkup(req, res) {
  */
 async function toggleActive(req, res) {
     try {
-        const productId = parseInt(req.params.id);
+        const productId = toBigIntId(req.params.id);
+        if (!productId) {
+            return res.status(400).json({ error: 'ID produk tidak valid' });
+        }
 
         const { data: product, error: fetchError } = await supabase
             .from('products')
@@ -185,7 +194,10 @@ async function toggleActive(req, res) {
  */
 async function toggleFeatured(req, res) {
     try {
-        const productId = parseInt(req.params.id);
+        const productId = toBigIntId(req.params.id);
+        if (!productId) {
+            return res.status(400).json({ error: 'ID produk tidak valid' });
+        }
 
         const { data: product, error: fetchError } = await supabase
             .from('products')
@@ -231,6 +243,46 @@ async function getFeatured(req, res) {
 }
 
 /**
+ * GET /api/admin/products/featured-options
+ *
+ * The Featured tab needs all products (so an admin can mark any product as
+ * featured), but it only needs a small subset of each product's data. This
+ * avoids downloading the full catalog with markup/base_price for every tab.
+ */
+async function getFeaturedOptions(req, res) {
+    try {
+        const { data, error } = await supabase
+            .from('products')
+            .select('id, name, category, icon, is_featured, product_variants(id, vendor_variant_id, sell_price, stock, is_hidden, is_active)')
+            .order('category', { ascending: true })
+            .order('name', { ascending: true });
+
+        if (error) throw error;
+
+        const normalized = (data || []).map(product => ({
+            id: product.id,
+            name: product.name,
+            category: product.category,
+            icon: product.icon,
+            is_featured: product.is_featured,
+            variants: (product.product_variants || [])
+                .filter(v => v.is_hidden !== true && v.is_active !== false)
+                .map(v => ({
+                    id: v.vendor_variant_id,
+                    sell_price: v.sell_price,
+                    price: v.sell_price,
+                    stock: v.stock,
+                })),
+        }));
+
+        res.json(normalized);
+    } catch (err) {
+        logger.error('admin_featured_options_failed', { error: err });
+        res.status(500).json({ error: 'Gagal memuat produk unggulan' });
+    }
+}
+
+/**
  * PATCH /api/admin/products/variants/:id/toggle-hidden
  * or /api/admin/products/products/:productId/variant/:variantId/toggle-hidden
  */
@@ -240,37 +292,46 @@ async function toggleVariantHidden(req, res) {
         const targetVariantId = id || variantId;
         const targetProductId = productId;
 
-        let query = supabase.from('product_variants').select('id, product_id, is_hidden, vendor_variant_id');
-        
-        if (targetProductId && targetVariantId) {
-            if (!isNaN(targetVariantId)) {
-                query = query.eq('product_id', targetProductId).or(`vendor_variant_id.eq.${targetVariantId},id.eq.${targetVariantId}`);
-            } else {
-                query = query.eq('product_id', targetProductId).eq('vendor_variant_id', String(targetVariantId));
-            }
-        } else if (targetVariantId) {
-            if (!isNaN(targetVariantId)) {
-                query = query.or(`id.eq.${targetVariantId},vendor_variant_id.eq.${targetVariantId}`);
-            } else {
-                query = query.eq('vendor_variant_id', String(targetVariantId));
-            }
+        if (!targetVariantId) {
+            return res.status(400).json({ error: 'ID varian tidak valid' });
         }
 
-        const { data: variant, error: fetchErr } = await query.maybeSingle();
-        if (fetchErr || !variant) {
+        const columns = 'id, product_id, is_hidden, vendor_variant_id';
+        const result = targetProductId
+            ? await findVariantInProduct(supabase, targetProductId, targetVariantId, columns)
+            : await findVariantByPublicId(supabase, targetVariantId, columns);
+
+        if (result.error) {
+            logger.error('variant_hidden_lookup_failed', {
+                productId: targetProductId || null,
+                variantId: targetVariantId,
+                code: result.error.code,
+            });
+            return res.status(500).json({ error: 'Gagal memuat varian' });
+        }
+
+        const variant = result.data;
+        if (!variant) {
             return res.status(404).json({ error: 'Variant tidak ditemukan' });
         }
 
         const newHidden = !variant.is_hidden;
-        await supabase
+        const { error: updateError } = await supabase
             .from('product_variants')
             .update({ is_hidden: newHidden })
             .eq('id', variant.id);
 
+        if (updateError) throw updateError;
+
         cacheService.invalidateHome();
         res.json({ success: true, is_hidden: newHidden });
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        logger.error('variant_hidden_toggle_failed', {
+            productId: req.params.productId || null,
+            variantId: req.params.id || req.params.variantId || null,
+            error: err,
+        });
+        res.status(500).json({ error: 'Gagal mengubah visibilitas varian' });
     }
 }
 
@@ -310,6 +371,7 @@ module.exports = {
     toggleActive,
     toggleFeatured,
     getFeatured,
+    getFeaturedOptions,
     toggleVariantHidden,
     globalMarkup,
 };

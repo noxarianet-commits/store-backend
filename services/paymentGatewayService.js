@@ -1,4 +1,5 @@
 const crypto = require('crypto');
+const { logger } = require('../utils/logger');
 
 /**
  * PaymentGatewayService — Client untuk FinCloud Payment Gateway API (Dynamic QRIS).
@@ -141,8 +142,7 @@ class PaymentGatewayService {
             return true;
         }
 
-        console.error('[PaymentGatewayService] Webhook signature mismatch!');
-        console.error(`  Received: ${receivedSignature}`);
+        logger.warn('fincloud_webhook_signature_mismatch');
         return false;
     }
 
@@ -161,20 +161,18 @@ class PaymentGatewayService {
             } catch {
                 data = { msg: error.response.data };
             }
-            console.error(
-                `[PaymentGatewayService] ${context} — HTTP ${status}:`,
-                data
-            );
+            logger.error('fincloud_request_failed', {
+                context,
+                status,
+                message: data?.msg || data?.message || 'UNKNOWN_ERROR',
+            });
             return {
                 success: false,
                 status,
                 message: data?.msg || data?.message || 'UNKNOWN_ERROR',
             };
         }
-        console.error(
-            `[PaymentGatewayService] ${context} — Network error:`,
-            error.message
-        );
+        logger.error('fincloud_network_failed', { context, message: error.message });
         return {
             success: false,
             status: 0,
@@ -220,7 +218,7 @@ class PaymentGatewayService {
             const { res, json } = await this._post('/create_invoice', payload);
 
             if (!res.ok || !json.status) {
-                console.error('[PaymentGatewayService] createInvoice failed:', json);
+                logger.error('fincloud_create_invoice_failed', { status: res.status, message: json?.msg || json?.message });
                 return {
                     success: false,
                     status: res.status,
@@ -279,7 +277,7 @@ class PaymentGatewayService {
             const { res, json } = await this._post('/cek_status', payload);
 
             if (!res.ok) {
-                console.error('[PaymentGatewayService] checkInvoiceStatus HTTP error:', json);
+                logger.error('fincloud_status_check_failed', { status: res.status, message: json?.msg || json?.message });
                 return {
                     success: false,
                     status: res.status,
@@ -322,7 +320,7 @@ class PaymentGatewayService {
             const { res, json } = await this._post('/cancel_invoice', payload);
 
             if (!res.ok || !json.status) {
-                console.error('[PaymentGatewayService] cancelInvoice failed:', json);
+                logger.error('fincloud_cancel_invoice_failed', { status: res.status, message: json?.msg || json?.message });
                 return {
                     success: false,
                     status: res.status,
@@ -363,7 +361,7 @@ class PaymentGatewayService {
             });
 
             if (!res.ok || !json.status) {
-                console.error('[PaymentGatewayService] checkBalance failed:', json);
+                logger.error('fincloud_balance_check_failed', { status: res.status, message: json?.msg || json?.message });
                 return {
                     success: false,
                     status: res.status,

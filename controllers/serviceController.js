@@ -1,5 +1,7 @@
 const supabase = require('../supabase');
 const cacheService = require('../services/cacheService');
+const { toBigIntId } = require('../utils/dbIds');
+const { logger } = require('../utils/logger');
 
 /**
  * GET /api/services
@@ -15,22 +17,27 @@ async function list(req, res) {
         if (error) throw error;
         res.json(data);
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        logger.error('services_list_failed', { error: err });
+        res.status(500).json({ error: 'Gagal memuat layanan' });
     }
 }
 
 /**
  * GET /api/services/:id
  * Get a single service by ID.
- * Returns 404 for inactive services.
+ * Returns 404 for inactive services or non-numeric IDs.
  */
 async function getById(req, res) {
     try {
-        const { id } = req.params;
+        const serviceId = toBigIntId(req.params.id);
+        if (!serviceId) {
+            return res.status(404).json({ error: 'Layanan tidak ditemukan' });
+        }
+
         const { data, error } = await supabase
             .from('services')
             .select('*')
-            .eq('id', id)
+            .eq('id', serviceId)
             .maybeSingle();
 
         if (error) throw error;
@@ -39,7 +46,8 @@ async function getById(req, res) {
         }
         res.json({ ...data, is_service_table: true });
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        logger.error('service_detail_failed', { serviceId: req.params.id, error: err });
+        res.status(500).json({ error: 'Gagal memuat layanan' });
     }
 }
 
@@ -56,7 +64,8 @@ async function create(req, res) {
         cacheService.invalidateHome();
         res.json(data);
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        logger.error('service_create_failed', { error: err });
+        res.status(500).json({ error: 'Gagal membuat layanan' });
     }
 }
 
@@ -66,16 +75,21 @@ async function create(req, res) {
  */
 async function update(req, res) {
     try {
-        const { id } = req.params;
+        const serviceId = toBigIntId(req.params.id);
+        if (!serviceId) {
+            return res.status(400).json({ error: 'ID layanan tidak valid' });
+        }
+
         const { error } = await supabase
             .from('services')
             .update(req.body)
-            .eq('id', id);
+            .eq('id', serviceId);
         if (error) throw error;
         cacheService.invalidateHome();
         res.json({ success: true });
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        logger.error('service_update_failed', { serviceId: req.params.id, error: err });
+        res.status(500).json({ error: 'Gagal memperbarui layanan' });
     }
 }
 
@@ -85,16 +99,21 @@ async function update(req, res) {
  */
 async function remove(req, res) {
     try {
-        const { id } = req.params;
+        const serviceId = toBigIntId(req.params.id);
+        if (!serviceId) {
+            return res.status(400).json({ error: 'ID layanan tidak valid' });
+        }
+
         const { error } = await supabase
             .from('services')
             .delete()
-            .eq('id', id);
+            .eq('id', serviceId);
         if (error) throw error;
         cacheService.invalidateHome();
         res.json({ success: true });
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        logger.error('service_delete_failed', { serviceId: req.params.id, error: err });
+        res.status(500).json({ error: 'Gagal menghapus layanan' });
     }
 }
 

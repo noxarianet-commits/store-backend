@@ -1,6 +1,9 @@
 const supabase = require('../supabase');
 const vendorRegistry = require('./vendors/vendorRegistry');
 const { normalizeNotePhoneNumber } = require('../utils/phoneUtils');
+const { logger } = require('../utils/logger');
+
+const fulfillmentLog = logger.child({ job: 'order-fulfillment' });
 
 /**
  * Service to handle order fulfillment centrally.
@@ -86,15 +89,15 @@ class OrderFulfillmentService {
 
                 if (vRow?.products?.vendor) {
                     vendorName = vRow.products.vendor;
-                    console.log(`[OrderFulfillment] Auto-corrected vendor for order ${orderId} to '${vendorName}'.`);
+                    fulfillmentLog.info('vendor_auto_corrected', { orderId, vendor: vendorName });
                 }
             } catch (e) {
-                console.warn('[OrderFulfillment] Vendor auto-lookup warning:', e.message);
+                fulfillmentLog.warn('vendor_auto_lookup_failed', { orderId, message: e.message });
             }
         }
 
         if (!vendorName) vendorName = 'sekalipay';
-        console.log(`[OrderFulfillment] Claiming order ${orderId} for vendor '${vendorName}' (variant: ${variantId})...`);
+        fulfillmentLog.debug('claiming_order', { orderId, vendor: vendorName, variantId });
 
         try {
             // 1. Atomic Claim: UPDATE ... WHERE id = ? AND status = 'PENDING'
@@ -106,24 +109,24 @@ class OrderFulfillmentService {
                 .select('id');
 
             if (updateError) {
-                console.error(`[OrderFulfillment] Error during claim for order ${orderId}:`, updateError.message);
+                fulfillmentLog.error('claim_failed', { orderId, code: updateError.code, message: updateError.message });
                 return { success: false, message: 'Database error during claim' };
             }
 
             // 2. Skip if already claimed by another worker
             if (!updatedOrders || updatedOrders.length === 0) {
-                console.log(`[OrderFulfillment] Skip — order ${orderId} already claimed (status != PENDING).`);
+                fulfillmentLog.debug('order_already_claimed', { orderId });
                 return { success: true, skipped: true };
             }
 
-            console.log(`[OrderFulfillment] Claim success for order ${orderId}. Processing to ${vendorName}...`);
+            fulfillmentLog.info('claim_succeeded', { orderId, vendor: vendorName });
 
             // 3. Resolve Vendor Adapter
             let vendorAdapter;
             try {
                 vendorAdapter = vendorRegistry.get(vendorName);
             } catch (err) {
-                console.error(`[OrderFulfillment] ${err.message}`);
+                fulfillmentLog.error('vendor_adapter_missing', { orderId, vendor: vendorName, message: err.message });
                 await supabase
                     .from('orders')
                     .update({ status: 'FAILED', error_message: `Vendor ${vendorName} tidak didukung` })
@@ -134,6 +137,7 @@ class OrderFulfillmentService {
             if (!variantId) {
                 const errMsg = 'variant_id / sku tidak ditemukan di order';
                 await supabase.from('orders').update({ status: 'FAILED', error_message: errMsg }).eq('id', orderId);
+                fulfillmentLog.error('variant_missing', { orderId, vendor: vendorName });
                 return { success: false, message: errMsg };
             }
 
@@ -144,7 +148,7 @@ class OrderFulfillmentService {
 
             if (!vendorResult.success) {
                 const errMsg = vendorResult.message || `Pesanan gagal di vendor ${vendorName}`;
-                console.error(`[OrderFulfillment] Order ${orderId} failed on ${vendorName}:`, errMsg);
+                fulfillmentLog.error('vendor_order_failed', { orderId, vendor: vendorName, message: errMsg });
 
                 await supabase
                     .from('orders')
@@ -160,7 +164,7 @@ class OrderFulfillmentService {
             const vendorOrderId = vendorResult.vendorOrderId || vendorResult.data?.ref_id || orderId;
             const vendorInvoice = vendorResult.invoice || vendorResult.data?.invoice || null;
 
-            console.log(`[OrderFulfillment] Order ${orderId} processed on ${vendorName}. (Vendor Ref: ${vendorOrderId})`);
+            fulfillmentLog.info('vendor_order_created', { orderId, vendor: vendorName, vendorOrderId });
 
             const sn = vendorResult.sn || null;
             const updatedAccountDetails = {
@@ -184,7 +188,7 @@ class OrderFulfillmentService {
 
 
         } catch (err) {
-            console.error(`[OrderFulfillment] Exception processing order ${orderId}:`, err);
+            fulfillmentLog.error('order_fulfillment_exception', { orderId, error: err });
             await supabase
                 .from('orders')
                 .update({ status: 'FAILED', error_message: err.message })

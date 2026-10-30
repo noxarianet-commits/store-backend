@@ -16,6 +16,7 @@ router.get('/balance', adminProductController.getBalance);
 // Products & Variants CRUD / Management
 router.get('/products', adminProductController.getProducts);
 router.get('/featured', adminProductController.getFeatured);
+router.get('/featured-options', adminProductController.getFeaturedOptions);
 router.patch('/products/:id/markup', adminProductController.updateMarkup);
 router.patch('/products/:id/toggle', adminProductController.toggleActive);
 router.patch('/products/:id/featured', adminProductController.toggleFeatured);

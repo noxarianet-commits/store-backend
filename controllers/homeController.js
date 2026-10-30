@@ -1,6 +1,9 @@
 const supabase = require('../supabase');
 const cacheService = require('../services/cacheService');
+const { getActiveCatalog } = require('../services/catalogService');
 const { groupProducts } = require('../utils/productGrouping');
+const { buildPublicSettings } = require('../utils/publicSettings');
+const { logger } = require('../utils/logger');
 
 /**
  * Generate URL-friendly slug from text.
@@ -43,8 +46,8 @@ async function getHomePage(req, res) {
 
         res.json(responseData);
     } catch (err) {
-        console.error('[HomeController] getHomePage error:', err.message);
-        res.status(500).json({ error: err.message });
+        logger.error('home_page_failed', { error: err });
+        res.status(500).json({ error: 'Gagal memuat halaman utama' });
     }
 }
 
@@ -54,13 +57,8 @@ async function getHomePage(req, res) {
  */
 async function fetchHomePageData() {
     // Fetch all data in parallel
-    const [productsResult, servicesResult, testimonialsResult, settingsResult] = await Promise.all([
-        supabase
-            .from('products')
-            .select('*, product_variants(*)')
-            .eq('is_active', true)
-            .order('category', { ascending: true })
-            .order('name', { ascending: true }),
+    const [products, servicesResult, testimonialsResult, settingsResult] = await Promise.all([
+        getActiveCatalog(),
         supabase
             .from('services')
             .select('id, category, name, icon, image, subtitle, features, variants, is_active, created_at')
@@ -76,25 +74,18 @@ async function fetchHomePageData() {
             .select('key, value'),
     ]);
 
-    if (productsResult.error) throw productsResult.error;
     if (servicesResult.error) throw servicesResult.error;
     if (testimonialsResult.error) throw testimonialsResult.error;
     if (settingsResult.error) throw settingsResult.error;
 
-    // Process settings (filter sensitive keys)
-    const settingsMap = {
+    // Only allowlisted public settings are exposed. Secrets such as gateway
+    // credentials must never be returned by /api/home.
+    const settingsMap = buildPublicSettings(settingsResult.data, {
         shop_status: { isOpen: true, message: 'Selamat datang!' },
-    };
-    if (settingsResult.data) {
-        settingsResult.data.forEach(s => {
-            if (s.key !== 'admin_auth' && !s.key.endsWith('_last_sync')) {
-                settingsMap[s.key] = s.value;
-            }
-        });
-    }
+    });
 
     // Deduplicate and group products across multiple vendors
-    const rawProducts = productsResult.data || [];
+    const rawProducts = products || [];
     const dedupedProducts = groupProducts(rawProducts);
 
     // Build categories from deduplicated products
@@ -182,14 +173,8 @@ async function getCategoryProducts(req, res) {
             return res.json(responseData);
         }
 
-        // Regular product category — find by matching slug
-        const { data: allProducts, error } = await supabase
-            .from('products')
-            .select('*, product_variants(*)')
-            .eq('is_active', true)
-            .order('name', { ascending: true });
-
-        if (error) throw error;
+        // Regular product category — find by matching slug in the cached public catalog.
+        const allProducts = await getActiveCatalog();
 
         // Find products whose category slugifies to the requested slug
         const matchingProducts = (allProducts || []).filter(
@@ -215,8 +200,8 @@ async function getCategoryProducts(req, res) {
         cacheService.set(cacheKey, responseData, 300);
         res.json(responseData);
     } catch (err) {
-        console.error('[HomeController] getCategoryProducts error:', err.message);
-        res.status(500).json({ error: err.message });
+        logger.error('home_category_failed', { slug: req.params.slug, error: err });
+        res.status(500).json({ error: 'Gagal memuat kategori' });
     }
 }
 

@@ -29,6 +29,7 @@
 
 const nodemailer = require('nodemailer');
 const supabase = require('../supabase');
+const { maskEmail } = require('../utils/logger');
 const {
     buildCompletedEmailHtml,
     buildFailedEmailHtml,
@@ -260,10 +261,10 @@ async function sendViaMailketing({ to, subject, html }) {
 async function tryBrevo(brevoSmtp, mailOptions, to, context) {
     if (!brevoSmtp || isBrevoInCooldown()) return null;
 
-    console.log(`[EmailService] Mengirim via Brevo SMTP (${context}) ke ${to}...`);
+    console.log(`[EmailService] Mengirim via Brevo SMTP (${context}) ke ${maskEmail(to)}...`);
     try {
         const info = await brevoSmtp.sendMail(mailOptions);
-        console.log(`[EmailService] Email terkirim via Brevo (${context}) ke ${to} — messageId: ${info.messageId}`);
+        console.log(`[EmailService] Email terkirim via Brevo (${context}) ke ${maskEmail(to)} — messageId: ${info.messageId}`);
         return { success: true, messageId: info.messageId, provider: 'brevo', fallback: context !== 'primary' };
     } catch (brevoErr) {
         const isLimit = LIMIT_ERROR_PATTERN.test(brevoErr.message || '');
@@ -271,7 +272,7 @@ async function tryBrevo(brevoSmtp, mailOptions, to, context) {
             console.warn(`[EmailService] Brevo limit/quota terdeteksi (${brevoErr.message}).`);
             markBrevoCooldown(brevoErr.message);
         } else {
-            console.warn(`[EmailService] Gagal kirim via Brevo (${context}) ke ${to}: ${brevoErr.message}`);
+            console.warn(`[EmailService] Gagal kirim via Brevo (${context}) ke ${maskEmail(to)}: ${brevoErr.message}`);
         }
         return null; // signal: lanjut ke provider berikutnya
     }
@@ -289,17 +290,17 @@ async function tryBrevo(brevoSmtp, mailOptions, to, context) {
 async function tryMailketing({ to, subject, html }, context) {
     if (!isMailketingConfigured()) return null;
 
-    console.log(`[EmailService] Mengirim via Mailketing API (${context}) ke ${to}...`);
+    console.log(`[EmailService] Mengirim via Mailketing API (${context}) ke ${maskEmail(to)}...`);
     try {
         const result = await sendViaMailketing({ to, subject, html });
         if (result.success) {
-            console.log(`[EmailService] Email terkirim via Mailketing (${context}) ke ${to} — messageId: ${result.messageId}`);
+            console.log(`[EmailService] Email terkirim via Mailketing (${context}) ke ${maskEmail(to)} — messageId: ${result.messageId}`);
             return { success: true, messageId: result.messageId, provider: 'mailketing', fallback: true };
         }
-        console.warn(`[EmailService] Mailketing API gagal (${context}) ke ${to}: ${result.error}`);
+        console.warn(`[EmailService] Mailketing API gagal (${context}) ke ${maskEmail(to)}: ${result.error}`);
         return null;
     } catch (mkErr) {
-        console.error(`[EmailService] Mailketing API error (${context}) ke ${to}:`, mkErr.message);
+        console.error(`[EmailService] Mailketing API error (${context}) ke ${maskEmail(to)}:`, mkErr.message);
         return null;
     }
 }
@@ -340,7 +341,7 @@ async function sendEmail({ to, subject, html }) {
     if (resendSmtp && !isResendInCooldown()) {
         try {
             const info = await resendSmtp.sendMail(mailOptions);
-            console.log(`[EmailService] Email terkirim via Resend ke ${to} — messageId: ${info.messageId}`);
+            console.log(`[EmailService] Email terkirim via Resend ke ${maskEmail(to)} — messageId: ${info.messageId}`);
             return { success: true, messageId: info.messageId, provider: 'resend' };
         } catch (resendErr) {
             const isLimit = LIMIT_ERROR_PATTERN.test(resendErr.message || '');
@@ -373,7 +374,7 @@ async function sendEmail({ to, subject, html }) {
     const errorSummary = errors.length
         ? errors.join(' | ')
         : 'Semua provider gagal atau tidak terkonfigurasi';
-    console.error(`[EmailService] Semua provider gagal mengirim email ke ${to}: ${errorSummary}`);
+    console.error(`[EmailService] Semua provider gagal mengirim email ke ${maskEmail(to)}: ${errorSummary}`);
     return { success: false, error: errorSummary };
 }
 

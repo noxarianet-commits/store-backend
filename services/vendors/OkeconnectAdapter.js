@@ -3,6 +3,9 @@ const axios = require('axios');
 const EventEmitter = require('events');
 const cacheService = require('../cacheService');
 const { normalizePhoneNumber } = require('../../utils/phoneUtils');
+const { logger } = require('../../utils/logger');
+
+const okeLog = logger.child({ job: 'okeconnect' });
 
 /**
  * Helper to slugify text for external_id generation.
@@ -204,7 +207,7 @@ class OkeconnectAdapter extends VendorAdapter {
      */
     async fetchProducts(params = {}) {
         try {
-            console.log(`[OkeconnectAdapter] Fetching price list from ${this.priceListUrl}?id=${this.priceListId}&produk=saldo_gojek,digital...`);
+            okeLog.debug('price_list_request', { priceListId: this.priceListId });
             const res = await axios.get(this.priceListUrl, {
                 params: {
                     id: this.priceListId,
@@ -386,7 +389,7 @@ class OkeconnectAdapter extends VendorAdapter {
                 });
             }
 
-            console.log(`[OkeconnectAdapter] Successfully parsed ${normalizedProducts.length} product groups (${rawItems.length} total variants).`);
+            okeLog.info('price_list_parsed', { productGroups: normalizedProducts.length, variants: rawItems.length });
 
             return {
                 success: true,
@@ -394,7 +397,7 @@ class OkeconnectAdapter extends VendorAdapter {
                 serverTime: new Date().toISOString(),
             };
         } catch (error) {
-            console.error('[OkeconnectAdapter] fetchProducts error:', error.message);
+            okeLog.error('price_list_fetch_failed', { error });
             return {
                 success: false,
                 message: error.message,
@@ -474,7 +477,7 @@ class OkeconnectAdapter extends VendorAdapter {
 
             return result;
         } catch (error) {
-            console.error('[OkeconnectAdapter] getBalance error:', error.message);
+            okeLog.error('balance_fetch_failed', { error });
             return {
                 success: false,
                 message: error.message,
@@ -597,14 +600,14 @@ class OkeconnectAdapter extends VendorAdapter {
         const cacheKey = cacheService.KEYS.ACCOUNT_VALIDATION('okeconnect', `${inqCode}_${dest}`);
         const cached = cacheService.get(cacheKey);
         if (cached !== undefined) {
-            console.log(`[OkeconnectAdapter] Cache hit for account validation: ${dest}`);
+            okeLog.debug('account_validation_cache_hit');
             return cached;
         }
 
         try {
             const tempRefId = `INQ${Date.now().toString(36).toUpperCase()}`;
 
-            console.log(`[OkeconnectAdapter] Validating account with code=${inqCode}, dest=${dest}, refID=${tempRefId}...`);
+            okeLog.debug('account_validation_started', { inqCode, refId: tempRefId });
 
             // Setup a Promise to wait for callback with optimized 4s timeout
             const waitForCallback = new Promise((resolve) => {
@@ -628,7 +631,7 @@ class OkeconnectAdapter extends VendorAdapter {
             });
 
             const text = String(res.data || '').trim();
-            console.log(`[OkeconnectAdapter] Inquiry response for ${dest}:`, text);
+            okeLog.debug('account_validation_response_received', { inqCode });
 
             const initialParsed = parseStatusAndSn(text);
 
@@ -638,13 +641,13 @@ class OkeconnectAdapter extends VendorAdapter {
 
             // If initial response is pending / "akan diproses", wait for webhook callback or poll
             if (finalStatus === 'pending' || text.includes('akan diproses') || text.includes('Menunggu Jawaban')) {
-                console.log(`[OkeconnectAdapter] Waiting for inquiry callback for ${tempRefId}...`);
+                okeLog.debug('account_validation_waiting_callback', { refId: tempRefId });
                 const callbackEvent = await waitForCallback;
                 if (callbackEvent) {
                     finalText = callbackEvent.message || finalText;
                     finalStatus = callbackEvent.status;
                     finalSn = callbackEvent.sn;
-                    console.log(`[OkeconnectAdapter] Inquiry callback received for ${tempRefId}: status=${finalStatus}, sn=${finalSn}`);
+                    okeLog.debug('account_validation_callback_received', { refId: tempRefId, status: finalStatus });
                 } else {
                     // Quick poll fallback if callback didn't arrive in time
                     try {
@@ -694,7 +697,7 @@ class OkeconnectAdapter extends VendorAdapter {
 
             return result;
         } catch (error) {
-            console.warn('[OkeconnectAdapter] validateAccount error:', error.message);
+            okeLog.warn('account_validation_failed', { error });
             return {
                 success: false,
                 valid: false,
@@ -751,12 +754,12 @@ class OkeconnectAdapter extends VendorAdapter {
                 params.qty = parseInt(qty);
             }
 
-            console.log(`[OkeconnectAdapter] Creating order refID=${refId}, product=${product}, dest=${dest}...`);
+            okeLog.info('order_create_started', { refId, product });
 
             const res = await this.client.get('/trx', { params });
             const text = String(res.data || '').trim();
 
-            console.log(`[OkeconnectAdapter] Response for refID=${refId}:`, text);
+            okeLog.debug('order_create_response_received', { refId });
 
             const isFailed = text.includes('GAGAL') ||
                              text.includes('Pin Salah') ||
@@ -798,7 +801,7 @@ class OkeconnectAdapter extends VendorAdapter {
                 },
             };
         } catch (error) {
-            console.error(`[OkeconnectAdapter] createOrder error:`, error.message);
+            okeLog.error('order_create_failed', { refId, error });
             return {
                 success: false,
                 message: error.message || 'Gagal membuat transaksi di OkeConnect',
@@ -843,7 +846,7 @@ class OkeconnectAdapter extends VendorAdapter {
                 },
             };
         } catch (error) {
-            console.error(`[OkeconnectAdapter] checkOrderStatus error:`, error.message);
+            okeLog.error('order_status_check_failed', { refId, error });
             return {
                 success: false,
                 message: error.message,

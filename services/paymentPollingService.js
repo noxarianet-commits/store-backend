@@ -6,6 +6,10 @@ const orderFulfillmentService = require('./orderFulfillmentService');
 const { normalizeNotePhoneNumber } = require('../utils/phoneUtils');
 const vendorRegistry = require('./vendors/vendorRegistry');
 const emailService = require('./emailService');
+const { logger } = require('../utils/logger');
+const { withReadRetry, isTransientError } = require('../utils/dbRetry');
+
+const pollingLog = logger.child({ job: 'payment-polling' });
 
 /**
  * Service untuk mem-polling status pembayaran dari Sekalipay Gateway, FinCloud, dan Dyqris
@@ -14,68 +18,74 @@ const emailService = require('./emailService');
 class PaymentPollingService {
     async pollPendingOrders() {
         try {
-            console.log('[Polling/PG] Memulai pengecekan status pending orders...');
-            
-            // Cari order PENDING yang menggunakan QRIS dan punya pg_invoice
-            // Batasi misalnya order yang dibuat maksimal 24 jam terakhir agar tidak berat
+            // Only routing fields are needed here. The full order is re-read
+            // after the gateway confirms payment, right before fulfillment.
             const yesterday = new Date();
             yesterday.setHours(yesterday.getHours() - 24);
 
-            const { data: orders, error } = await supabase
-                .from('orders')
-                .select('*')
-                .eq('status', 'PENDING')
-                .eq('payment_method', 'QRIS')
-                .not('pg_invoice', 'is', null)
-                .gte('timestamp', yesterday.toISOString());
+            const { data: orders, error } = await withReadRetry(async () => {
+                const result = await supabase
+                    .from('orders')
+                    .select('id, status, payment_method, pg_provider, pg_invoice, dyqris_ref_id, timestamp')
+                    .eq('status', 'PENDING')
+                    .eq('payment_method', 'QRIS')
+                    .not('pg_invoice', 'is', null)
+                    .gte('timestamp', yesterday.toISOString())
+                    .limit(100);
 
+                if (result.error && isTransientError(result.error)) throw result.error;
+                return result;
+            });
 
             if (error) {
-                console.error('[Polling/PG] Gagal mengambil pending orders:', error.message);
+                pollingLog.error('pending_order_query_failed', { code: error.code });
                 return;
             }
 
             if (!orders || orders.length === 0) {
-                console.log('[Polling/PG] Tidak ada pending orders untuk diproses.');
                 return;
             }
 
-            console.log(`[Polling/PG] Ditemukan ${orders.length} order PENDING.`);
+            pollingLog.info('pending_orders_found', { count: orders.length });
+            if (orders.length === 100) {
+                pollingLog.warn('pending_order_batch_limit_reached', { limit: 100 });
+            }
 
-            // Proses setiap order berdasarkan pg_provider
             for (const order of orders) {
                 await this.processOrder(order);
             }
-
-            console.log('[Polling/PG] Pengecekan selesai.');
         } catch (err) {
-            console.error('[Polling/PG] Error dalam proses polling:', err);
+            pollingLog.error('pending_order_poll_failed', { error: err });
         }
     }
 
     async pollPendingTopups() {
         try {
-            console.log('[Polling/PG] Memulai pengecekan status pending topups...');
-            
             const yesterday = new Date();
             yesterday.setHours(yesterday.getHours() - 24);
 
-            const { data: topups, error } = await supabase
-                .from('balance_transactions')
-                .select('*')
-                .eq('status', 'pending')
-                .not('pg_invoice', 'is', null)
-                .gte('created_at', yesterday.toISOString());
+            const { data: topups, error } = await withReadRetry(async () => {
+                const result = await supabase
+                    .from('balance_transactions')
+                    .select('*')
+                    .eq('status', 'pending')
+                    .not('pg_invoice', 'is', null)
+                    .gte('created_at', yesterday.toISOString())
+                    .limit(100);
+
+                if (result.error && isTransientError(result.error)) throw result.error;
+                return result;
+            });
 
             if (error) {
-                console.error('[Polling/PG] Gagal mengambil pending topups:', error.message);
+                pollingLog.error('pending_topup_query_failed', { code: error.code });
                 return;
             }
 
             if (!topups || topups.length === 0) {
                 return;
             }
-            
+
             const balanceService = require('./balanceService');
 
             for (const tx of topups) {
@@ -104,28 +114,32 @@ class PaymentPollingService {
                         else if (s === 'EXPIRED' || s === 'CANCELLED') isExpired = true;
                     }
                 } catch (pgError) {
-                    console.error(`Error polling status for topup ${tx.reference_id}:`, pgError.message);
+                    pollingLog.error('topup_status_check_failed', {
+                        referenceId: tx.reference_id,
+                        message: pgError.message,
+                    });
                 }
 
                 if (isPaid) {
                     try {
                         const creditRes = await balanceService.creditTopup(tx);
                         if (creditRes?.alreadyProcessed) {
-                            // Sering terjadi: webhook sudah lebih duluan. Ini normal,
-                            // creditTopup yang idempoten jadi tidak ada kredit ganda.
-                            console.log(`[Polling/PG] Topup ${tx.reference_id} sudah dikreditkan sebelumnya, dilewati.`);
+                            pollingLog.debug('topup_already_credited', { referenceId: tx.reference_id });
                         } else {
-                            console.log(`[Polling/PG] Topup ${tx.reference_id} berhasil dikreditkan via polling.`);
+                            pollingLog.info('topup_credited_via_polling', { referenceId: tx.reference_id });
                         }
                     } catch (creditErr) {
-                        console.error('Error crediting balance for topup:', creditErr);
+                        pollingLog.error('topup_credit_failed', {
+                            referenceId: tx.reference_id,
+                            error: creditErr,
+                        });
                     }
                 } else if (isExpired || isTimeout) {
                     await supabase.from('balance_transactions').update({ status: 'cancelled' }).eq('id', tx.id);
                 }
             }
         } catch (err) {
-            console.error('[Polling/PG] Error dalam proses polling topups:', err);
+            pollingLog.error('pending_topup_poll_failed', { error: err });
         }
     }
 
@@ -150,7 +164,7 @@ class PaymentPollingService {
         const orderId = order.id;
 
         if (!refId) {
-            console.warn(`[Polling/PG-Dyqris] Order ${orderId} tidak memiliki dyqris_ref_id valid, skip polling API.`);
+            pollingLog.warn('dyqris_missing_reference', { orderId });
             return;
         }
 
@@ -165,7 +179,7 @@ class PaymentPollingService {
                 return;
             }
 
-            console.log(`[Polling/PG-Dyqris] Order ${orderId} ternyata sudah PAID (ref=${refId}). Memproses...`);
+            pollingLog.info('dyqris_order_paid', { orderId, refId });
 
             const { data: currentOrder } = await supabase
                 .from('orders')
@@ -174,7 +188,7 @@ class PaymentPollingService {
                 .single();
 
             if (currentOrder && currentOrder.status !== 'PENDING') {
-                console.log(`[Polling/PG-Dyqris] Order ${orderId} sudah diproses. Skip.`);
+                pollingLog.debug('dyqris_order_already_processed', { orderId });
                 return;
             }
 
@@ -186,12 +200,12 @@ class PaymentPollingService {
             const fulfillmentResult = await orderFulfillmentService.fulfillOrder(currentOrder);
 
             if (!fulfillmentResult.success && !fulfillmentResult.skipped) {
-                console.error(`[Polling/PG-Dyqris] Fulfillment order gagal untuk ${orderId}:`, fulfillmentResult.message);
+                pollingLog.error('dyqris_fulfillment_failed', { orderId, message: fulfillmentResult.message });
             } else if (fulfillmentResult.success && !fulfillmentResult.skipped) {
-                console.log(`[Polling/PG-Dyqris] Order ${orderId} berhasil diproses via polling.`);
+                pollingLog.info('dyqris_order_fulfilled', { orderId });
             }
         } catch (err) {
-            console.error(`[Polling/PG-Dyqris] Error memproses order ${orderId}:`, err);
+            pollingLog.error('dyqris_order_process_failed', { orderId, error: err });
         }
     }
 
@@ -204,7 +218,7 @@ class PaymentPollingService {
         const orderId = order.id;
 
         if (!refId) {
-            console.warn(`[Polling/PG-Sekalipay] Order ${orderId} tidak memiliki ref_id valid, skip polling API.`);
+            pollingLog.warn('sekalipay_missing_reference', { orderId });
             return;
         }
 
@@ -220,7 +234,7 @@ class PaymentPollingService {
                 return;
             }
 
-            console.log(`[Polling/PG-Sekalipay] Order ${orderId} ternyata sudah PAID (ref=${refId}). Memproses...`);
+            pollingLog.info('sekalipay_order_paid', { orderId, refId });
 
             const { data: currentOrder } = await supabase
                 .from('orders')
@@ -228,8 +242,13 @@ class PaymentPollingService {
                 .eq('id', orderId)
                 .single();
 
-            if (currentOrder && currentOrder.status !== 'PENDING') {
-                console.log(`[Polling/PG-Sekalipay] Order ${orderId} sudah diproses. Skip.`);
+            if (!currentOrder) {
+                pollingLog.warn('sekalipay_order_missing_after_paid', { orderId });
+                return;
+            }
+
+            if (currentOrder.status !== 'PENDING') {
+                pollingLog.debug('sekalipay_order_already_processed', { orderId });
                 return;
             }
 
@@ -241,12 +260,12 @@ class PaymentPollingService {
             const fulfillmentResult = await orderFulfillmentService.fulfillOrder(currentOrder);
 
             if (!fulfillmentResult.success && !fulfillmentResult.skipped) {
-                console.error(`[Polling/PG-Sekalipay] Fulfillment order gagal untuk ${orderId}:`, fulfillmentResult.message);
+                pollingLog.error('sekalipay_fulfillment_failed', { orderId, message: fulfillmentResult.message });
             } else if (fulfillmentResult.success && !fulfillmentResult.skipped) {
-                console.log(`[Polling/PG-Sekalipay] Order ${orderId} berhasil diproses via polling.`);
+                pollingLog.info('sekalipay_order_fulfilled', { orderId });
             }
         } catch (err) {
-            console.error(`[Polling/PG-Sekalipay] Error memproses order ${orderId}:`, err);
+            pollingLog.error('sekalipay_order_process_failed', { orderId, error: err });
         }
     }
 
@@ -268,7 +287,7 @@ class PaymentPollingService {
             const apiStatus = String(checkResult.data.status || '').toLowerCase();
 
             if (apiStatus === 'expired' || apiStatus === 'cancelled') {
-                console.log(`[Polling/PG-FinCloud] Order ${reffId} berstatus ${apiStatus}. Menandai CANCELLED.`);
+                pollingLog.info('fincloud_order_expired', { orderId: reffId, apiStatus });
                 await supabase
                     .from('orders')
                     .update({ status: 'CANCELLED', error_message: `Tagihan ${apiStatus} di FinCloud` })
@@ -282,7 +301,7 @@ class PaymentPollingService {
                 return;
             }
 
-            console.log(`[Polling/PG-FinCloud] Order ${reffId} ternyata sudah sukses dibayar (status=${apiStatus}). Memproses...`);
+            pollingLog.info('fincloud_order_paid', { orderId: reffId, apiStatus });
 
             // Pastikan belum diproses secara bersamaan oleh webhook
             const { data: currentOrder } = await supabase
@@ -291,8 +310,13 @@ class PaymentPollingService {
                 .eq('id', reffId)
                 .single();
 
-            if (currentOrder && currentOrder.status !== 'PENDING') {
-                console.log(`[Polling/PG-FinCloud] Order ${reffId} sudah diproses oleh webhook. Skip.`);
+            if (!currentOrder) {
+                pollingLog.warn('fincloud_order_missing_after_paid', { orderId: reffId });
+                return;
+            }
+
+            if (currentOrder.status !== 'PENDING') {
+                pollingLog.debug('fincloud_order_already_processed', { orderId: reffId });
                 return;
             }
 
@@ -306,12 +330,12 @@ class PaymentPollingService {
             const fulfillmentResult = await orderFulfillmentService.fulfillOrder(currentOrder);
 
             if (!fulfillmentResult.success && !fulfillmentResult.skipped) {
-                console.error(`[Polling/PG-FinCloud] Fulfillment order gagal untuk ${reffId}:`, fulfillmentResult.message);
+                pollingLog.error('fincloud_fulfillment_failed', { orderId: reffId, message: fulfillmentResult.message });
             } else if (fulfillmentResult.success && !fulfillmentResult.skipped) {
-                console.log(`[Polling/PG-FinCloud] Order ${reffId} berhasil diproses via polling.`);
+                pollingLog.info('fincloud_order_fulfilled', { orderId: reffId });
             }
         } catch (err) {
-            console.error(`[Polling/PG-FinCloud] Error memproses order ${reffId}:`, err);
+            pollingLog.error('fincloud_order_process_failed', { orderId: reffId, error: err });
         }
     }
 
@@ -329,15 +353,15 @@ class PaymentPollingService {
                 .select('id');
 
             if (error) {
-                console.error('[Polling/PG] Gagal update status order expired:', error.message);
+                pollingLog.error('expired_order_update_failed', { code: error.code });
                 return;
             }
 
             if (orders && orders.length > 0) {
-                console.log(`[Polling/PG] Berhasil membatalkan ${orders.length} order kedaluwarsa (> 30 menit).`);
+                pollingLog.info('expired_orders_cancelled', { count: orders.length });
             }
         } catch (err) {
-            console.error('[Polling/PG] Error dalam membatalkan order kedaluwarsa:', err);
+            pollingLog.error('expired_order_sweep_failed', { error: err });
         }
     }
 
@@ -357,15 +381,15 @@ class PaymentPollingService {
                 .select('id, reference_id');
 
             if (error) {
-                console.error('[Polling/PG] Gagal update status topup expired:', error.message);
+                pollingLog.error('expired_topup_update_failed', { code: error.code });
                 return;
             }
 
             if (topups && topups.length > 0) {
-                console.log(`[Polling/PG] Berhasil membatalkan ${topups.length} transaksi top-up kedaluwarsa (> 30 menit).`);
+                pollingLog.info('expired_topups_cancelled', { count: topups.length });
             }
         } catch (err) {
-            console.error('[Polling/PG] Error dalam membatalkan top-up kedaluwarsa:', err);
+            pollingLog.error('expired_topup_sweep_failed', { error: err });
         }
     }
 

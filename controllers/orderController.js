@@ -136,7 +136,7 @@ async function create(req, res) {
         const customerWA = orderData.wa_number || req.body.wa_number || 'Customer';
 
         if (rawTestimonial && rawTestimonial !== '-' && rawTestimonial !== '') {
-            console.log('Menyimpan Testimoni Baru dari:', customerWA);
+            console.log('Menyimpan testimoni baru untuk order:', orderData.id);
             const productName = orderData.product || '';
             const testiText = productName ? `${rawTestimonial} (${productName})` : rawTestimonial;
             const { error: testiError } = await supabase.from('testimonials').insert([{

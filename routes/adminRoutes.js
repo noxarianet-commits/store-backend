@@ -2,6 +2,7 @@ const express = require('express');
 const rateLimit = require('express-rate-limit');
 const router = express.Router();
 const adminController = require('../controllers/adminController');
+const settingsController = require('../controllers/settingsController');
 const verifyAdmin = require('../middleware/verifyAdmin');
 
 // Login rate limiter: only 5 attempts per 15 minutes
@@ -16,6 +17,9 @@ router.post('/login', loginLimiter, adminController.login);
 
 // PUT /api/admin/password — protected
 router.put('/password', verifyAdmin, adminController.changePassword);
+
+// Settings — full map for the admin dashboard (public /api/settings is allowlisted)
+router.get('/settings', verifyAdmin, settingsController.listAdmin);
 
 // User Management Routes — protected
 router.get('/users', verifyAdmin, adminController.getUsers);

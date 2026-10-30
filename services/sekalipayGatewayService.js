@@ -1,6 +1,7 @@
 const axios = require('axios');
 const crypto = require('crypto');
 const supabase = require('../supabase');
+const { logger } = require('../utils/logger');
 
 /**
  * SekalipayGatewayService — Client untuk Sekalipay Payment Gateway API.
@@ -63,7 +64,7 @@ class SekalipayGatewayService {
                 }
             }
         } catch (err) {
-            console.error('[SekalipayGatewayService] Error reading config from DB:', err.message);
+            logger.error('sekalipay_config_read_failed', { message: err.message });
         }
 
         return { baseURL, apiKey, secretKey, merchantCode, paymentCode };
@@ -101,7 +102,7 @@ class SekalipayGatewayService {
             if (bufReceived.length !== bufExpected.length) return false;
             return crypto.timingSafeEqual(bufReceived, bufExpected);
         } catch (err) {
-            console.error('[SekalipayGatewayService] Signature verification error:', err.message);
+            logger.error('sekalipay_signature_verification_failed', { message: err.message });
             return false;
         }
     }
@@ -163,7 +164,7 @@ class SekalipayGatewayService {
         const signature = this.generateSignature(rawBody, secretKey);
 
         try {
-            console.log(`[SekalipayGatewayService] Creating payment (${chosenPaymentCode}) for ref=${merchant_ref_id}, amount=${amount}`);
+            logger.info('sekalipay_payment_creating', { merchantRefId: merchant_ref_id, amount, paymentCode: chosenPaymentCode });
 
             const response = await axios.post(`${baseURL}/payment`, rawBody, {
                 headers: {
@@ -189,7 +190,10 @@ class SekalipayGatewayService {
             };
         } catch (err) {
             const errData = err.response?.data;
-            console.error('[SekalipayGatewayService] createPayment error:', JSON.stringify(errData, null, 2) || err.message);
+            logger.error('sekalipay_create_payment_failed', {
+                merchantRefId: merchant_ref_id,
+                message: errData?.message || errData?.error || err.message,
+            });
 
             const errorMsg = errData?.message || errData?.error || err.message || 'Error koneksi ke API Sekalipay Gateway';
             return {
@@ -233,7 +237,7 @@ class SekalipayGatewayService {
                 return order.id;
             }
         } catch (dbErr) {
-            console.warn('[SekalipayGatewayService] resolveMerchantRefId DB lookup warning:', dbErr.message);
+            logger.warn('sekalipay_merchant_ref_lookup_failed', { message: dbErr.message });
         }
 
         return trimmed;
@@ -260,7 +264,7 @@ class SekalipayGatewayService {
         if (/^(SPY|INV[\/_])/i.test(targetRefId)) {
             const resolved = await this.resolveMerchantRefId(targetRefId);
             if (resolved && resolved !== targetRefId) {
-                console.log(`[SekalipayGatewayService] Resolving invoice ${targetRefId} -> merchant_ref_id: ${resolved}`);
+                logger.debug('sekalipay_invoice_resolved', { invoice: targetRefId, merchantRefId: resolved });
                 targetRefId = resolved;
             }
         }
@@ -291,7 +295,7 @@ class SekalipayGatewayService {
             if (targetRefId === merchantRefId && (errData?.message === 'PAYMENT_NOT_FOUND' || err.response?.status === 404)) {
                 const resolved = await this.resolveMerchantRefId(merchantRefId);
                 if (resolved && resolved !== merchantRefId) {
-                    console.log(`[SekalipayGatewayService] Fallback resolving invoice ${merchantRefId} -> merchant_ref_id: ${resolved}`);
+                    logger.debug('sekalipay_invoice_fallback_resolved', { invoice: merchantRefId, merchantRefId: resolved });
                     try {
                         const retryResponse = await axios.get(`${baseURL}/payment/${encodeURIComponent(resolved)}`, {
                             headers: {
@@ -307,13 +311,17 @@ class SekalipayGatewayService {
                             };
                         }
                     } catch (retryErr) {
-                        console.error(`[SekalipayGatewayService] Retry checkPaymentStatus(${resolved}) error:`, retryErr.response?.data || retryErr.message);
+                        logger.error('sekalipay_status_retry_failed', { merchantRefId: resolved, message: retryErr.message });
                     }
                 }
             }
 
             const errorMsg = errData?.message || errData?.error || err.message;
-            console.error(`[SekalipayGatewayService] checkPaymentStatus(${merchantRefId}) error:`, errData || err.message);
+            logger.error('sekalipay_status_check_failed', {
+                merchantRefId,
+                message: errorMsg,
+                status: err.response?.status,
+            });
             return { success: false, message: errorMsg };
         }
     }

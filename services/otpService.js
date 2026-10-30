@@ -14,6 +14,7 @@
 
 const crypto = require('crypto');
 const supabase = require('../supabase');
+const { maskEmail } = require('../utils/logger');
 
 const CODE_LENGTH = 6;
 const DEFAULT_TTL_MINUTES = 10;
@@ -132,7 +133,7 @@ async function generateOtp({
 
         if (error) throw error;
 
-        console.log(`[OtpService] OTP dibuat untuk ${purpose} → ${mail} (kedaluwarsa ${expiresAt.toISOString()})`);
+        console.log(`[OtpService] OTP dibuat untuk ${purpose} → ${maskEmail(mail)} (kedaluwarsa ${expiresAt.toISOString()})`);
 
         return {
             ok: true,
@@ -250,11 +251,11 @@ async function consumeFailedAttempt(otp, purpose, mail) {
     }
 
     if (updated.attempts >= updated.max_attempts) {
-        console.warn(`[OtpService] OTP untuk ${purpose} → ${mail} terkunci setelah ${updated.attempts} percobaan.`);
+        console.warn(`[OtpService] OTP untuk ${purpose} → ${maskEmail(mail)} terkunci setelah ${updated.attempts} percobaan.`);
         return { ok: false, reason: 'maxed', otpId: otp.id };
     }
 
-    console.warn(`[OtpService] OTP salah untuk ${purpose} → ${mail} (percobaan ${updated.attempts}/${updated.max_attempts})`);
+    console.warn(`[OtpService] OTP salah untuk ${purpose} → ${maskEmail(mail)} (percobaan ${updated.attempts}/${updated.max_attempts})`);
     return { ok: false, reason: 'invalid', otpId: otp.id };
 }
 

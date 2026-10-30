@@ -1,8 +1,12 @@
 const supabase = require('../supabase');
 const vendorRegistry = require('../services/vendors/vendorRegistry');
 const cacheService = require('../services/cacheService');
+const { getActiveCatalog, PUBLIC_PRODUCT_SELECT } = require('../services/catalogService');
 const { groupProducts, buildMultiServerProduct, getCanonicalKey } = require('../utils/productGrouping');
 const { normalizePhoneNumber } = require('../utils/phoneUtils');
+const { findProductByAnyId, findVariantByPublicId, findVariantInProduct } = require('../utils/productLookup');
+const { toBigIntId } = require('../utils/dbIds');
+const { logger } = require('../utils/logger');
 
 /**
  * Format a product row and its variants for public display.
@@ -51,7 +55,7 @@ async function list(req, res) {
 
         let query = supabase
             .from('products')
-            .select('*, product_variants(*)', { count: 'exact' })
+            .select(PUBLIC_PRODUCT_SELECT, { count: 'exact' })
             .eq('is_active', true)
             .order('category', { ascending: true })
             .order('name', { ascending: true });
@@ -98,8 +102,8 @@ async function list(req, res) {
             },
         });
     } catch (err) {
-        console.error('GET /api/products error:', err.message);
-        res.status(500).json({ error: err.message });
+        logger.error('product_list_failed', { error: err });
+        res.status(500).json({ error: 'Gagal memuat produk' });
     }
 }
 
@@ -125,39 +129,43 @@ async function getCategories(req, res) {
         const categories = [...new Set((data || []).map(p => p.category))].sort();
         res.json(categories);
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        logger.error('product_categories_failed', { error: err });
+        res.status(500).json({ error: 'Gagal memuat kategori' });
     }
 }
 
 /**
  * GET /api/products/:id
- * Get a single product by ID with its variants and peer server options.
+ * Get a single product by internal ID or external ID, with peer server options.
  */
 async function getById(req, res) {
     try {
         const { id } = req.params;
 
-        // 1. Fetch the primary target product
-        const { data: primary, error } = await supabase
-            .from('products')
-            .select('*, product_variants(*)')
-            .eq('id', id)
-            .maybeSingle();
+        // 1. Fetch the primary target product. Numeric values are tried as the
+        // internal BIGINT id first; non-numeric values only query external_id.
+        const { data: primary, error } = await findProductByAnyId(
+            supabase,
+            id,
+            PUBLIC_PRODUCT_SELECT
+        );
 
-        if (error) throw error;
+        if (error) {
+            logger.error('product_detail_lookup_failed', { productId: id, code: error.code });
+            return res.status(500).json({ error: 'Gagal memuat produk' });
+        }
         if (!primary || primary.is_active === false) {
             return res.status(404).json({ error: 'Produk tidak ditemukan' });
         }
 
-        // 2. Find peer products in the same canonical group across all vendors
+        // 2. Find peer products from the cached public catalog. This replaces
+        // an unbounded per-request query that fetched every variant in the
+        // category.
         const targetCanonicalKey = getCanonicalKey(primary.name);
-        const { data: peerCandidates } = await supabase
-            .from('products')
-            .select('*, product_variants(*)')
-            .eq('is_active', true)
-            .eq('category', primary.category);
-
-        const peerProducts = (peerCandidates || []).filter(p =>
+        const catalog = await getActiveCatalog();
+        const peerProducts = catalog.filter(p =>
+            String(p.id) !== String(primary.id) &&
+            p.category === primary.category &&
             getCanonicalKey(p.name) === targetCanonicalKey
         );
 
@@ -166,8 +174,8 @@ async function getById(req, res) {
 
         res.json(multiServerProduct);
     } catch (err) {
-        console.error('GET /api/products/:id error:', err.message);
-        res.status(500).json({ error: err.message });
+        logger.error('product_detail_failed', { productId: req.params.id, error: err });
+        res.status(500).json({ error: 'Gagal memuat produk' });
     }
 }
 
@@ -190,11 +198,17 @@ async function validate(req, res) {
         let dbProduct = null;
 
         if (product_id) {
-            const { data } = await supabase
-                .from('products')
-                .select('id, name, brand, category, vendor')
-                .eq('id', product_id)
-                .maybeSingle();
+            const { data, error } = await findProductByAnyId(
+                supabase,
+                product_id,
+                'id, name, brand, category, vendor'
+            );
+            if (error) {
+                logger.warn('product_validate_lookup_failed', {
+                    productId: product_id,
+                    code: error.code,
+                });
+            }
             if (data) {
                 dbProduct = data;
                 if (!resolvedVendor) resolvedVendor = data.vendor;
@@ -203,14 +217,23 @@ async function validate(req, res) {
 
         let variantValidation = null;
         if (targetVariantId) {
-            const { data: vRow } = await supabase
-                .from('product_variants')
-                .select('id, vendor_variant_id, validation, products(id, name, brand, category, vendor)')
-                .or(`id.eq.${targetVariantId},vendor_variant_id.eq.${targetVariantId}`)
-                .maybeSingle();
+            const columns = 'id, product_id, vendor_variant_id, validation, products(id, name, brand, category, vendor)';
+            const { data: vRow, error: variantError } = dbProduct?.id
+                ? await findVariantInProduct(supabase, dbProduct.id, targetVariantId, columns)
+                : await findVariantByPublicId(supabase, targetVariantId, columns);
+
+            if (variantError) {
+                logger.warn('variant_validate_lookup_failed', {
+                    variantId: targetVariantId,
+                    code: variantError.code,
+                });
+            }
+
             if (vRow) {
                 variantValidation = vRow.validation;
-                if (vRow.products) {
+                // Prefer the product already resolved from product_id. Only use
+                // the joined product when product_id was not supplied.
+                if (!dbProduct && vRow.products) {
                     dbProduct = vRow.products;
                     if (!resolvedVendor) resolvedVendor = vRow.products.vendor;
                 }
@@ -288,8 +311,8 @@ async function validate(req, res) {
             ...(result.data || { account_name: customer_id, display_name: customer_id })
         });
     } catch (err) {
-        console.error('POST /api/products/validate error:', err.message);
-        res.status(500).json({ error: err.message });
+        logger.error('product_validate_failed', { error: err });
+        res.status(500).json({ error: 'Gagal memvalidasi akun' });
     }
 }
 
@@ -304,7 +327,8 @@ async function create(req, res) {
         cacheService.invalidateHome();
         res.json(data);
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        logger.error('product_create_failed', { error: err });
+        res.status(500).json({ error: 'Gagal membuat produk' });
     }
 }
 
@@ -313,13 +337,17 @@ async function create(req, res) {
  */
 async function update(req, res) {
     try {
-        const { id } = req.params;
-        const { error } = await supabase.from('products').update(req.body).eq('id', id);
+        const productId = toBigIntId(req.params.id);
+        if (!productId) {
+            return res.status(400).json({ error: 'ID produk tidak valid' });
+        }
+        const { error } = await supabase.from('products').update(req.body).eq('id', productId);
         if (error) throw error;
         cacheService.invalidateHome();
         res.json({ success: true });
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        logger.error('product_update_failed', { productId: req.params.id, error: err });
+        res.status(500).json({ error: 'Gagal memperbarui produk' });
     }
 }
 
@@ -328,13 +356,17 @@ async function update(req, res) {
  */
 async function remove(req, res) {
     try {
-        const { id } = req.params;
-        const { error } = await supabase.from('products').delete().eq('id', id);
+        const productId = toBigIntId(req.params.id);
+        if (!productId) {
+            return res.status(400).json({ error: 'ID produk tidak valid' });
+        }
+        const { error } = await supabase.from('products').delete().eq('id', productId);
         if (error) throw error;
         cacheService.invalidateHome();
         res.json({ success: true });
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        logger.error('product_delete_failed', { productId: req.params.id, error: err });
+        res.status(500).json({ error: 'Gagal menghapus produk' });
     }
 }
 

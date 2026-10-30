@@ -144,7 +144,7 @@ async function dispatchOtp(res, email, purpose, displayName) {
     });
 
     if (!mail.success) {
-        console.error(`[Auth] Gagal mengirim OTP ke ${email}:`, mail.error);
+        console.error(`[Auth] Gagal mengirim OTP ke ${maskEmail(email)}:`, mail.error);
         await otpService.invalidateOtps({ email, purpose });
         return res.status(500).json({
             success: false,
@@ -363,7 +363,7 @@ async function verifyRegistration(req, res) {
 
         await otpService.invalidateOtps({ email, purpose: otpService.PURPOSE.REGISTER });
 
-        console.log(`[Auth] Registrasi terverifikasi: ${email}`);
+        console.log(`[Auth] Registrasi terverifikasi: ${maskEmail(email)}`);
 
         res.json({
             success: true,
@@ -445,7 +445,7 @@ async function forgotPassword(req, res) {
         if (!user || !user.is_active) {
             // Balas dengan bentuk yang sama persis supaya bentuk respons tidak
             // membocorkan keberadaan akun.
-            console.warn(`[Auth] Permintaan reset password untuk email tidak dikenal: ${email}`);
+            console.warn(`[Auth] Permintaan reset password untuk email tidak dikenal: ${maskEmail(email)}`);
             return res.json({
                 success: true,
                 message: 'Jika email tersebut terdaftar, kode verifikasi telah dikirim.',
@@ -536,7 +536,7 @@ async function verifyResetPassword(req, res) {
 
         await otpService.invalidateOtps({ email, purpose: otpService.PURPOSE.RESET_PASSWORD });
 
-        console.log(`[Auth] Password direset: ${email}`);
+        console.log(`[Auth] Password direset: ${maskEmail(email)}`);
 
         res.json({
             success: true,

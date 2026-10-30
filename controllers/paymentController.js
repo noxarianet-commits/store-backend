@@ -8,6 +8,9 @@ const vendorRegistry = require('../services/vendors/vendorRegistry');
 const cacheService = require('../services/cacheService');
 const balanceService = require('../services/balanceService');
 const orderFulfillmentService = require('../services/orderFulfillmentService');
+const { findProductByAnyId, findProductByExternalId, findVariantByPublicId } = require('../utils/productLookup');
+const { withReadRetry, isTransientError } = require('../utils/dbRetry');
+const { logger } = require('../utils/logger');
 const { normalizePhoneNumber, normalizeNotePhoneNumber } = require('../utils/phoneUtils');
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -66,7 +69,8 @@ async function generateUniqueCode() {
         .from('orders')
         .select('unique_code')
         .eq('status', 'PENDING')
-        .gt('unique_code', 0);
+        .gt('unique_code', 0)
+        .limit(500);
 
     const usedCodes = new Set((pendingOrders || []).map(o => o.unique_code));
 
@@ -173,52 +177,66 @@ async function createPayment(req, res) {
         // 3. Query produk & variant secara unified
         let dbProduct = null;
         if (product_id) {
-            // Cek terlebih dahulu dengan primary key id jika berupa angka
-            if (!isNaN(product_id)) {
-                const { data } = await supabase
-                    .from('products')
-                    .select('*, product_variants(*)')
-                    .eq('id', parseInt(product_id, 10))
-                    .maybeSingle();
-                dbProduct = data;
+            const { data, error } = await findProductByAnyId(
+                supabase,
+                product_id,
+                '*, product_variants(*)'
+            );
+
+            if (error) {
+                logger.error('order_product_lookup_failed', {
+                    productId: product_id,
+                    code: error.code,
+                });
+                return res.status(500).json({ error: 'Gagal memuat produk' });
             }
 
-            // Jika belum ditemukan, coba cari berdasarkan external_id
-            if (!dbProduct) {
-                const { data } = await supabase
-                    .from('products')
-                    .select('*, product_variants(*)')
-                    .eq('external_id', String(product_id))
-                    .maybeSingle();
-                dbProduct = data;
-            }
+            dbProduct = data;
         }
 
         // Fallback: cari produk via targetVariantId di tabel product_variants
         if (!dbProduct && targetVariantId) {
-            let vQuery = supabase.from('product_variants').select('product_id');
-            if (!isNaN(targetVariantId)) {
-                vQuery = vQuery.or(`id.eq.${targetVariantId},vendor_variant_id.eq.${targetVariantId}`);
-            } else {
-                vQuery = vQuery.eq('vendor_variant_id', String(targetVariantId));
+            const { data: vRow, error: variantError } = await findVariantByPublicId(
+                supabase,
+                targetVariantId,
+                'id, product_id, vendor_variant_id'
+            );
+
+            if (variantError) {
+                logger.error('order_variant_lookup_failed', {
+                    variantId: targetVariantId,
+                    code: variantError.code,
+                });
+                return res.status(500).json({ error: 'Gagal memuat varian produk' });
             }
-            const { data: vList } = await vQuery.limit(1);
-            if (vList && vList.length > 0) {
-                const { data } = await supabase
-                    .from('products')
-                    .select('*, product_variants(*)')
-                    .eq('id', vList[0].product_id)
-                    .maybeSingle();
+
+            if (vRow?.product_id) {
+                const { data, error } = await findProductByAnyId(
+                    supabase,
+                    vRow.product_id,
+                    '*, product_variants(*)'
+                );
+                if (error) {
+                    logger.error('order_variant_product_lookup_failed', {
+                        productId: vRow.product_id,
+                        code: error.code,
+                    });
+                    return res.status(500).json({ error: 'Gagal memuat produk' });
+                }
                 dbProduct = data;
             }
         }
 
         if (!dbProduct && sku) {
-            const { data } = await supabase
-                .from('products')
-                .select('*, product_variants(*)')
-                .eq('external_id', String(sku))
-                .maybeSingle();
+            const { data, error } = await findProductByExternalId(
+                supabase,
+                sku,
+                '*, product_variants(*)'
+            );
+            if (error) {
+                logger.error('order_sku_product_lookup_failed', { sku, code: error.code });
+                return res.status(500).json({ error: 'Gagal memuat produk' });
+            }
             dbProduct = data;
         }
 
@@ -276,7 +294,7 @@ async function createPayment(req, res) {
         }
 
         if (amount !== expectedAmount) {
-            console.error(`[paymentController] Price mismatch. Expected: ${expectedAmount}, Got: ${amount}`);
+            logger.warn('order_price_mismatch', { expectedAmount, receivedAmount: amount });
             return res.status(400).json({ error: 'Terjadi ketidaksesuaian harga. Silakan refresh halaman.' });
         }
         if (expectedAmount < 1000) {
@@ -292,7 +310,7 @@ async function createPayment(req, res) {
             const balanceRes = await adapter.getBalance();
             if (balanceRes.success && typeof balanceRes.balance === 'number') {
                 if (balanceRes.balance < requiredVendorCost) {
-                    console.warn(`[paymentController] OkeConnect balance insufficient (${balanceRes.balance} < ${requiredVendorCost})`);
+                    logger.warn('okeconnect_balance_insufficient', { balance: balanceRes.balance, required: requiredVendorCost });
                     return res.status(400).json({
                         error: 'Mohon maaf, saldo server sedang dalam pengisian. Silakan coba beberapa saat lagi atau pilih server lain.'
                     });
@@ -383,7 +401,7 @@ async function createPayment(req, res) {
                     }
                 }
             } catch (valErr) {
-                console.warn('[paymentController] Validation check warning (fail-open):', valErr.message);
+                logger.warn('sekalipay_validation_check_failed_open', { message: valErr.message });
             }
         }
 
@@ -453,10 +471,10 @@ async function createPayment(req, res) {
             ]);
             
             if (dbError) {
-                console.error('[paymentController] DB insert error:', dbError);
+                logger.error('balance_order_insert_failed', { orderId, code: dbError.code });
                 // Refund balance
                 await balanceService.refundBalance(req.user.id, amount, orderId, 'Refund otomatis karena gagal simpan order');
-                return res.status(500).json({ error: `Gagal menyimpan order: ${dbError.message}` });
+                return res.status(500).json({ error: 'Gagal menyimpan order' });
             }
             
             // Ambil data terbaru untuk fulfillment
@@ -464,7 +482,7 @@ async function createPayment(req, res) {
             
             // Jalankan fulfillment di background tanpa await
             orderFulfillmentService.fulfillOrder(latestOrder).catch(err => {
-                console.error(`[paymentController] Fulfillment error for balance order ${orderId}:`, err);
+                logger.error('balance_order_fulfillment_failed', { orderId, error: err });
             });
             
             return res.status(201).json({
@@ -485,7 +503,7 @@ async function createPayment(req, res) {
 
         // 8. Tentukan Payment Gateway & Buat Invoice
         const pgProvider = await getActivePaymentGateway();
-        console.log(`[paymentController] Using PG: ${pgProvider}, unique_code: ${uniqueCode}`);
+        logger.info('payment_gateway_selected', { orderId, pgProvider, uniqueCode });
 
         let pgData, pgFee, pgTotal, pgInvoice, pgPaymentLink, pgQrLink;
 
@@ -632,11 +650,11 @@ async function createPayment(req, res) {
         ]);
 
         if (dbError) {
-            console.error('[paymentController] DB insert error:', dbError);
-            return res.status(500).json({ error: `Gagal menyimpan order: ${dbError.message}` });
+            logger.error('gateway_order_insert_failed', { orderId, code: dbError.code });
+            return res.status(500).json({ error: 'Gagal menyimpan order' });
         }
 
-        console.log(`[paymentController] Order ${orderId} created via ${pgProvider}`);
+        logger.info('order_created', { orderId, pgProvider, vendor: actualVendor });
 
         return res.status(201).json({
             success: true,
@@ -656,16 +674,17 @@ async function createPayment(req, res) {
             },
         });
     } catch (err) {
-        console.error('[paymentController] createPayment crash:', err);
-        return res.status(500).json({ error: err.message });
+        logger.error('payment_create_failed', { error: err });
+        return res.status(500).json({ error: 'Gagal membuat pembayaran' });
     }
 }
 
 // In-memory map to throttle upstream Payment Gateway checks (orderId -> timestamp)
 const lastVendorCheckMap = new Map();
 
-// Periodic cleanup of stale throttle entries (every 10 minutes)
-setInterval(() => {
+// Periodic cleanup of stale throttle entries (every 10 minutes). Do not keep a
+// serverless process alive just for this timer.
+const throttleCleanupTimer = setInterval(() => {
     const now = Date.now();
     for (const [key, timestamp] of lastVendorCheckMap.entries()) {
         if (now - timestamp > 3600000) { // older than 1 hour
@@ -673,6 +692,46 @@ setInterval(() => {
         }
     }
 }, 600000);
+if (throttleCleanupTimer.unref) throttleCleanupTimer.unref();
+
+// Columns needed by the storefront status page and by authorizeOrderAccess().
+// Everything else (email, wa_number, proof_image, payment links, ...) is not
+// required on every poll and only increases egress.
+const ORDER_STATUS_FIELDS = [
+    'id',
+    'status',
+    'product',
+    'variant',
+    'price',
+    'payment_method',
+    'payment_type',
+    'pg_provider',
+    'pg_invoice',
+    'pg_paid_at',
+    'pg_expired_at',
+    'error_message',
+    'account_details',
+    'user_id',
+    'order_access_token',
+].join(',');
+
+/**
+ * Remove credentials and (for the slim view) customer PII before sending an
+ * order row to the browser.
+ */
+function toSafeOrderResponse(order, { slim }) {
+    const out = { ...order };
+    delete out.order_access_token;
+
+    if (slim) {
+        delete out.user_id;
+        delete out.email;
+        delete out.wa_number;
+        delete out.customer_name;
+    }
+
+    return out;
+}
 
 // ══════════════════════════════════════════════════════════════════════════
 // GET /api/payments/status/:orderId
@@ -682,14 +741,32 @@ async function getPaymentStatus(req, res) {
     try {
         const { orderId } = req.params;
         const force = req.query.force === 'true';
+        const slim = req.query.view === 'slim';
+        const columns = slim ? ORDER_STATUS_FIELDS : '*';
 
-        const { data, error } = await supabase
-            .from('orders')
-            .select('*')
-            .eq('id', orderId)
-            .single();
+        res.set('Cache-Control', 'no-store');
 
-        if (error || !data) {
+        const { data, error } = await withReadRetry(async () => {
+            const result = await supabase
+                .from('orders')
+                .select(columns)
+                .eq('id', orderId)
+                .maybeSingle();
+
+            // Supabase resolves with { error }, it does not throw. Re-throw
+            // only transient errors so withReadRetry can retry them.
+            if (result.error && isTransientError(result.error)) throw result.error;
+            return result;
+        });
+
+        if (error) {
+            if (error.code === 'PGRST116') {
+                return res.status(404).json({ error: 'Order tidak ditemukan' });
+            }
+            logger.error('order_status_read_failed', { orderId, code: error.code });
+            return res.status(500).json({ error: 'Gagal memeriksa status pesanan' });
+        }
+        if (!data) {
             return res.status(404).json({ error: 'Order tidak ditemukan' });
         }
 
@@ -713,21 +790,27 @@ async function getPaymentStatus(req, res) {
                     await paymentPollingService.processOrder(data);
                     const { data: updatedData } = await supabase
                         .from('orders')
-                        .select('*')
+                        .select(columns)
                         .eq('id', orderId)
-                        .single();
+                        .maybeSingle();
 
-                    if (updatedData) return res.json({ data: updatedData });
+                    if (updatedData) {
+                        return res.json({ data: toSafeOrderResponse(updatedData, { slim }) });
+                    }
                 } catch (vendorErr) {
-                    console.warn(`[paymentController] Outbound vendor check warning for order ${orderId}:`, vendorErr.message);
+                    logger.warn('order_vendor_status_check_failed', {
+                        orderId,
+                        code: vendorErr.code,
+                        message: vendorErr.message,
+                    });
                 }
             }
         }
 
-        return res.json({ data });
+        return res.json({ data: toSafeOrderResponse(data, { slim }) });
     } catch (err) {
-        console.error('[paymentController] getPaymentStatus error:', err.message);
-        res.status(500).json({ error: err.message });
+        logger.error('order_status_failed', { orderId: req.params.orderId, error: err });
+        res.status(500).json({ error: 'Gagal memeriksa status pesanan' });
     }
 }
 
@@ -764,8 +847,8 @@ async function cancelPayment(req, res) {
         await supabase.from('orders').update({ status: 'CANCELLED' }).eq('id', order_id);
         return res.json({ success: true, message: 'Invoice berhasil dibatalkan' });
     } catch (err) {
-        console.error('[paymentController] cancelPayment error:', err.message);
-        res.status(500).json({ error: err.message });
+        logger.error('payment_cancel_failed', { orderId: req.body?.order_id, error: err });
+        res.status(500).json({ error: 'Gagal membatalkan pembayaran' });
     }
 }
 

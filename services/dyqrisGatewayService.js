@@ -1,6 +1,7 @@
 const axios = require('axios');
 const crypto = require('crypto');
 const supabase = require('../supabase');
+const { logger } = require('../utils/logger');
 
 class DyqrisGatewayService {
     async getConfig() {
@@ -29,7 +30,7 @@ class DyqrisGatewayService {
                 }
             }
         } catch (err) {
-            console.error('[DyqrisGatewayService] Error reading config from DB:', err.message);
+            logger.error('dyqris_config_read_failed', { message: err.message });
         }
 
         return { baseURL, apiKey, webhookSecret, expiryMinutes };
@@ -57,7 +58,11 @@ class DyqrisGatewayService {
         };
 
         try {
-            console.log('[DyqrisGatewayService] Creating transaction payload:', JSON.stringify(payload, null, 2));
+            logger.debug('dyqris_transaction_creating', {
+                refId,
+                amount: payload.amount,
+                expiryMinutes: payload.expiry_minutes,
+            });
             const response = await axios.post(`${baseURL}/v1/transactions`, payload, {
                 headers: {
                     'Content-Type': 'application/json',
@@ -82,7 +87,11 @@ class DyqrisGatewayService {
             };
         } catch (err) {
             const errData = err.response?.data;
-            console.error('[DyqrisGatewayService] createTransaction error:', JSON.stringify(errData, null, 2) || err.message);
+            logger.error('dyqris_create_transaction_failed', {
+                refId,
+                status: err.response?.status,
+                message: errData?.message || errData?.error || err.message,
+            });
 
             const errorMsg = errData?.message || errData?.error || err.message || 'Error koneksi ke API Dyqris';
             return {
@@ -120,7 +129,11 @@ class DyqrisGatewayService {
 
             return { success: false, message: 'Transaksi Dyqris tidak ditemukan' };
         } catch (err) {
-            console.error('[DyqrisGatewayService] getTransactionDetails error:', err.response?.data || err.message);
+            logger.error('dyqris_get_transaction_failed', {
+                transactionId: id,
+                status: err.response?.status,
+                message: err.response?.data?.message || err.message,
+            });
             return { success: false, message: err.message };
         }
     }
@@ -131,7 +144,7 @@ class DyqrisGatewayService {
      */
     verifyWebhookSignature(rawBody, signatureHeader, secret) {
         if (!signatureHeader || !secret) {
-            console.error('[DyqrisGatewayService] Missing signatureHeader or secret for verification');
+            logger.warn('dyqris_webhook_signature_config_missing');
             return false;
         }
 
@@ -150,7 +163,7 @@ class DyqrisGatewayService {
 
             return crypto.timingSafeEqual(expectedBuf, receivedBuf);
         } catch (err) {
-            console.error('[DyqrisGatewayService] Signature verification error:', err.message);
+            logger.error('dyqris_webhook_signature_failed', { message: err.message });
             return false;
         }
     }

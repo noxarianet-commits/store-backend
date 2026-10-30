@@ -47,7 +47,7 @@ async function create(req, res) {
         if (error) throw error;
 
         cacheService.invalidateHome();
-        console.log(`[testimonial] Testimoni dari ${name} (rating: ${ratingVal}, order: ${order_id})`);
+        console.log(`[testimonial] Testimoni diterima (rating: ${ratingVal}, order: ${order_id})`);
         res.status(201).json({ success: true, data });
     } catch (err) {
         console.error('[testimonialController] create error:', err.message);

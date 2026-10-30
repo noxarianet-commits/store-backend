@@ -1,6 +1,9 @@
 const supabase = require('../supabase');
 const vendorRegistry = require('./vendors/vendorRegistry');
 const cacheService = require('./cacheService');
+const { toBigIntId } = require('../utils/dbIds');
+const { findVariantByPublicId, findVariantInProduct } = require('../utils/productLookup');
+const { logger } = require('../utils/logger');
 
 /**
  * Unified Product Sync Service.
@@ -367,16 +370,23 @@ class ProductSyncService {
      */
     async updateVariantMarkup(productId, variantId, markup) {
         const markupVal = Math.max(0, parseInt(markup) || 0);
+        const internalProductId = toBigIntId(productId);
 
-        let query = supabase.from('product_variants').select('id, base_price');
-        if (productId) {
-            query = query.eq('product_id', productId).eq('vendor_variant_id', String(variantId));
-        } else {
-            query = query.or(`id.eq.${variantId},vendor_variant_id.eq.${variantId}`);
+        const result = internalProductId
+            ? await findVariantInProduct(supabase, internalProductId, variantId, 'id, base_price')
+            : await findVariantByPublicId(supabase, variantId, 'id, base_price');
+
+        if (result.error) {
+            logger.error('variant_markup_lookup_failed', {
+                productId: productId || null,
+                variantId,
+                code: result.error.code,
+            });
+            return { success: false, error: 'Gagal memuat varian' };
         }
 
-        const { data: variant, error: varFetchErr } = await query.maybeSingle();
-        if (varFetchErr || !variant) {
+        const variant = result.data;
+        if (!variant) {
             return { success: false, error: 'Variant tidak ditemukan' };
         }
 
@@ -397,11 +407,15 @@ class ProductSyncService {
      */
     async updateProductMarkup(productId, markup) {
         const markupVal = Math.max(0, parseInt(markup) || 0);
+        const internalProductId = toBigIntId(productId);
+        if (!internalProductId) {
+            return { success: false, error: 'ID produk tidak valid' };
+        }
 
         const { data: variants } = await supabase
             .from('product_variants')
             .select('id, base_price')
-            .eq('product_id', productId);
+            .eq('product_id', internalProductId);
 
         if (variants) {
             for (const v of variants) {

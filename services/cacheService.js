@@ -1,4 +1,5 @@
 const NodeCache = require('node-cache');
+const { logger } = require('../utils/logger');
 
 /**
  * CacheService — In-memory cache wrapper using node-cache.
@@ -11,6 +12,8 @@ const NodeCache = require('node-cache');
 const KEYS = {
     HOME_PAGE: 'home_page',
     HOME_CATEGORY: (slug) => `home_category_${slug}`,
+    CATALOG: 'home_catalog',
+    PUBLIC_SETTINGS: 'home_public_settings',
     VENDOR_BALANCE: (vendor) => `vendor_balance_${vendor}`,
     ACCOUNT_VALIDATION: (vendor, key) => `val_${vendor}_${key}`,
 };
@@ -22,11 +25,8 @@ class CacheService {
             checkperiod: 60,   // Check for expired keys every 60s
             useClones: false,  // Return references for performance
         });
+        this.pending = new Map();
         this.KEYS = KEYS;
-
-        this.cache.on('expired', (key) => {
-            console.log(`[Cache] Key expired: ${key}`);
-        });
     }
 
     /**
@@ -54,7 +54,10 @@ class CacheService {
 
     /**
      * Get from cache or fetch and cache the result.
-     * Avoids repetitive get→check→set boilerplate in controllers.
+     *
+     * Concurrent misses for the same key share one in-flight promise. Without
+     * this, several cold requests can fetch the entire product catalog in
+     * parallel, multiplying Supabase egress.
      *
      * @param {string} key - Cache key
      * @param {Function} fetchFn - Async function that returns the data to cache
@@ -67,13 +70,25 @@ class CacheService {
             return cached;
         }
 
-        const data = await fetchFn();
-        this.set(key, data, ttl);
-        return data;
+        const existing = this.pending.get(key);
+        if (existing) return existing;
+
+        const promise = (async () => {
+            try {
+                const data = await fetchFn();
+                this.set(key, data, ttl);
+                return data;
+            } finally {
+                this.pending.delete(key);
+            }
+        })();
+
+        this.pending.set(key, promise);
+        return promise;
     }
 
     /**
-     * Delete a specific key from cache.
+     * Delete a specific key.
      * @param {string} key
      */
     del(key) {
@@ -89,7 +104,7 @@ class CacheService {
         const matchingKeys = keys.filter(k => k.startsWith(prefix));
         if (matchingKeys.length > 0) {
             this.cache.del(matchingKeys);
-            console.log(`[Cache] Invalidated ${matchingKeys.length} keys with prefix "${prefix}"`);
+            logger.debug('cache_invalidated', { prefix, count: matchingKeys.length });
         }
     }
 
@@ -112,7 +127,7 @@ class CacheService {
                     formatted: `Rp ${newBalance.toLocaleString('id-ID')}`
                 }
             }, 60);
-            console.log(`[Cache] Optimistically deducted ${amount} from ${vendor} balance. New: ${newBalance}`);
+            logger.debug('vendor_balance_optimistic_deduction', { vendor, amount, newBalance });
         }
     }
 
@@ -122,7 +137,6 @@ class CacheService {
      */
     invalidateHome() {
         this.invalidateByPrefix('home_');
-        console.log('[Cache] Home cache invalidated');
     }
 
     /**
@@ -130,12 +144,10 @@ class CacheService {
      */
     flushAll() {
         this.cache.flushAll();
-        console.log('[Cache] All cache flushed');
     }
 
     /**
      * Get cache statistics.
-     * @returns {object}
      */
     getStats() {
         return this.cache.getStats();

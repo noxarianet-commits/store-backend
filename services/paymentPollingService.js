@@ -26,7 +26,7 @@ class PaymentPollingService {
             const { data: orders, error } = await withReadRetry(async () => {
                 const result = await supabase
                     .from('orders')
-                    .select('id, status, payment_method, pg_provider, pg_invoice, dyqris_ref_id, timestamp')
+                    .select('id, status, payment_method, pg_provider, pg_invoice, timestamp')
                     .eq('status', 'PENDING')
                     .eq('payment_method', 'QRIS')
                     .not('pg_invoice', 'is', null)
@@ -160,7 +160,7 @@ class PaymentPollingService {
      * Cek status via Dyqris API GET /v1/transactions/:id.
      */
     async _processDyqrisOrder(order) {
-        const refId = order.dyqris_ref_id || order.pg_invoice;
+        const refId = order.pg_invoice;
         const orderId = order.id;
 
         if (!refId) {

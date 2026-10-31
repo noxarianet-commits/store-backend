@@ -75,7 +75,7 @@ class OrderFulfillmentService {
      */
     async fulfillOrder(order) {
         const orderId = order.id;
-        const variantId = order.vendor_variant_id || (order.sekalipay_variant_id ? String(order.sekalipay_variant_id) : null);
+        const variantId = order.vendor_variant_id || null;
         let vendorName = order.vendor || order.account_details?.vendor;
 
         // Auto-detect vendor if missing or misattributed

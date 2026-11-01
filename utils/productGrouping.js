@@ -108,6 +108,7 @@ function formatPublicVariants(rawVariants = [], vendor = 'sekalipay', productId 
             required_fields: v.required_fields || [],
             validation: v.validation || {},
             provider_meta: v.provider_meta || {},
+            note: v.note || '',
         }))
         .sort((a, b) => (a.price || 0) - (b.price || 0));
 }

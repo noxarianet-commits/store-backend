@@ -110,6 +110,7 @@ async function getProducts(req, res) {
                     required_fields: v.required_fields,
                     validation: v.validation,
                     provider_meta: v.provider_meta,
+                    note: v.note || '',
                 }))
                 : (p.variants || []),
         }));
@@ -337,6 +338,83 @@ async function toggleVariantHidden(req, res) {
 
 
 /**
+ * Normalize a public variant note.
+ * Keeps internal line breaks, trims outer whitespace, and enforces the limit.
+ *
+ * @param {unknown} value
+ * @returns {{ value?: string|null, error?: string }}
+ */
+function normalizeNote(value) {
+    if (value === null || value === undefined) {
+        return { value: null };
+    }
+    if (typeof value !== 'string') {
+        return { error: 'Catatan harus berupa teks' };
+    }
+
+    const note = value.replace(/\r\n?/g, '\n').trim();
+    if (note.length > 2000) {
+        return { error: 'Catatan maksimal 2000 karakter' };
+    }
+
+    return { value: note || null };
+}
+
+/**
+ * PATCH /api/admin/products/products/:productId/variant/:variantId/note
+ * Body: { note: string }
+ *
+ * `variantId` may be the product_variants primary key or the vendor variant ID.
+ */
+async function updateVariantNote(req, res) {
+    try {
+        const { productId, variantId } = req.params;
+        const normalized = normalizeNote(req.body?.note);
+
+        if (normalized.error) {
+            return res.status(400).json({ error: normalized.error });
+        }
+
+        const { data: variant, error: lookupError } = await findVariantInProduct(
+            supabase,
+            productId,
+            variantId,
+            'id'
+        );
+
+        if (lookupError) {
+            logger.error('variant_note_lookup_failed', {
+                productId,
+                variantId,
+                code: lookupError.code,
+            });
+            return res.status(500).json({ error: 'Gagal memuat varian' });
+        }
+        if (!variant) {
+            return res.status(404).json({ error: 'Variant tidak ditemukan' });
+        }
+
+        const { error: updateError } = await supabase
+            .from('product_variants')
+            .update({ note: normalized.value })
+            .eq('id', variant.id);
+
+        if (updateError) throw updateError;
+
+        cacheService.invalidateHome();
+        res.json({ success: true, note: normalized.value });
+    } catch (err) {
+        logger.error('variant_note_update_failed', {
+            productId: req.params.productId || null,
+            variantId: req.params.variantId || null,
+            error: err,
+        });
+        res.status(500).json({ error: 'Gagal menyimpan catatan varian' });
+    }
+}
+
+
+/**
  * POST /api/admin/products/global-markup
  * Body: { vendor: 'sekalipay'|'fincloud'|'all', markup: number }
  */
@@ -373,5 +451,6 @@ module.exports = {
     getFeatured,
     getFeaturedOptions,
     toggleVariantHidden,
+    updateVariantNote,
     globalMarkup,
 };

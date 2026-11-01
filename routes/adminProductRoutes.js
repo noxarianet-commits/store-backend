@@ -21,9 +21,10 @@ router.patch('/products/:id/markup', adminProductController.updateMarkup);
 router.patch('/products/:id/toggle', adminProductController.toggleActive);
 router.patch('/products/:id/featured', adminProductController.toggleFeatured);
 
-// Variant hidden toggle (support both route patterns)
+// Variant hidden toggle & note (support both route patterns)
 router.patch('/variants/:id/toggle-hidden', adminProductController.toggleVariantHidden);
 router.patch('/products/:productId/variant/:variantId/toggle-hidden', adminProductController.toggleVariantHidden);
+router.patch('/products/:productId/variant/:variantId/note', adminProductController.updateVariantNote);
 
 // Global markup
 router.post('/global-markup', adminProductController.globalMarkup);

@@ -26,6 +26,7 @@ function toPublicProduct(product) {
             required_fields: v.required_fields || [],
             validation: v.validation || {},
             provider_meta: v.provider_meta || {},
+            note: v.note || '',
         }));
 
     return {

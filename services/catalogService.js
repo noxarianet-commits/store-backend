@@ -18,7 +18,7 @@ const PUBLIC_PRODUCT_SELECT = [
     'is_featured',
     'synced_at',
     'created_at',
-    'product_variants(id, product_id, vendor_variant_id, name, sell_price, stock, order_process, required_fields, validation, provider_meta, is_hidden, is_active, metadata)',
+    'product_variants(id, product_id, vendor_variant_id, name, sell_price, stock, order_process, required_fields, validation, provider_meta, note, is_hidden, is_active, metadata)',
 ].join(',');
 
 async function fetchActiveCatalog() {

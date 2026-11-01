@@ -106,12 +106,20 @@ class PaymentPollingService {
                         const s = statusRes.success && statusRes.data ? (statusRes.data.status || '').toUpperCase() : '';
                         if (s === 'PAID' || s === 'SUCCESS' || s === 'COMPLETED') isPaid = true;
                         else if (s === 'EXPIRED' || s === 'CANCELLED' || s === 'FAILED') isExpired = true;
-                    } else {
-                        // fincloud
+                    } else if (tx.pg_provider === 'fincloud') {
                         const statusRes = await paymentGatewayService.checkInvoiceStatus(tx.pg_invoice || tx.reference_id);
                         const s = statusRes.success && statusRes.data ? (statusRes.data.status || '').toUpperCase() : '';
                         if (s === 'PAID' || s === 'SUCCESS') isPaid = true;
                         else if (s === 'EXPIRED' || s === 'CANCELLED') isExpired = true;
+                    } else {
+                        // Unknown/missing provider: never assume FinCloud.
+                        pollingLog.sampled(
+                            'warn',
+                            `unknown_topup_provider:${tx.pg_provider || 'null'}`,
+                            60000,
+                            'unknown_topup_provider_skip',
+                            { referenceId: tx.reference_id, pgProvider: tx.pg_provider || null }
+                        );
                     }
                 } catch (pgError) {
                     pollingLog.error('topup_status_check_failed', {
@@ -144,15 +152,22 @@ class PaymentPollingService {
     }
 
     async processOrder(order) {
-        const pgProvider = order.pg_provider || 'fincloud';
-        
+        const pgProvider = order.pg_provider;
+
         if (pgProvider === 'sekalipay') {
             return this._processSekalipayOrder(order);
         } else if (pgProvider === 'dyqris') {
             return this._processDyqrisOrder(order);
-        } else {
+        } else if (pgProvider === 'fincloud') {
             return this._processFincloudOrder(order);
         }
+
+        // Never default an unknown/missing provider to FinCloud. That would
+        // call a legacy gateway for orders that were never FinCloud orders.
+        pollingLog.warn('unknown_pg_provider_skip', {
+            orderId: order.id,
+            pgProvider: pgProvider || null,
+        });
     }
 
     /**

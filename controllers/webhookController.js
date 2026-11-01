@@ -6,6 +6,7 @@ const dyqrisGatewayService = require('../services/dyqrisGatewayService');
 const emailService = require('../services/emailService');
 const orderFulfillmentService = require('../services/orderFulfillmentService');
 const vendorRegistry = require('../services/vendors/vendorRegistry');
+const { logger } = require('../utils/logger');
 
 // ══════════════════════════════════════════════════════════════════════════
 // HELPER — Sekalipay Reseller Webhook Signature Verification
@@ -32,13 +33,13 @@ function timingSafeCompare(a, b) {
 
 async function handlePaymentGatewayWebhook(req, res) {
     const payload = req.body || {};
-    const reffId = payload.reff_id || payload.external_id || '';
+    const reffId = String(payload.reff_id || payload.external_id || '').trim();
     const event = payload.event || '';
     const status = payload.status || (event === 'payment.success' ? 'success' : '');
     const signature = req.headers['x-signature'] || req.headers['signature'] || payload.signature || '';
     const isTest = payload.is_test === 'true' || payload.is_test === true || event === 'webhook.test';
 
-    console.log(`[Webhook/PG-FinCloud] Received callback: reff_id=${reffId}, event=${event}, status=${status}`);
+    logger.debug('fincloud_callback_received', { reffId, event, status });
 
     // 1. Validasi signature jika disertakan
     if (signature) {
@@ -50,7 +51,7 @@ async function handlePaymentGatewayWebhook(req, res) {
         });
 
         if (!isValidSig) {
-            console.warn('[Webhook/PG-FinCloud] Invalid signature — request ditolak.');
+            logger.warn('fincloud_webhook_signature_invalid');
             return res.status(401).json({ error: 'Invalid signature' });
         }
     }
@@ -77,8 +78,23 @@ async function handlePaymentGatewayWebhook(req, res) {
             .or(`reference_id.eq.${reffId},pg_invoice.eq.${reffId}`)
             .maybeSingle();
 
-        if (fetchTxErr || !tx) {
-            console.error(`[Webhook/PG-FinCloud] Topup ${reffId} tidak ditemukan.`);
+        if (fetchTxErr) {
+            logger.error('fincloud_topup_lookup_failed', {
+                reffId,
+                code: fetchTxErr.code,
+                message: fetchTxErr.message,
+            });
+            return res.status(500).json({ error: 'Database error' });
+        }
+
+        if (!tx) {
+            logger.sampled(
+                'warn',
+                `fincloud_topup_not_found:${reffId}`,
+                60000,
+                'fincloud_topup_not_found',
+                { reffId }
+            );
             return res.status(404).json({ error: 'Topup not found' });
         }
 
@@ -88,10 +104,10 @@ async function handlePaymentGatewayWebhook(req, res) {
 
         try {
             await balanceService.creditTopup(tx);
-            console.log(`[Webhook/PG-FinCloud] Topup ${reffId} berhasil dikreditkan.`);
+            logger.info('fincloud_topup_credited', { reffId });
             return res.status(200).json({ status: true, message: 'Topup success' });
         } catch (err) {
-            console.error(`[Webhook/PG-FinCloud] Gagal kredit saldo untuk ${reffId}:`, err.message);
+            logger.error('fincloud_topup_credit_failed', { reffId, error: err });
             return res.status(500).json({ error: 'Failed to credit balance' });
         }
     }
@@ -104,8 +120,25 @@ async function handlePaymentGatewayWebhook(req, res) {
         .or(`id.eq.${reffId},pg_invoice.eq.${reffId}`)
         .maybeSingle();
 
-    if (fetchError || !order) {
-        console.error(`[Webhook/PG-FinCloud] Order ${reffId} tidak ditemukan:`, fetchError?.message);
+    if (fetchError) {
+        logger.error('fincloud_order_lookup_failed', {
+            reffId,
+            code: fetchError.code,
+            message: fetchError.message,
+        });
+        return res.status(500).json({ error: 'Database error' });
+    }
+
+    if (!order) {
+        // Repeated callbacks for the same legacy ID are rate-limited to one
+        // warning per minute per reference.
+        logger.sampled(
+            'warn',
+            `fincloud_order_not_found:${reffId}`,
+            60000,
+            'fincloud_order_not_found',
+            { reffId }
+        );
         return res.status(404).json({ error: 'Order not found' });
     }
 
@@ -121,7 +154,7 @@ async function handlePaymentGatewayWebhook(req, res) {
     };
 
     // 4. Update pg_paid_at & proses fulfillment
-    await supabase
+    const { error: updateError } = await supabase
         .from('orders')
         .update({
             pg_paid_at: payload.timestamp || new Date().toISOString(),
@@ -129,9 +162,21 @@ async function handlePaymentGatewayWebhook(req, res) {
         })
         .eq('id', order.id);
 
+    if (updateError) {
+        logger.error('fincloud_order_update_failed', {
+            orderId: order.id,
+            code: updateError.code,
+            message: updateError.message,
+        });
+        return res.status(500).json({ error: 'Database error' });
+    }
+
     const fulfillmentResult = await orderFulfillmentService.fulfillOrder(order);
     if (!fulfillmentResult.success && !fulfillmentResult.skipped) {
-        console.error(`[Webhook/PG-FinCloud] Fulfillment order gagal untuk ${order.id}:`, fulfillmentResult.message);
+        logger.error('fincloud_fulfillment_failed', {
+            orderId: order.id,
+            message: fulfillmentResult.message,
+        });
     }
 
     return res.status(200).json({ status: true, message: 'OK' });

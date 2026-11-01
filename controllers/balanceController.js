@@ -3,6 +3,7 @@ const supabase = require('../supabase');
 const paymentGatewayService = require('../services/paymentGatewayService');
 const sekalipayGatewayService = require('../services/sekalipayGatewayService');
 const dyqrisGatewayService = require('../services/dyqrisGatewayService');
+const { logger } = require('../utils/logger');
 
 const { getActivePaymentGateway } = require('./paymentController');
 
@@ -58,8 +59,8 @@ async function createTopup(req, res) {
             qrLink = pgRes.data.qr_link || pgRes.data.payment_link || null;
             total = pgRes.data.total || amount;
             pgExpiredAt = pgRes.data.expired_at ? new Date(pgRes.data.expired_at) : new Date(Date.now() + 30 * 60 * 1000);
-        } else {
-            // fincloud (default)
+        } else if (pgProvider === 'fincloud') {
+            // Legacy provider, only used when explicitly selected in settings.
             const pgRes = await paymentGatewayService.createInvoice({
                 reffId: topupId,
                 nominal: amount,
@@ -69,6 +70,8 @@ async function createTopup(req, res) {
             qrLink = pgRes.data.qris_url || pgRes.data.qr_url || (pgRes.data.qris_string ? `https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${encodeURIComponent(pgRes.data.qris_string)}` : null);
             total = pgRes.data.total_bayar || pgRes.data.nominal_total || amount;
             pgExpiredAt = new Date(Date.now() + 30 * 60 * 1000);
+        } else {
+            throw new Error('Payment gateway tidak dikenali');
         }
 
         // Batalkan topup pending sebelumnya milik user ini agar tidak menumpuk
@@ -161,12 +164,20 @@ async function getTopupStatus(req, res) {
                     const s = statusRes.success && statusRes.data ? (statusRes.data.status || '').toUpperCase() : '';
                     if (s === 'PAID' || s === 'SUCCESS' || s === 'COMPLETED') isPaid = true;
                     else if (s === 'EXPIRED' || s === 'CANCELLED' || s === 'FAILED') isExpired = true;
-                } else {
-                    // fincloud
+                } else if (tx.pg_provider === 'fincloud') {
                     const statusRes = await paymentGatewayService.checkInvoiceStatus(tx.pg_invoice || tx.reference_id);
                     const s = statusRes.success && statusRes.data ? (statusRes.data.status || '').toUpperCase() : '';
                     if (s === 'PAID' || s === 'SUCCESS') isPaid = true;
                     else if (s === 'EXPIRED' || s === 'CANCELLED') isExpired = true;
+                } else {
+                    // Unknown/missing provider: do not assume FinCloud.
+                    logger.sampled(
+                        'warn',
+                        `unknown_topup_provider:${tx.pg_provider || 'null'}`,
+                        60000,
+                        'unknown_topup_provider_skip',
+                        { referenceId: tx.reference_id, pgProvider: tx.pg_provider || null }
+                    );
                 }
             } catch (pgError) {
                 console.error(`Error polling status for topup ${tx.reference_id}:`, pgError.message);

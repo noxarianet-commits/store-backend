@@ -1,6 +1,10 @@
 const express = require('express');
 const router = express.Router();
 const webhookController = require('../controllers/webhookController');
+const {
+    fincloudWebhookGate,
+    fincloudIgnoredReffGate,
+} = require('../middleware/fincloudWebhook');
 
 /**
  * Middleware khusus untuk webhook Sekalipay Reseller:
@@ -15,13 +19,20 @@ const rawBodyMiddleware = express.json({
 
 /**
  * POST /api/webhooks/payment-gateway
- * Callback dari FinCloud ketika pembayaran QRIS user berhasil (payment.success).
- * Mendukung payload JSON dan urlencoded.
+ * Callback dari FinCloud ketika pembayaran QRIS user berhasil.
+ *
+ * Gate order matters:
+ * 1. fincloudWebhookGate runs before body parsing. If FinCloud is disabled,
+ *    no body is parsed and no Supabase query is made.
+ * 2. Raw body is preserved for signature verification when enabled.
+ * 3. Ignored legacy reference IDs are acknowledged without DB access.
  */
 router.post(
     '/payment-gateway',
+    fincloudWebhookGate,
     rawBodyMiddleware,
     express.urlencoded({ extended: true }),
+    fincloudIgnoredReffGate,
     webhookController.handlePaymentGatewayWebhook
 );
 

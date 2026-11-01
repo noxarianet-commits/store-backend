@@ -90,8 +90,15 @@ async function generateUniqueCode() {
 
 /**
  * Read active payment gateway setting from Supabase.
- * Returns 'fincloud' (default) | 'sekalipay' | 'dyqris'.
+ *
+ * DYQRIS is the safe default. FinCloud may still be selected explicitly for
+ * historical compatibility, but missing/invalid configuration must never
+ * silently reactivate the legacy provider.
+ *
+ * Returns 'dyqris' (default) | 'sekalipay' | 'fincloud'.
  */
+const DEFAULT_PAYMENT_GATEWAY = 'dyqris';
+
 async function getActivePaymentGateway() {
     try {
         const { data, error } = await supabase
@@ -100,20 +107,34 @@ async function getActivePaymentGateway() {
             .eq('key', 'payment_gateway')
             .maybeSingle();
 
-        if (error || !data || !data.value) return 'fincloud';
+        if (error || !data || !data.value) return DEFAULT_PAYMENT_GATEWAY;
         let val = data.value;
         if (typeof val === 'string') {
             try { val = JSON.parse(val); } catch (e) {}
         }
         if (typeof val === 'object' && val !== null) {
-            val = val.provider || val.value || val.gateway || 'fincloud';
+            val = val.provider || val.value || val.gateway || DEFAULT_PAYMENT_GATEWAY;
         }
         const strVal = String(val).toLowerCase().trim();
         if (strVal === 'sekalipay') return 'sekalipay';
         if (strVal === 'dyqris') return 'dyqris';
-        return 'fincloud';
+        if (strVal === 'fincloud') {
+            // Never create new FinCloud invoices while its webhook is
+            // disabled: confirmations would be ignored and payments could be
+            // lost. Historical FinCloud orders are still handled by polling.
+            if (process.env.FINCLOUD_WEBHOOK_ENABLED === 'true') return 'fincloud';
+            logger.sampled(
+                'warn',
+                'fincloud_gateway_disabled_fallback',
+                60000,
+                'fincloud_gateway_disabled_fallback',
+                { fallback: DEFAULT_PAYMENT_GATEWAY }
+            );
+            return DEFAULT_PAYMENT_GATEWAY;
+        }
+        return DEFAULT_PAYMENT_GATEWAY;
     } catch {
-        return 'fincloud';
+        return DEFAULT_PAYMENT_GATEWAY;
     }
 }
 
@@ -552,7 +573,7 @@ async function createPayment(req, res) {
             pgPaymentLink = pgData.payment_link || pgData.checkout_url || null;
             pgQrLink = pgData.qr_link || pgData.payment_link || null;
 
-        } else {
+        } else if (pgProvider === 'fincloud') {
             const pgResult = await paymentGatewayService.createInvoice({
                 reffId: orderId,
                 nominal: amount,
@@ -568,6 +589,8 @@ async function createPayment(req, res) {
             pgInvoice = String(pgData.reff_id || pgData.external_id || pgData.id_depo || orderId);
             pgPaymentLink = pgData.checkout_url || pgData.invoice_url || null;
             pgQrLink = pgData.qris_url || pgData.qr_url || (pgData.qris_string ? `https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${encodeURIComponent(pgData.qris_string)}` : null);
+        } else {
+            return res.status(500).json({ error: 'Payment gateway tidak dikenali' });
         }
 
         const effectiveUniqueCode = pgProvider === 'dyqris'

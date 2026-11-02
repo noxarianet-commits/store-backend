@@ -4,6 +4,8 @@
  * deduplicating catalog items for public display, and constructing multi-vendor server payloads.
  */
 
+const { sanitizeProviderMeta } = require('./publicProduct');
+
 const VENDOR_DISPLAY_NAMES = {
     sekalipay: 'Server 1 (Sekalipay)',
     okeconnect: 'Server 2 (OkeConnect)',
@@ -91,23 +93,26 @@ function getCanonicalDisplayName(product) {
  * @param {number|string} productId - Product ID
  * @returns {Array} Public variants
  */
-function formatPublicVariants(rawVariants = [], vendor = 'sekalipay', productId = null) {
+function formatPublicVariants(rawVariants = [], vendor = 'sekalipay', productId = null, productType = 'prepaid') {
+    const isPostpaid = productType === 'postpaid';
+
     return (rawVariants || [])
         .filter(v => v.is_active !== false && !v.is_hidden)
         .map(v => ({
-            id: v.vendor_variant_id,
+            id: isPostpaid ? String(v.id) : v.vendor_variant_id,
             db_id: v.id,
             product_id: productId,
             vendor: vendor,
-            sku: v.metadata?.sku || v.vendor_variant_id,
+            sku: isPostpaid ? null : (v.metadata?.sku || v.vendor_variant_id),
             name: v.name,
-            price: v.sell_price || 0,
-            sell_price: v.sell_price || 0,
+            price: isPostpaid ? 0 : (v.sell_price || 0),
+            sell_price: isPostpaid ? 0 : (v.sell_price || 0),
+            admin_fee: isPostpaid ? (v.sell_price || 0) : undefined,
             stock: v.stock !== undefined ? v.stock : 9999,
             order_process: v.order_process || 'auto',
             required_fields: v.required_fields || [],
             validation: v.validation || {},
-            provider_meta: v.provider_meta || {},
+            provider_meta: sanitizeProviderMeta(v.provider_meta, isPostpaid),
             note: v.note || '',
         }))
         .sort((a, b) => (a.price || 0) - (b.price || 0));
@@ -129,7 +134,7 @@ function groupProducts(productRows = []) {
         const key = getCanonicalKey(p.name);
         const groupKey = key || `prod-${p.id}`;
 
-        const publicVariants = formatPublicVariants(p.product_variants, p.vendor, p.id);
+        const publicVariants = formatPublicVariants(p.product_variants, p.vendor, p.id, p.product_type);
 
         if (!groups.has(groupKey)) {
             // Pick preferred representative metadata: prefer Sekalipay or first item with valid image/icon
@@ -143,6 +148,8 @@ function groupProducts(productRows = []) {
                 image: p.image || null,
                 is_active: true,
                 is_featured: p.is_featured || false,
+                product_type: p.product_type || 'prepaid',
+                is_postpaid: (p.product_type || 'prepaid') === 'postpaid',
                 synced_at: p.synced_at,
                 created_at: p.created_at,
                 servers: [],
@@ -217,7 +224,7 @@ function buildMultiServerProduct(primaryProduct, peerProducts = []) {
     }
 
     // Fallback if grouping produced empty
-    const publicVariants = formatPublicVariants(primaryProduct.product_variants, primaryProduct.vendor, primaryProduct.id);
+    const publicVariants = formatPublicVariants(primaryProduct.product_variants, primaryProduct.vendor, primaryProduct.id, primaryProduct.product_type);
     return {
         id: primaryProduct.id,
         vendor: primaryProduct.vendor,
@@ -229,6 +236,8 @@ function buildMultiServerProduct(primaryProduct, peerProducts = []) {
         image: primaryProduct.image,
         is_active: primaryProduct.is_active,
         is_featured: primaryProduct.is_featured,
+        product_type: primaryProduct.product_type || 'prepaid',
+        is_postpaid: (primaryProduct.product_type || 'prepaid') === 'postpaid',
         variants: publicVariants,
         servers: [
             {

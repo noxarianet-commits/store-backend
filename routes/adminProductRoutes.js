@@ -20,6 +20,7 @@ router.get('/featured-options', adminProductController.getFeaturedOptions);
 router.patch('/products/:id/markup', adminProductController.updateMarkup);
 router.patch('/products/:id/toggle', adminProductController.toggleActive);
 router.patch('/products/:id/featured', adminProductController.toggleFeatured);
+router.patch('/products/:id/channels', adminProductController.updateChannels);
 
 // Variant hidden toggle & note (support both route patterns)
 router.patch('/variants/:id/toggle-hidden', adminProductController.toggleVariantHidden);

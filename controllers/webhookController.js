@@ -577,6 +577,13 @@ async function handleOkeconnectWebhook(req, res) {
 
         const event = adapter.parseWebhookEvent(req.body, req.headers, queryParams);
 
+        // Postpaid bill inquiry callback (refId starts with BILLINQ).
+        if (refId.startsWith('BILLINQ') && typeof adapter.handleBillInquiryCallback === 'function') {
+            adapter.handleBillInquiryCallback(refId, event);
+            console.log(`[Webhook/OkeConnect] Dispatched bill inquiry callback for ${refId} (status: ${event.status}).`);
+            return res.status(200).json({ refid: refId, message: message || 'OK', status: 'bill_inquiry_processed' });
+        }
+
         // Check if this is an account inquiry callback (refId starts with INQ)
         if (refId.startsWith('INQ') && typeof adapter.handleInquiryCallback === 'function') {
             adapter.handleInquiryCallback(refId, event);
@@ -649,6 +656,10 @@ async function handleOkeconnectWebhook(req, res) {
                     await balanceService.refundBalance(order.user_id, order.price, order.id, `Refund otomatis: Transaksi gagal di OkeConnect`);
                 } catch (err) {
                     console.error(`[Webhook/Okeconnect] Auto-refund gagal untuk ${order.id}:`, err.message);
+                    await supabase
+                        .from('orders')
+                        .update({ status: 'REFUND_PENDING', error_message: `Refund gagal otomatis: ${err.message}` })
+                        .eq('id', order.id);
                 }
             }
 

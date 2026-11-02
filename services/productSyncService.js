@@ -55,11 +55,15 @@ class ProductSyncService {
      * @param {string} vendorName - 'sekalipay' | 'fincloud' | custom vendor
      * @param {Object} options - { type: 'full'|'delta', category?: number|string }
      */
-    async syncVendor(vendorName, { type = 'full', category } = {}) {
-        console.log(`[ProductSyncService] Starting ${type} sync for vendor: ${vendorName}...`);
+    async syncVendor(vendorName, { type = 'full', category, productType = 'prepaid' } = {}) {
+        console.log(`[ProductSyncService] Starting ${type} ${productType} sync for vendor: ${vendorName}...`);
         const adapter = vendorRegistry.get(vendorName);
         if (!adapter) {
             throw new Error(`Vendor adapter '${vendorName}' is not registered`);
+        }
+
+        if (productType === 'postpaid') {
+            return await this._syncPostpaid(adapter, vendorName, { type });
         }
 
         if (vendorName === 'sekalipay') {
@@ -67,6 +71,39 @@ class ProductSyncService {
         } else {
             return await this._syncGenericVendor(adapter, vendorName, { type });
         }
+    }
+
+    /**
+     * Postpaid bill sync. Kept separate from the prepaid catalog so a full
+     * prepaid sync can never deactivate bill products (and vice versa).
+     */
+    async _syncPostpaid(adapter, vendorName, { type = 'full' } = {}) {
+        if (typeof adapter.fetchPostpaidProducts !== 'function') {
+            throw new Error(`Vendor '${vendorName}' does not support postpaid products`);
+        }
+
+        const res = await adapter.fetchPostpaidProducts({ type });
+        if (!res.success || !Array.isArray(res.data)) {
+            throw new Error(res.message || `Gagal mengambil produk postpaid dari ${vendorName}`);
+        }
+
+        const stats = await this._persistUnifiedProducts(vendorName, res.data, type === 'full', {
+            productType: 'postpaid',
+            defaultChannels: ['app'],
+        });
+
+        await this.setLastSyncTime(`${vendorName}_postpaid`, {
+            type,
+            productCount: stats.productsUpserted,
+        });
+
+        cacheService.invalidateHome();
+        return {
+            success: true,
+            vendor: vendorName,
+            productType: 'postpaid',
+            ...stats,
+        };
     }
 
     /**
@@ -162,10 +199,13 @@ class ProductSyncService {
      * Core persistence routine to upsert products and variants while preserving
      * existing markups and hidden states in product_variants.
      */
-    async _persistUnifiedProducts(vendorName, productList, isFullSync = false) {
+    async _persistUnifiedProducts(vendorName, productList, isFullSync = false, options = {}) {
         if (!productList || productList.length === 0) {
             return { productsUpserted: 0, variantsUpserted: 0 };
         }
+
+        const productType = options.productType || 'prepaid';
+        const defaultChannels = options.defaultChannels || (productType === 'postpaid' ? ['app'] : ['web', 'app']);
 
         const externalIds = productList.map(p => p.external_id);
 
@@ -180,7 +220,7 @@ class ProductSyncService {
         while (pHasMore) {
             const { data: pChunk, error: pErr } = await supabase
                 .from('products')
-                .select('id, external_id, is_active, is_featured, image, icon')
+                .select('id, external_id, is_active, is_featured, image, icon, product_type, available_channels')
                 .eq('vendor', vendorName)
                 .range(pFrom, pFrom + P_PAGE_SIZE - 1);
 
@@ -251,6 +291,10 @@ class ProductSyncService {
                 const preservedImage = (existing && existing.image) ? existing.image : (p.image || null);
                 const preservedIcon = (existing && existing.icon) ? existing.icon : (p.icon || null);
 
+                const channels = existing?.available_channels?.length
+                    ? existing.available_channels
+                    : (p.available_channels || defaultChannels);
+
                 return {
                     vendor: vendorName,
                     external_id: p.external_id,
@@ -261,6 +305,8 @@ class ProductSyncService {
                     brand: p.brand || null,
                     is_active: existing ? existing.is_active : p.is_active,
                     is_featured: existing ? (existing.is_featured || false) : false,
+                    product_type: existing?.product_type || p.product_type || productType,
+                    available_channels: channels,
                     metadata: p.metadata || {},
                     synced_at: nowIso,
                 };
@@ -338,9 +384,11 @@ class ProductSyncService {
         }
 
 
-        // 3. If full sync, deactivate products missing from vendor response
+        // 3. If full sync, deactivate products missing from vendor response.
+        // Scope by product_type so prepaid and postpaid catalogs never wipe
+        // each other out.
         if (isFullSync && externalIds.length > 0) {
-            await this._deactivateMissing(vendorName, externalIds);
+            await this._deactivateMissing(vendorName, externalIds, productType);
         }
 
         return { productsUpserted, variantsUpserted };
@@ -349,12 +397,13 @@ class ProductSyncService {
     /**
      * Deactivate products no longer present in vendor full sync.
      */
-    async _deactivateMissing(vendorName, activeExternalIds) {
+    async _deactivateMissing(vendorName, activeExternalIds, productType = 'prepaid') {
         try {
             const { error } = await supabase
                 .from('products')
                 .update({ is_active: false })
                 .eq('vendor', vendorName)
+                .eq('product_type', productType)
                 .not('external_id', 'in', `(${activeExternalIds.join(',')})`);
 
             if (error) {

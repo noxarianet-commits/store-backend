@@ -34,6 +34,7 @@ const authRoutes = require('./routes/authRoutes');
 const balanceRoutes = require('./routes/balanceRoutes');
 const ticketRoutes = require('./routes/ticketRoutes');
 const adminTicketRoutes = require('./routes/adminTicketRoutes');
+const mobileRoutes = require('./routes/mobileRoutes');
 
 const verifyAdmin = require('./middleware/verifyAdmin');
 const verifyUser = require('./middleware/verifyUser');
@@ -54,7 +55,9 @@ const globalLimiter = rateLimit({
     // sampai koneksi itu menghabiskan kuota request halaman lain.
     // Path pelanggan mengandung nomor tiket (mis. /api/tickets/TK-.../stream),
     // jadi cocokkan suffix '/stream', bukan '/tickets/stream'.
-    skip: (req) => req.path.includes('/payments/status') || req.path.endsWith('/stream'),
+    skip: (req) => req.path.includes('/payments/status') ||
+        req.path.endsWith('/stream') ||
+        (req.method === 'GET' && /\/mobile\/orders\/[^/]+$/.test(req.path)),
     message: { error: 'Terlalu banyak request, silakan coba lagi nanti.' },
     standardHeaders: true,
     legacyHeaders: false,
@@ -65,7 +68,7 @@ app.use(cors({
     origin: true,
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'x-admin-token', 'x-order-token', 'x-ticket-token', 'x-signature', 'x-event', 'x-webhook-signature', 'x-callback-secret', '*'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'x-admin-token', 'x-order-token', 'x-ticket-token', 'idempotency-key', 'x-signature', 'x-event', 'x-webhook-signature', 'x-callback-secret', '*'],
     optionsSuccessStatus: 200
 }));
 
@@ -97,6 +100,7 @@ app.use('/api/settings', settingsRoutes);
 app.use('/api/testimonials', testimonialRoutes);
 app.use('/api/payments', paymentRoutes);
 app.use('/api/auth', authRoutes);
+app.use('/api/mobile', mobileRoutes);
 app.use('/api/balance', verifyUser, balanceRoutes);
 app.use('/api/tickets', ticketRoutes);
 
@@ -212,6 +216,27 @@ if (cronEnabled) {
         }
     });
 
+    // OkeConnect postpaid bill catalog daily at 04:30. Kept separate from the
+    // prepaid full sync so each catalog has its own deactivation scope.
+    cron.schedule('30 4 * * *', async () => {
+        if (productSyncRunning) {
+            logger.warn('product_sync_skipped_overlap', { job: 'okeconnect_postpaid_full' });
+            return;
+        }
+        productSyncRunning = true;
+        try {
+            const result = await productSyncService.syncVendor('okeconnect', {
+                type: 'full',
+                productType: 'postpaid',
+            });
+            logger.info('product_sync_completed', { job: 'okeconnect_postpaid_full', ...result });
+        } catch (err) {
+            logger.error('product_sync_failed', { job: 'okeconnect_postpaid_full', error: err });
+        } finally {
+            productSyncRunning = false;
+        }
+    });
+
     // Background balance refresh for OkeConnect
     cron.schedule('*/5 * * * *', async () => {
         try {
@@ -221,6 +246,28 @@ if (cronEnabled) {
             }
         } catch (err) {
             logger.warn('okeconnect_balance_refresh_failed', { message: err.message });
+        }
+    });
+
+    // Reconcile balance orders that never received a vendor callback. This is
+    // the safety net for mobile polling and postpaid bills.
+    cron.schedule('*/5 * * * *', async () => {
+        try {
+            const orderStatusService = require('./services/orderStatusService');
+            await orderStatusService.reconcileProcessingOrders();
+        } catch (err) {
+            logger.error('order_reconciliation_failed', { error: err });
+        }
+    });
+
+    // Expire stale bill quotes so they cannot be used after the vendor amount
+    // may have changed.
+    cron.schedule('*/10 * * * *', async () => {
+        try {
+            const billService = require('./services/billService');
+            await billService.expireStale();
+        } catch (err) {
+            logger.error('bill_inquiry_expiry_failed', { error: err });
         }
     });
 
@@ -234,7 +281,9 @@ if (cronEnabled) {
 
     logger.info('cron_scheduled', {
         paymentSchedule,
-        productSync: 'sekalipay delta 1h/full 03:00, okeconnect full 04:00',
+        productSync: 'sekalipay delta 1h/full 03:00, okeconnect full 04:00, okeconnect postpaid 04:30',
+        orderReconciliation: 'every 5 minutes',
+        billQuoteCleanup: 'every 10 minutes',
         otpCleanup: 'daily 05:15',
         pm2Instance: pm2Instance ?? null,
     });

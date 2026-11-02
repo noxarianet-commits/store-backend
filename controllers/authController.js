@@ -60,16 +60,38 @@ function maskEmail(email) {
 }
 
 /**
- * Sign token untuk user yang baru selesai verifikasi.
- * Dipakai oleh verifyRegistration; login memakai payload yang sama persis,
- * jadi token dari kedua jalur tidak bisa dibedakan oleh verifyUser.
+ * Sign token untuk customer.
+ *
+ * `client` membedakan sesi web dari sesi aplikasi Android. Token lama tanpa
+ * claim ini diperlakukan sebagai web oleh verifyUser.
  */
-function signUserToken(user) {
+function signUserToken(user, { client = 'web', expiresIn = '7d' } = {}) {
     return jwt.sign(
-        { id: user.id, email: user.email, display_name: user.display_name, type: 'user' },
+        {
+            id: user.id,
+            email: user.email,
+            display_name: user.display_name,
+            type: 'user',
+            client,
+        },
         JWT_SECRET,
-        { expiresIn: '7d' }
+        { expiresIn }
     );
+}
+
+/**
+ * Token options for the current route.
+ *
+ * The web route leaves these unset. The mobile router sets them before calling
+ * the shared controller, so login and registration-verify can mint an app
+ * token without duplicating the authentication logic.
+ */
+function tokenOptions(req) {
+    const client = String(req.authClient || 'web').toLowerCase() === 'android'
+        ? 'android'
+        : 'web';
+    const expiresIn = req.authTokenExpiry || (client === 'android' ? '30d' : '7d');
+    return { client, expiresIn };
 }
 
 /**
@@ -367,7 +389,7 @@ async function verifyRegistration(req, res) {
 
         res.json({
             success: true,
-            token: signUserToken(newUser),
+            token: signUserToken(newUser, tokenOptions(req)),
             user: newUser,
         });
     } catch (err) {
@@ -628,7 +650,7 @@ async function login(req, res) {
 
         delete user.password_hash;
 
-        res.json({ success: true, token: signUserToken(user), user });
+        res.json({ success: true, token: signUserToken(user, tokenOptions(req)), user });
     } catch (err) {
         console.error('Login Error:', err);
         res.status(500).json({ success: false, error: 'Terjadi kesalahan server.' });

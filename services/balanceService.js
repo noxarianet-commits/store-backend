@@ -54,6 +54,14 @@ class BalanceService {
             p_description: description
         });
         if (error) throw error;
+
+        // The RPC reports business failures (insufficient balance, inactive
+        // user) as { success: false, error } instead of raising. Callers must
+        // never continue to create an order when the debit did not happen.
+        if (!data?.success) {
+            throw new Error(data?.error || 'Saldo tidak mencukupi');
+        }
+
         return data;
     }
 
@@ -65,6 +73,15 @@ class BalanceService {
             p_description: description
         });
         if (error) throw error;
+
+        // Already-refunded is a successful no-op for retry paths. Any other
+        // business failure (user missing/inactive) must be surfaced so the
+        // order can stay in REFUND_PENDING for manual/automated retry.
+        const alreadyRefunded = /sudah pernah di-refund/i.test(data?.error || '');
+        if (!data?.success && !alreadyRefunded) {
+            throw new Error(data?.error || 'Gagal mengembalikan saldo');
+        }
+
         return data;
     }
 

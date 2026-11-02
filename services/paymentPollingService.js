@@ -362,21 +362,164 @@ class PaymentPollingService {
 
             const { data: orders, error } = await supabase
                 .from('orders')
-                .update({ status: 'CANCELLED', error_message: 'Expired: Unpaid for more than 30 minutes' })
+                .select('id, payment_type, user_id, price, status')
                 .eq('status', 'PENDING')
                 .lt('timestamp', expiredTime.toISOString())
-                .select('id');
+                .order('timestamp', { ascending: true })
+                .limit(200);
 
             if (error) {
-                pollingLog.error('expired_order_update_failed', { code: error.code });
+                pollingLog.error('expired_order_query_failed', { code: error.code });
+                await this.retryPendingRefunds();
                 return;
             }
 
-            if (orders && orders.length > 0) {
-                pollingLog.info('expired_orders_cancelled', { count: orders.length });
+            if (!orders || orders.length === 0) {
+                await this.retryPendingRefunds();
+                return;
             }
+
+            const balanceService = require('./balanceService');
+            let cancelled = 0;
+            let refunded = 0;
+
+            for (const order of orders) {
+                // Balance orders were already paid at creation time. Claim the
+                // order with an intermediate status first so fulfillment can
+                // never claim it while we are refunding.
+                if (order.payment_type === 'balance' && order.user_id) {
+                    const { data: claimed, error: claimError } = await supabase
+                        .from('orders')
+                        .update({
+                            status: 'REFUND_PENDING',
+                            error_message: 'Expired: refunding balance before cancellation',
+                        })
+                        .eq('id', order.id)
+                        .eq('status', 'PENDING')
+                        .select('id');
+
+                    if (claimError) {
+                        pollingLog.error('expired_order_claim_failed', {
+                            orderId: order.id,
+                            code: claimError.code,
+                        });
+                        continue;
+                    }
+                    if (!claimed || claimed.length === 0) continue;
+
+                    try {
+                        await balanceService.refundBalance(
+                            order.user_id,
+                            order.price,
+                            order.id,
+                            'Refund otomatis: pesanan kedaluwarsa sebelum diproses'
+                        );
+
+                        await supabase
+                            .from('orders')
+                            .update({ status: 'CANCELLED' })
+                            .eq('id', order.id)
+                            .eq('status', 'REFUND_PENDING');
+
+                        refunded++;
+                        cancelled++;
+                    } catch (refundErr) {
+                        // Leave REFUND_PENDING. retryPendingRefunds() will try
+                        // again on the next payment sweep.
+                        pollingLog.error('expired_balance_order_refund_failed', {
+                            orderId: order.id,
+                            message: refundErr.message,
+                        });
+                    }
+                    continue;
+                }
+
+                const { data: cancelledRows, error: cancelError } = await supabase
+                    .from('orders')
+                    .update({
+                        status: 'CANCELLED',
+                        error_message: 'Expired: Unpaid for more than 30 minutes',
+                    })
+                    .eq('id', order.id)
+                    .eq('status', 'PENDING')
+                    .select('id');
+
+                if (cancelError) {
+                    pollingLog.error('expired_order_cancel_failed', {
+                        orderId: order.id,
+                        code: cancelError.code,
+                    });
+                    continue;
+                }
+
+                if (cancelledRows && cancelledRows.length > 0) cancelled++;
+            }
+
+            pollingLog.info('expired_orders_cancelled', { count: cancelled, refunded });
+
+            await this.retryPendingRefunds();
         } catch (err) {
             pollingLog.error('expired_order_sweep_failed', { error: err });
+        }
+    }
+
+    /**
+     * Retry balance refunds for orders left in REFUND_PENDING by a failed
+     * cancellation refund. refund_balance is idempotent, so this is safe to
+     * run on every payment sweep.
+     */
+    async retryPendingRefunds() {
+        try {
+            const { data: orders, error } = await supabase
+                .from('orders')
+                .select('id, payment_type, user_id, price, status')
+                .eq('status', 'REFUND_PENDING')
+                .limit(200);
+
+            if (error) {
+                pollingLog.error('refund_pending_query_failed', { code: error.code });
+                return { success: false, retried: 0 };
+            }
+
+            if (!orders || orders.length === 0) return { success: true, retried: 0 };
+
+            const balanceService = require('./balanceService');
+            let completed = 0;
+
+            for (const order of orders) {
+                if (order.payment_type !== 'balance' || !order.user_id) continue;
+
+                try {
+                    await balanceService.refundBalance(
+                        order.user_id,
+                        order.price,
+                        order.id,
+                        'Refund otomatis: pesanan kedaluwarsa sebelum diproses'
+                    );
+
+                    await supabase
+                        .from('orders')
+                        .update({ status: 'CANCELLED' })
+                        .eq('id', order.id)
+                        .eq('status', 'REFUND_PENDING');
+
+                    completed++;
+                } catch (err) {
+                    pollingLog.error('refund_pending_retry_failed', {
+                        orderId: order.id,
+                        message: err.message,
+                    });
+                }
+            }
+
+            if (completed > 0) {
+                pollingLog.info('refund_pending_completed', { count: completed });
+            }
+
+            return { success: true, retried: completed };
+        } catch (err) {
+            pollingLog.error('refund_pending_sweep_failed', { error: err });
+            return { success: false, retried: 0 };
         }
     }
 

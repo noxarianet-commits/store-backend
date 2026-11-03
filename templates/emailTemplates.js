@@ -23,6 +23,16 @@ function formatRupiah(amount) {
 }
 
 /**
+ * Total yang ditampilkan di email: ambil dari pg_total (termasuk fee/kode unik),
+ * fallback ke price jika pg_total 0 / tidak ada (order saldo, order lama).
+ * @param {Object} order
+ * @returns {number}
+ */
+function resolveDisplayTotal(order) {
+    return Number(order?.pg_total) > 0 ? order.pg_total : order.price;
+}
+
+/**
  * Escape HTML entities untuk mencegah XSS di template email.
  * @param {string} str
  * @returns {string}
@@ -552,7 +562,7 @@ function buildCompletedEmailHtml(order, waNumber = '6285199605580') {
                                             </tr>
                                             <tr>
                                                 <td style="padding:6px 0; color:#666; font-size:13px;">Total Bayar</td>
-                                                <td style="padding:6px 0; color:#1a237e; font-size:14px; font-weight:700;">${formatRupiah(order.price)}</td>
+                                                <td style="padding:6px 0; color:#1a237e; font-size:14px; font-weight:700;">${formatRupiah(resolveDisplayTotal(order))}</td>
                                             </tr>
                                         </table>
                                     </td>
@@ -654,7 +664,7 @@ function buildFailedEmailHtml(order, waNumber = '6285199605580') {
                                             </tr>
                                             <tr>
                                                 <td style="padding:6px 0; color:#666; font-size:13px;">Total</td>
-                                                <td style="padding:6px 0; color:#c62828; font-size:14px; font-weight:700;">${formatRupiah(order.price)}</td>
+                                                <td style="padding:6px 0; color:#c62828; font-size:14px; font-weight:700;">${formatRupiah(resolveDisplayTotal(order))}</td>
                                             </tr>
                                         </table>
                                     </td>

@@ -133,6 +133,29 @@ async function getHome(req, res) {
     }
 }
 
+/**
+ * Bill products are grouped (one product per OkeConnect biller group), so the
+ * region a customer types ("bandung", "jakarta") lives on the variant name and
+ * not on the product name. Returns the bill product ids whose variants match.
+ */
+async function findBillProductIdsByVariantName(search) {
+    const { data, error } = await supabase
+        .from('product_variants')
+        .select('product_id, products!inner(product_type)')
+        .ilike('name', `%${search}%`)
+        .eq('is_active', true)
+        .eq('is_hidden', false)
+        .eq('products.product_type', 'postpaid')
+        .limit(500);
+
+    if (error) {
+        logger.warn('mobile_variant_search_failed', { code: error.code });
+        return [];
+    }
+
+    return [...new Set((data || []).map(row => row.product_id).filter(Boolean))];
+}
+
 async function listProducts(req, res) {
     try {
         const {
@@ -161,7 +184,24 @@ async function listProducts(req, res) {
             query = query.eq('category', category);
         }
         if (search) {
-            query = query.or(`name.ilike.%${search}%,category.ilike.%${search}%,brand.ilike.%${search}%`);
+            // Commas and parentheses would break the PostgREST `or=` filter.
+            const term = String(search).replace(/[,()\\]/g, ' ').trim();
+            if (term) {
+                const filters = [
+                    `name.ilike.%${term}%`,
+                    `category.ilike.%${term}%`,
+                    `brand.ilike.%${term}%`,
+                ];
+
+                if (type === 'postpaid') {
+                    const variantProductIds = await findBillProductIdsByVariantName(term);
+                    if (variantProductIds.length > 0) {
+                        filters.push(`id.in.(${variantProductIds.join(',')})`);
+                    }
+                }
+
+                query = query.or(filters.join(','));
+            }
         }
 
         const { data, error, count } = await query.range(offset, offset + limit - 1);

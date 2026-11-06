@@ -159,6 +159,13 @@ const POSTPAID_GROUP_EXCLUDE = [
     'paket data', 'pulsa', 'masa aktif', 'kuota', 'bulk', 'cetak',
 ];
 
+// Vendor categories that are always prepaid / topup products. Rows in these
+// categories must never land in the bill catalog even when their description
+// says "Bayar ..." (e.g. "Bayar Paket Combo Sakti Omni").
+const POSTPAID_CATEGORY_EXCLUDE = [
+    'kuota', 'bulk', 'sms', 'digital', 'nominal bebas',
+];
+
 const POSTPAID_MANUAL_PAIRS = {
     BYRPGN: 'CEKPGN',
     BYRGAS: 'CEKGAS',
@@ -173,7 +180,7 @@ const POSTPAID_CATEGORY_RULES = [
     { test: /gas|pgn|pertagas/i, category: 'Tagihan Gas' },
     { test: /tv|vision|mnc|indovision|okevision|topas|transvision|yes/i, category: 'Tagihan TV' },
     { test: /pbb|pajak|samsat|tilang|retribusi/i, category: 'Pajak & Retribusi' },
-    { test: /telkom|indihome|speedy|pascabayar telepon|fren|telkomsel|indosat|smartfren|\btri\b|\bxl\b/i, category: 'Tagihan Telepon & Internet' },
+    { test: /telkom|indihome|speedy|internet|pascabayar telepon|fren|telkomsel|indosat|smartfren|\btri\b|\bxl\b/i, category: 'Tagihan Telepon & Internet' },
     { test: /finance|kredit|bpr|koperasi|asuransi|home credit|multifinance|cicilan/i, category: 'Tagihan Finansial' },
 ];
 
@@ -184,6 +191,7 @@ function isPostpaidPayItem(item) {
 
     if (POSTPAID_GROUP_EXCLUDE.some(keyword => group.includes(keyword))) return false;
     if (POSTPAID_GROUP_EXCLUDE.some(keyword => description.includes(keyword))) return false;
+    if (POSTPAID_CATEGORY_EXCLUDE.some(keyword => category.includes(keyword))) return false;
 
     // Inquiry rows are the "Cek ..." half of the pair, never the payment row.
     if (/^(cek|cek tagihan|cek pascabayar|inq)\b/i.test(description)) return false;
@@ -232,16 +240,46 @@ function findPostpaidInquiryItem(payItem, rawItems, byCode) {
     return null;
 }
 
+/**
+ * Normalize common Indonesian biller wording for display.
+ * "Bayar Pdam Kabupaten Bandung" -> "PDAM Kabupaten Bandung".
+ */
+function normalizeBillerText(text) {
+    return String(text || '')
+        .replace(/\bpdam\b/gi, 'PDAM')
+        .replace(/\bpln\b/gi, 'PLN')
+        .replace(/\bbpjs\b/gi, 'BPJS')
+        .replace(/\bpbb\b/gi, 'PBB')
+        .replace(/\bpgn\b/gi, 'PGN')
+        .replace(/\bpertagas\b/gi, 'Pertagas')
+        .replace(/\bipl\b/gi, 'IPL')
+        .replace(/\bkabupaten\b/gi, 'Kabupaten')
+        .replace(/\bkota\b/gi, 'Kota')
+        .trim();
+}
+
+/**
+ * Clean an OkeConnect price-list group name into a product display name.
+ * "Tagihan PBB Sumatera" -> "PBB Sumatera", "Bayar PLN Bulanan" -> "PLN Bulanan".
+ */
+function cleanPostpaidGroupName(groupName) {
+    const raw = String(groupName || '').trim();
+    const cleaned = raw.replace(/^(tagihan|bayar|pembayaran|cicilan)\s+/i, '').trim();
+    return normalizeBillerText(cleaned || raw) || 'Tagihan';
+}
+
 function cleanPostpaidBillerName(payItem) {
     let name = String(payItem?.keterangan || payItem?.kode || 'Tagihan')
         .replace(/^(bayar|pembayaran|tagihan|cicilan)\s+/i, '')
         .trim();
 
-    if (/tagihan listrik/i.test(name)) return 'PLN Pascabayar';
+    // Only the plain PLN bill collapses to the display alias. Every other PLN
+    // product ("PLN Non Tagihan Listrik", ...) must stay distinct so a grouped
+    // product keeps one variant per service.
+    if (/^tagihan listrik$/i.test(name)) return 'PLN Pascabayar';
     if (/^bpjs kesehatan$/i.test(name)) return 'BPJS Kesehatan';
-    if (/^pascabayar /i.test(name)) return name;
 
-    return name || String(payItem?.kode || 'Tagihan');
+    return normalizeBillerText(name) || String(payItem?.kode || 'Tagihan');
 }
 
 function postpaidCategoryFor(text) {
@@ -250,6 +288,20 @@ function postpaidCategoryFor(text) {
         if (rule.test.test(haystack)) return rule.category;
     }
     return 'Tagihan & PPOB';
+}
+
+/**
+ * Resolve the display category for a whole biller group. The group name is the
+ * primary signal; biller names only fill in groups the rules cannot classify,
+ * so a single odd biller name can never reclassify the whole group.
+ */
+function resolvePostpaidCategory(rawGroup, candidates) {
+    const groupName = cleanPostpaidGroupName(rawGroup);
+    const direct = postpaidCategoryFor(`${rawGroup} ${groupName}`);
+    if (direct !== 'Tagihan & PPOB') return direct;
+
+    const billerText = candidates.map(candidate => candidate.billerName).join(' ');
+    return postpaidCategoryFor(`${rawGroup} ${groupName} ${billerText}`);
 }
 
 /**
@@ -523,10 +575,15 @@ class OkeconnectAdapter extends VendorAdapter {
      * Fetch postpaid bill products (PLN, PDAM, BPJS, phone, TV, gas, PBB, ...).
      *
      * OkeConnect exposes paired codes: a "Cek ..." inquiry code and a "Bayar ..."
-     * payment code. One product is created per biller, with the payment code as
-     * the single variant. When a biller has several commission tiers (e.g. PLN
-     * BPLA/BPLA4000/BPLA4500), the highest active commission is chosen so the
-     * customer is not asked to pick between indistinguishable options.
+     * payment code. One catalog product is created per OkeConnect price-list
+     * group (`item.produk`), and every biller/region inside that group becomes a
+     * variant. Example: the group "PDAM Jawa Barat dan Jakarta" becomes the
+     * product of the same name with the variants "PDAM Kota Jakarta Aetra",
+     * "PDAM Kota Bandung", ...
+     *
+     * When a biller has several commission tiers (e.g. PLN BPLA/BPLA4000/
+     * BPLA4500), the highest active commission is chosen so the customer is not
+     * asked to pick between indistinguishable options.
      *
      * These products are app-only by default; the web storefront must never see
      * a bill product before the bill flow is explicitly enabled for it.
@@ -553,6 +610,9 @@ class OkeconnectAdapter extends VendorAdapter {
                 if (item?.kode) byCode.set(String(item.kode).toUpperCase(), item);
             }
 
+            // One entry per OkeConnect price-list group. Inside each group the
+            // key is the cleaned biller name so duplicate commission tiers for
+            // the same biller collapse into a single variant.
             const groups = new Map();
 
             for (const item of rawItems) {
@@ -561,8 +621,10 @@ class OkeconnectAdapter extends VendorAdapter {
                 const inquiryItem = findPostpaidInquiryItem(item, rawItems, byCode);
                 if (!inquiryItem) continue;
 
+                const rawGroup = String(item.produk || '').trim() || 'Tagihan Lainnya';
+                const groupKey = rawGroup.toLowerCase();
                 const billerName = cleanPostpaidBillerName(item);
-                const groupKey = `${billerName}::${item.produk || ''}`;
+                const billerKey = billerName.toLowerCase();
 
                 const price = parseInt(item.harga, 10) || 0;
                 const commission = Math.max(0, -price);
@@ -578,9 +640,15 @@ class OkeconnectAdapter extends VendorAdapter {
                     isActive,
                 };
 
-                const existing = groups.get(groupKey);
+                let group = groups.get(groupKey);
+                if (!group) {
+                    group = { rawGroup, billers: new Map() };
+                    groups.set(groupKey, group);
+                }
+
+                const existing = group.billers.get(billerKey);
                 if (!existing) {
-                    groups.set(groupKey, candidate);
+                    group.billers.set(billerKey, candidate);
                     continue;
                 }
 
@@ -589,17 +657,18 @@ class OkeconnectAdapter extends VendorAdapter {
                 const existingScore = (existing.isActive ? 1 : 0) * 1e9 + existing.commission;
                 const candidateScore = (candidate.isActive ? 1 : 0) * 1e9 + candidate.commission;
                 if (candidateScore > existingScore) {
-                    groups.set(groupKey, candidate);
+                    group.billers.set(billerKey, candidate);
                 }
             }
 
             const usedExternalIds = new Set();
             const normalizedProducts = [];
 
-            for (const candidate of groups.values()) {
-                const { payItem, inquiryItem, billerName, commission, vendorFee, isActive } = candidate;
+            for (const group of groups.values()) {
+                const candidates = [...group.billers.values()];
+                const groupName = cleanPostpaidGroupName(group.rawGroup);
 
-                const baseSlug = slugify(billerName);
+                const baseSlug = slugify(group.rawGroup) || 'group';
                 let externalId = `okc-bill-${baseSlug}`;
                 let suffix = 2;
                 while (usedExternalIds.has(externalId)) {
@@ -608,29 +677,10 @@ class OkeconnectAdapter extends VendorAdapter {
                 }
                 usedExternalIds.add(externalId);
 
-                const category = postpaidCategoryFor(`${payItem.produk || ''} ${billerName}`);
-
-                normalizedProducts.push({
-                    vendor: 'okeconnect',
-                    external_id: externalId,
-                    category,
-                    name: billerName,
-                    brand: null,
-                    icon: null,
-                    image: null,
-                    is_active: isActive,
-                    product_type: 'postpaid',
-                    available_channels: ['app'],
-                    metadata: {
-                        originalGroup: payItem.produk || null,
-                        vendor: 'okeconnect',
-                        payment_code: payItem.kode,
-                        inquiry_code: inquiryItem.kode,
-                        commission,
-                    },
-                    variants: [{
+                const variants = candidates
+                    .map(({ payItem, inquiryItem, billerName, commission, vendorFee, isActive }) => ({
                         vendor_variant_id: payItem.kode,
-                        name: payItem.keterangan || billerName,
+                        name: billerName,
                         base_price: 0,
                         markup: 0,
                         sell_price: 0,
@@ -656,17 +706,41 @@ class OkeconnectAdapter extends VendorAdapter {
                             kode: payItem.kode,
                             inquiry_code: inquiryItem.kode,
                             kategori: payItem.kategori,
-                            produk: payItem.produk,
+                            produk: group.rawGroup,
+                            biller: billerName,
                             raw_status: payItem.status,
                             commission,
                             vendor_fee: vendorFee,
                         },
-                    }],
+                    }))
+                    .sort((a, b) => a.name.localeCompare(b.name, 'id'));
+
+                normalizedProducts.push({
+                    vendor: 'okeconnect',
+                    external_id: externalId,
+                    category: resolvePostpaidCategory(group.rawGroup, candidates),
+                    name: groupName,
+                    brand: null,
+                    icon: null,
+                    image: null,
+                    // A group is sellable as long as one of its billers is.
+                    is_active: candidates.some(candidate => candidate.isActive),
+                    product_type: 'postpaid',
+                    available_channels: ['app'],
+                    metadata: {
+                        originalGroup: group.rawGroup,
+                        vendor: 'okeconnect',
+                    },
+                    variants,
                 });
             }
 
+            const variantCount = normalizedProducts
+                .reduce((sum, product) => sum + product.variants.length, 0);
+
             okeLog.info('postpaid_price_list_parsed', {
                 products: normalizedProducts.length,
+                variants: variantCount,
                 rawItems: rawItems.length,
             });
 

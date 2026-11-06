@@ -280,6 +280,24 @@ class ProductSyncService {
         let variantsUpserted = 0;
         const nowIso = new Date().toISOString();
 
+        // Postpaid catalogs get regrouped over time (one product per biller
+        // becomes one product per OkeConnect group). An admin's markup and
+        // visibility must follow the vendor variant code to its new product, or
+        // the bill service fee would silently reset to zero after a regroup.
+        const inheritedVariantMap = new Map();
+        if (productType === 'postpaid') {
+            const postpaidProductIds = new Set(
+                [...existingMap.values()]
+                    .filter(p => p.product_type === 'postpaid')
+                    .map(p => String(p.id))
+            );
+            for (const existingVariant of variantMap.values()) {
+                if (!postpaidProductIds.has(String(existingVariant.product_id))) continue;
+                const code = String(existingVariant.vendor_variant_id);
+                if (!inheritedVariantMap.has(code)) inheritedVariantMap.set(code, existingVariant);
+            }
+        }
+
         // 2. Upsert products in batches
         const BATCH_SIZE = 50;
         for (let i = 0; i < productList.length; i += BATCH_SIZE) {
@@ -340,8 +358,11 @@ class ProductSyncService {
                     if (!v.vendor_variant_id) continue;
                     const key = `${dbProductId}:${v.vendor_variant_id}`;
                     const existingV = variantMap.get(key);
-                    const markup = existingV && existingV.markup !== undefined ? existingV.markup : (v.markup ?? 1000);
-                    const isHidden = existingV ? existingV.is_hidden : (v.is_hidden ?? false);
+                    // A regrouped postpaid variant keeps its admin settings even
+                    // though it now lives under a different product_id.
+                    const preservedV = existingV || inheritedVariantMap.get(String(v.vendor_variant_id));
+                    const markup = preservedV && preservedV.markup !== undefined ? preservedV.markup : (v.markup ?? 1000);
+                    const isHidden = preservedV ? preservedV.is_hidden : (v.is_hidden ?? false);
                     const sellPrice = Math.ceil((v.base_price || 0) + markup);
 
                     variantRowMap.set(key, {

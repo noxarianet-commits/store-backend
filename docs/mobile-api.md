@@ -68,6 +68,7 @@ Produk yang tersedia untuk channel `app`. Produk tagihan hanya muncul di sini.
 
 - Produk prepaid: `variants[].id` = ID varian vendor.
 - Produk tagihan: `variants[].id` = ID internal (kode vendor tidak diekspos), `admin_fee` = biaya layanan.
+- Produk tagihan dikelompokkan per grup biller OkeConnect (mis. `PDAM Jawa Barat dan Jakarta`, `PBB Sumatera`), dan `variants[]` berisi biller/daerah di grup tersebut (mis. `PDAM Kota Jakarta Aetra`, `PDAM Kota Bandung`). `search` pada produk tagihan juga mencocokkan nama varian, jadi `search=bandung` tetap menemukan produk PDAM yang benar.
 
 ### `GET /products/:id`
 
@@ -106,7 +107,7 @@ Response:
   "data": {
     "inquiry_id": "0f2c...",
     "expires_at": "2026-11-02T10:10:00.000Z",
-    "product": { "id": 10, "name": "PLN Pascabayar", "category": "Tagihan Listrik" },
+    "product": { "id": 10, "name": "PLN Bulanan", "category": "Tagihan Listrik" },
     "variant": { "id": "42", "name": "PLN Pascabayar" },
     "customer": { "number": "123456789012", "name": "BUDI" },
     "bill": { "period": "NOV 2026", "amount": 350000, "admin_fee": 0, "total": 350000 },

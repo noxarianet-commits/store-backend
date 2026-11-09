@@ -6,6 +6,7 @@ const { groupProducts, buildMultiServerProduct, getCanonicalKey } = require('../
 const { normalizePhoneNumber } = require('../utils/phoneUtils');
 const { findProductByAnyId, findVariantByPublicId, findVariantInProduct } = require('../utils/productLookup');
 const { toBigIntId } = require('../utils/dbIds');
+const { isMandatoryValidationEnabled } = require('../utils/settingFlags');
 const { logger } = require('../utils/logger');
 
 /**
@@ -277,6 +278,18 @@ async function validate(req, res) {
             if (normalized && normalized.startsWith('08')) {
                 targetCustomerId = normalized;
             }
+        }
+
+        // Fitur "Wajib Validasi" dinonaktifkan admin (mis. endpoint validasi
+        // provider sedang gangguan): jangan panggil provider sama sekali.
+        if (!(await isMandatoryValidationEnabled())) {
+            return res.json({
+                valid: true,
+                validation_available: false,
+                account_name: targetCustomerId,
+                display_name: targetCustomerId,
+                message: 'Validasi akun sedang dinonaktifkan sementara oleh admin',
+            });
         }
 
         const result = await adapter.validateAccount({

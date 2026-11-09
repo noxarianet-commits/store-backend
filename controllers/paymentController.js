@@ -12,6 +12,7 @@ const { findProductByAnyId, findProductByExternalId, findVariantByPublicId } = r
 const { withReadRetry, isTransientError } = require('../utils/dbRetry');
 const { logger } = require('../utils/logger');
 const { normalizePhoneNumber, normalizeNotePhoneNumber } = require('../utils/phoneUtils');
+const { isMandatoryValidationEnabled } = require('../utils/settingFlags');
 
 // ══════════════════════════════════════════════════════════════════════════
 // HELPERS
@@ -347,6 +348,18 @@ async function createPayment(req, res) {
         }
 
         // 6. Validasi Akun Wajib (Khusus OkeConnect / Varian dengan validasi)
+        // Dilewati total saat settings `mandatory_validation` nonaktif (endpoint
+        // validasi provider sedang gangguan) — transaksi tetap berjalan.
+        const mandatoryValidation = await isMandatoryValidationEnabled();
+        const isValidationNeeded = Boolean(matchedVariant.validation?.available);
+        if (isValidationNeeded && !mandatoryValidation) {
+            logger.info('account_validation_bypassed', {
+                vendor: actualVendor,
+                variantId: matchedVariant.vendor_variant_id || targetVariantId,
+                product: dbProduct?.name,
+            });
+        }
+
         let resolvedCustomerName = (customer_name || wa_number || 'Pelanggan').trim();
 
         if (actualVendor === 'okeconnect') {
@@ -370,35 +383,39 @@ async function createPayment(req, res) {
                 }
             }
 
-            const isValidationNeeded = Boolean(matchedVariant.validation?.available);
-
             if (isValidationNeeded) {
                 if (!targetId) {
-                    return res.status(400).json({ error: 'User ID / Nomor Tujuan wajib diisi dan divalidasi terlebih dahulu' });
+                    return res.status(400).json({
+                        error: mandatoryValidation
+                            ? 'User ID / Nomor Tujuan wajib diisi dan divalidasi terlebih dahulu'
+                            : 'User ID / Nomor Tujuan wajib diisi',
+                    });
                 }
 
-                const valRes = await adapter.validateAccount({
-                    variantId: matchedVariant.vendor_variant_id || targetVariantId,
-                    customerId: targetId,
-                    zoneId: zone_id,
-                    productName: dbProduct.name,
-                    brand: dbProduct.brand,
-                    category: dbProduct.category,
-                });
+                if (mandatoryValidation) {
+                    const valRes = await adapter.validateAccount({
+                        variantId: matchedVariant.vendor_variant_id || targetVariantId,
+                        customerId: targetId,
+                        zoneId: zone_id,
+                        productName: dbProduct.name,
+                        brand: dbProduct.brand,
+                        category: dbProduct.category,
+                    });
 
-                if (!valRes.success || valRes.valid === false) {
-                    if (valRes.message !== 'VALIDATION_NOT_AVAILABLE') {
-                        return res.status(400).json({
-                            error: valRes.message || 'ID Akun tujuan tidak valid atau tidak ditemukan. Mohon cek kembali ID Anda.'
-                        });
+                    if (!valRes.success || valRes.valid === false) {
+                        if (valRes.message !== 'VALIDATION_NOT_AVAILABLE') {
+                            return res.status(400).json({
+                                error: valRes.message || 'ID Akun tujuan tidak valid atau tidak ditemukan. Mohon cek kembali ID Anda.'
+                            });
+                        }
+                    }
+
+                    if (valRes.data?.account_name || valRes.data?.display_name) {
+                        resolvedCustomerName = valRes.data.account_name || valRes.data.display_name;
                     }
                 }
-
-                if (valRes.data?.account_name || valRes.data?.display_name) {
-                    resolvedCustomerName = valRes.data.account_name || valRes.data.display_name;
-                }
             }
-        } else if (actualVendor === 'sekalipay' && matchedVariant.validation?.available) {
+        } else if (actualVendor === 'sekalipay' && matchedVariant.validation?.available && mandatoryValidation) {
             try {
                 const svcCheck = await adapter.checkValidationServices({
                     product_name: dbProduct.name,

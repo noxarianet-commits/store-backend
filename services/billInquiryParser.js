@@ -7,6 +7,10 @@
  * nominal.
  */
 
+// Real bills stay far below this. Anything larger is almost always a
+// misparsed reference number rather than a nominal.
+const MAX_PLAUSIBLE_AMOUNT = 1_000_000_000_000;
+
 function normalizeText(input) {
     return String(input || '')
         .replace(/\r/g, '\n')
@@ -103,23 +107,38 @@ function parseBillInquiry(rawText) {
     }
 
     const upper = text.toUpperCase();
-    const failureMarkers = [
+
+    // Markers that always mean the vendor rejected the inquiry. These must win
+    // even when the response also contains long digit runs: a rejection line
+    // such as "CBPJS.8888801234567890 GAGAL. IP tidak sesuai" carries a
+    // reference number that must never be read as a nominal.
+    const hardFailureMarkers = [
         'GAGAL',
-        'TIDAK DITEMUKAN',
-        'TIDAK ADA TAGIHAN',
-        'SUDAH BAYAR',
-        'SUDAH LUNAS',
-        'LUNAS',
-        'TIDAK TERDAFTAR',
         'SALAH',
         'TIDAK VALID',
+        'TIDAK DITEMUKAN',
+        'TIDAK ADA TAGIHAN',
+        'TIDAK TERDAFTAR',
     ];
 
     // "LUNAS" can also appear in a successful bill description. Only treat it
     // as a failure when no nominal is present anywhere in the response.
+    const softFailureMarkers = [
+        'SUDAH BAYAR',
+        'SUDAH LUNAS',
+        'LUNAS',
+    ];
+
     const hasAnyAmount = /[0-9][0-9.,]{2,}/.test(text);
 
-    if (failureMarkers.some(marker => upper.includes(marker)) && !hasAnyAmount) {
+    if (hardFailureMarkers.some(marker => upper.includes(marker))) {
+        return { success: false, message: text.slice(0, 300) };
+    }
+
+    if (
+        softFailureMarkers.some(marker => upper.includes(marker)) &&
+        !hasAnyAmount
+    ) {
         return { success: false, message: text.slice(0, 300) };
     }
 
@@ -168,6 +187,12 @@ function parseBillInquiry(rawText) {
 
     if (!resolvedBill || resolvedBill <= 0) {
         return { success: false, message: 'Nominal tagihan tidak ditemukan pada respons vendor.' };
+    }
+
+    // Guard against nonsense nominals. Real bills stay far below this; larger
+    // values are usually a misparsed reference number.
+    if (resolvedBill > MAX_PLAUSIBLE_AMOUNT) {
+        return { success: false, message: 'Nominal tagihan tidak valid pada respons vendor.' };
     }
 
     if (resolvedAdmin === null) {

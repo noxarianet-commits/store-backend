@@ -19,16 +19,21 @@ class OrderFulfillmentService {
         const isPostpaid = order.order_type === 'postpaid' ||
             order.account_details?.type === 'postpaid' ||
             order.account_details?.postpaid === true;
+        // Meter / customer numbers (PLN token) are not phone numbers either.
+        const isMeterTarget = order.account_details?.target_type === 'meter';
 
         const rawNote = order.account_details?.target || order.account_details?.sekalipay_note || order.account_details?.note || '-';
         // Bill customer numbers must be passed through exactly as entered.
-        let note = isPostpaid ? String(rawNote) : normalizeNotePhoneNumber(rawNote);
+        // Meter / customer numbers are digits only, never phone numbers.
+        let note = isPostpaid
+            ? String(rawNote)
+            : (isMeterTarget ? String(rawNote).replace(/\D/g, '') : normalizeNotePhoneNumber(rawNote));
         let zoneId = isPostpaid
             ? null
             : (order.account_details?.zone_id || order.account_details?.zoneId || null);
 
         // Extract zone_id if formatted as USER_ID(ZONE_ID)
-        if (!isPostpaid && typeof note === 'string') {
+        if (!isPostpaid && !isMeterTarget && typeof note === 'string') {
             const match = note.match(/^([^\(\)]+)\(([^\(\)]+)\)$/);
             if (match) {
                 note = match[1].trim();

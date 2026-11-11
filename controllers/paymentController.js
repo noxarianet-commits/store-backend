@@ -28,6 +28,18 @@ function generateOrderId() {
 }
 
 /**
+ * Normalize the order target that is stored in account_details.
+ *
+ * Meter / customer numbers (PLN token) are digits only and must never be
+ * phone-normalized, because a meter ID may start with 62 or 8.
+ */
+function buildAccountTarget(note, matchedVariant) {
+    if (!note) return null;
+    const isMeterTarget = matchedVariant?.provider_meta?.target_type === 'meter';
+    return isMeterTarget ? String(note).replace(/\D/g, '') : normalizeNotePhoneNumber(note);
+}
+
+/**
  * Token akses order. Order ID bisa ditebak, jadi ID bukan bukti kepemilikan.
  * Token ini yang membuktikan request benar-benar berasal dari pembeli.
  */
@@ -437,8 +449,13 @@ async function createPayment(req, res) {
                     account_details: (() => {
                         const rawZoneId = zone_id || (req.body.fieldData && req.body.fieldData.zone_id);
                         const rawUserId = customer_id || user_id || (req.body.fieldData && req.body.fieldData.customer_id);
+                        const isMeterTarget = matchedVariant?.provider_meta?.target_type === 'meter';
+                        const accountTarget = buildAccountTarget(note, matchedVariant);
                         let finalZoneId = rawZoneId ? String(rawZoneId).trim() : null;
                         let finalUserId = rawUserId ? String(rawUserId).trim() : null;
+                        if (isMeterTarget && finalUserId) {
+                            finalUserId = finalUserId.replace(/\D/g, '');
+                        }
                         if (!finalZoneId && note && typeof note === 'string') {
                             const match = note.match(/^([^\(\)]+)\(([^\(\)]+)\)$/);
                             if (match) {
@@ -448,12 +465,13 @@ async function createPayment(req, res) {
                         }
                         return {
                             vendor: actualVendor,
-                            note: note ? normalizeNotePhoneNumber(note) : null,
-                            target: note ? normalizeNotePhoneNumber(note) : null,
+                            note: accountTarget,
+                            target: accountTarget,
                             customer_id: finalUserId,
                             user_id: finalUserId,
                             zone_id: finalZoneId,
                             provider_qty: provider_qty ? parseInt(provider_qty) : undefined,
+                            ...(isMeterTarget ? { target_type: 'meter' } : {}),
                         };
                     })(),
                     timestamp: new Date().toISOString(),
@@ -615,9 +633,15 @@ async function createPayment(req, res) {
                 account_details: (() => {
                     const rawZoneId = zone_id || (req.body.fieldData && req.body.fieldData.zone_id);
                     const rawUserId = customer_id || user_id || (req.body.fieldData && req.body.fieldData.customer_id);
+                    const isMeterTarget = matchedVariant?.provider_meta?.target_type === 'meter';
+                    const accountTarget = buildAccountTarget(note, matchedVariant);
 
                     let finalZoneId = rawZoneId ? String(rawZoneId).trim() : null;
                     let finalUserId = rawUserId ? String(rawUserId).trim() : null;
+
+                    if (isMeterTarget && finalUserId) {
+                        finalUserId = finalUserId.replace(/\D/g, '');
+                    }
 
                     if (!finalZoneId && note && typeof note === 'string') {
                         const match = note.match(/^([^\(\)]+)\(([^\(\)]+)\)$/);
@@ -629,12 +653,13 @@ async function createPayment(req, res) {
 
                     return {
                         vendor: actualVendor,
-                        note: note ? normalizeNotePhoneNumber(note) : null,
-                        target: note ? normalizeNotePhoneNumber(note) : null,
+                        note: accountTarget,
+                        target: accountTarget,
                         customer_id: finalUserId,
                         user_id: finalUserId,
                         zone_id: finalZoneId,
                         provider_qty: provider_qty ? parseInt(provider_qty) : undefined,
+                        ...(isMeterTarget ? { target_type: 'meter' } : {}),
                     };
                 })(),
 

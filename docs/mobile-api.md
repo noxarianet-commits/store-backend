@@ -1595,9 +1595,58 @@ Content-Type: application/json
 **Catatan**
 
 - Untuk e-wallet, nomor dinormalisasi ke format `08...`.
+- Untuk **Token PLN**, `customer_id` adalah No. Meter / ID Pelanggan (6-20 digit).
+  Nilainya **tidak** dinormalisasi seperti nomor HP, karena meter ID bisa diawali
+  `62` atau `8`. Validasi memakai inquiry `CEKPLN` dan balasannya berisi nama
+  pelanggan beserta tarif/daya, mis. `BUDI SANTOSO (R1/900VA)`.
 - Jika varian tidak memerlukan validasi (`validation.available = false`), server
   langsung membalas `valid: true` tanpa memanggil vendor.
 - Untuk produk tagihan, gunakan `POST /bills/inquiry`, bukan endpoint ini.
+
+### Produk Token PLN (khusus app)
+
+Produk token listrik PLN prabayar dari vendor OkeConnect. **Hanya tersedia di
+app** (`available_channels = ["app"]`), tidak muncul di katalog web.
+
+| Field | Nilai |
+|---|---|
+| `name` | `Token PLN (OkeConnect)` |
+| `external_id` | `okc-token-pln` |
+| `category` | `Token PLN` |
+| `product_type` | `prepaid` |
+| `brand` | `PLN` |
+
+Varian memakai kode vendor OkeConnect sebagai `sku`/`id` (mis. `PLN20`,
+`PLNB100A`, `PLNZ5JT`) dengan nama `Token PLN {nominal} — {rute}`. Rute yang
+tersedia: `Reguler`, `H2H Terbaik`, `Promo`, `Full Reply`, `Direct`, `Racikan`.
+Nominal mulai dari Rp 5.000 sampai Rp 10.000.000; harga jual = harga vendor +
+markup admin.
+
+**Field yang harus diisi**
+
+| `key` | `label` | `type` | Keterangan |
+|---|---|---|---|
+| `customer_id` | `No. Meter / ID Pelanggan` | `text` | 6-20 digit, tanpa spasi/huruf |
+
+`required_fields` pada varian ini memakai `type: "text"` (bukan `"tel"`), dan
+varian selalu punya `validation.available = true`.
+
+**Contoh order**
+
+```json
+{
+  "type": "prepaid",
+  "product_id": "okc-token-pln",
+  "variant_id": "PLN20",
+  "fields": {
+    "customer_id": "51234567890"
+  },
+  "payment_type": "balance"
+}
+```
+
+Nomor token listrik dikembalikan di `account_details` (`sn`, `serial_number`,
+dan `licenses[0]`) setelah order selesai.
 
 ### Model produk & varian
 
@@ -2383,6 +2432,11 @@ Authorization: Bearer <app-token>
 yang sudah selesai, bisa bertambah `sn`, `serial_number`, `licenses`,
 `vendor_status_raw`, dan `completed_at`.
 
+Untuk order **Token PLN**, `account_details` juga berisi `target_type: "meter"`
+dan `note`/`target` berisi No. Meter dalam bentuk digit saja (tidak pernah
+dinormalisasi menjadi nomor HP). Nomor token listrik ada di `sn` /
+`serial_number` / `licenses[0]`.
+
 `account_details` untuk order tagihan berisi `type: "postpaid"`, `postpaid: true`,
 `vendor`, `target`, `customer_number`, `note`, `customer_name`, `bill_period`,
 `bill_amount`, `admin_fee`, `total_amount`, dan `inquiry_id`.
@@ -2586,6 +2640,11 @@ Content-Type: application/json
 | `vendor` | `sekalipay` | Vendor yang disinkronkan |
 | `type` | `full` | `full` atau `delta` |
 | `product_type` | `prepaid` | `prepaid` atau `postpaid` |
+
+> Sync prepaid `okeconnect` juga mengambil produk **Token PLN**
+> (`external_id: okc-token-pln`, app-only, varian `PLNxxx`). Harga list publik
+> OkeConnect sering membalas HTTP 429; adapter mencoba ulang, dan produk yang
+> gagal di-refresh tidak dinonaktifkan.
 
 **Response `200`**
 

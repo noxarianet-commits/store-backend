@@ -281,6 +281,8 @@ async function validateAccount({ adapter, actualVendor, dbProduct, matchedVarian
     if (actualVendor === 'okeconnect') {
         const isEwallet = dbProduct?.category?.toLowerCase().includes('wallet') ||
             /dana|ovo|gopay|gojek|shopee|linkaja|isaku|maxim/i.test(dbProduct?.name || '');
+        // Meter / customer numbers (PLN token) are not phone numbers.
+        const isMeterTarget = matchedVariant?.provider_meta?.target_type === 'meter';
 
         if (isEwallet) {
             if (/[a-zA-Z]/.test(resolvedTarget)) {
@@ -291,6 +293,12 @@ async function validateAccount({ adapter, actualVendor, dbProduct, matchedVarian
                 return { error: fail(400, 'INVALID_TARGET', 'Format nomor e-wallet tidak valid. Harus diawali 08 dengan 10-14 digit angka.') };
             }
             resolvedTarget = normalized;
+        } else if (isMeterTarget) {
+            const digits = String(resolvedTarget || '').replace(/\D/g, '');
+            if (!digits || digits.length < 6 || digits.length > 20) {
+                return { error: fail(400, 'INVALID_TARGET', 'No. Meter / ID Pelanggan PLN harus berupa 6-20 digit angka.') };
+            }
+            resolvedTarget = digits;
         } else if (!zone && /^[0-9\s\-\+\(\)]+$/.test(resolvedTarget)) {
             const normalized = normalizePhoneNumber(resolvedTarget);
             if (normalized && normalized.startsWith('08')) {
@@ -373,15 +381,23 @@ function buildNote({ target, zone, providerQty, openDenom, orderProcess }) {
     return zone ? `${target}(${zone})` : target;
 }
 
-function buildAccountDetails({ actualVendor, note, target, zone, providerQty }) {
+function buildAccountDetails({ actualVendor, note, target, zone, providerQty, targetType }) {
+    // Meter / customer numbers must reach the vendor exactly as entered (and
+    // as digits only), so they skip the phone-number normalization.
+    const isMeterTarget = targetType === 'meter';
+    const normalizedNote = isMeterTarget
+        ? (note ? String(note).replace(/\D/g, '') : null)
+        : (note ? normalizeNotePhoneNumber(note) : null);
+
     return {
         vendor: actualVendor,
-        note: note ? normalizeNotePhoneNumber(note) : null,
-        target: note ? normalizeNotePhoneNumber(note) : null,
+        note: normalizedNote || null,
+        target: normalizedNote || null,
         customer_id: target || null,
         user_id: target || null,
         zone_id: zone || null,
         provider_qty: providerQty || undefined,
+        ...(isMeterTarget ? { target_type: 'meter' } : {}),
     };
 }
 
@@ -629,6 +645,7 @@ async function createPrepaidOrder({ user, input = {}, idempotencyKey }) {
         if (validated.error) return validated.error;
 
         const openDenom = Boolean(matchedVariant.provider_meta?.open_denom);
+        const targetType = matchedVariant.provider_meta?.target_type || null;
         const note = buildNote({
             target: validated.resolvedTarget,
             zone: targetInfo.zone,
@@ -643,6 +660,7 @@ async function createPrepaidOrder({ user, input = {}, idempotencyKey }) {
             target: validated.resolvedTarget,
             zone: targetInfo.zone,
             providerQty: targetInfo.providerQty,
+            targetType,
         });
 
         const orderId = generateOrderId();
@@ -777,5 +795,6 @@ module.exports = {
         computeAmount,
         buildNote,
         buildAccountDetails,
+        validateAccount,
     },
 };

@@ -185,7 +185,11 @@ class ProductSyncService {
             throw new Error(res.message || `Gagal mengambil produk dari ${vendorName}`);
         }
 
-        const stats = await this._persistUnifiedProducts(vendorName, res.data, type === 'full');
+        const stats = await this._persistUnifiedProducts(vendorName, res.data, type === 'full', {
+            // Products the vendor adapter could not refresh this run (e.g. a
+            // rate-limited price list) must not be deactivated.
+            preserveExternalIds: res.preserve_external_ids || [],
+        });
         await this.setLastSyncTime(vendorName, {
             type,
             productCount: stats.productsUpserted,
@@ -409,7 +413,7 @@ class ProductSyncService {
         // Scope by product_type so prepaid and postpaid catalogs never wipe
         // each other out.
         if (isFullSync && externalIds.length > 0) {
-            await this._deactivateMissing(vendorName, externalIds, productType);
+            await this._deactivateMissing(vendorName, externalIds, productType, options.preserveExternalIds);
         }
 
         return { productsUpserted, variantsUpserted };
@@ -417,15 +421,20 @@ class ProductSyncService {
 
     /**
      * Deactivate products no longer present in vendor full sync.
+     *
+     * @param {string[]} preservedExternalIds - External ids that were not part
+     * of this response because the vendor request failed. They stay active.
      */
-    async _deactivateMissing(vendorName, activeExternalIds, productType = 'prepaid') {
+    async _deactivateMissing(vendorName, activeExternalIds, productType = 'prepaid', preservedExternalIds = []) {
         try {
+            const keepIds = [...activeExternalIds, ...(preservedExternalIds || [])].map(id => String(id));
+
             const { error } = await supabase
                 .from('products')
                 .update({ is_active: false })
                 .eq('vendor', vendorName)
                 .eq('product_type', productType)
-                .not('external_id', 'in', `(${activeExternalIds.join(',')})`);
+                .not('external_id', 'in', `(${keepIds.join(',')})`);
 
             if (error) {
                 console.error(`[ProductSyncService] Deactivate missing error for ${vendorName}:`, error.message);

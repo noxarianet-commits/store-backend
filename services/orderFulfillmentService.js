@@ -1,5 +1,6 @@
 const supabase = require('../supabase');
 const vendorRegistry = require('./vendors/vendorRegistry');
+const balanceService = require('./balanceService');
 const { normalizeNotePhoneNumber } = require('../utils/phoneUtils');
 const { logger } = require('../utils/logger');
 
@@ -15,12 +16,24 @@ class OrderFulfillmentService {
      * Build vendor-appropriate order payload from standard order record.
      */
     _buildOrderPayload(vendorName, order, variantId) {
+        const isPostpaid = order.order_type === 'postpaid' ||
+            order.account_details?.type === 'postpaid' ||
+            order.account_details?.postpaid === true;
+        // Meter / customer numbers (PLN token) are not phone numbers either.
+        const isMeterTarget = order.account_details?.target_type === 'meter';
+
         const rawNote = order.account_details?.target || order.account_details?.sekalipay_note || order.account_details?.note || '-';
-        let note = normalizeNotePhoneNumber(rawNote);
-        let zoneId = order.account_details?.zone_id || order.account_details?.zoneId || null;
+        // Bill customer numbers must be passed through exactly as entered.
+        // Meter / customer numbers are digits only, never phone numbers.
+        let note = isPostpaid
+            ? String(rawNote)
+            : (isMeterTarget ? String(rawNote).replace(/\D/g, '') : normalizeNotePhoneNumber(rawNote));
+        let zoneId = isPostpaid
+            ? null
+            : (order.account_details?.zone_id || order.account_details?.zoneId || null);
 
         // Extract zone_id if formatted as USER_ID(ZONE_ID)
-        if (typeof note === 'string') {
+        if (!isPostpaid && !isMeterTarget && typeof note === 'string') {
             const match = note.match(/^([^\(\)]+)\(([^\(\)]+)\)$/);
             if (match) {
                 note = match[1].trim();
@@ -73,6 +86,35 @@ class OrderFulfillmentService {
      * @param {Object} order The order object from database
      * @returns {Promise<{success: boolean, skipped?: boolean, message?: string}>}
      */
+    async _refundIfBalance(order, reason) {
+        if (order?.payment_type !== 'balance' || !order?.user_id) return;
+
+        try {
+            await balanceService.refundBalance(
+                order.user_id,
+                order.price,
+                order.id,
+                reason
+            );
+        } catch (err) {
+            fulfillmentLog.error('auto_refund_failed', {
+                orderId: order.id,
+                message: err.message,
+            });
+
+            // Leave a marker the payment sweep can retry. Never leave a failed
+            // balance order without a refund attempt path.
+            await supabase
+                .from('orders')
+                .update({
+                    status: 'REFUND_PENDING',
+                    error_message: `Refund gagal otomatis: ${err.message}`,
+                })
+                .eq('id', order.id)
+                .neq('status', 'REFUND_PENDING');
+        }
+    }
+
     async fulfillOrder(order) {
         const orderId = order.id;
         const variantId = order.vendor_variant_id || null;
@@ -131,6 +173,8 @@ class OrderFulfillmentService {
                     .from('orders')
                     .update({ status: 'FAILED', error_message: `Vendor ${vendorName} tidak didukung` })
                     .eq('id', orderId);
+
+                await this._refundIfBalance(order, `Refund otomatis: vendor ${vendorName} tidak didukung`);
                 return { success: false, message: 'Unsupported vendor' };
             }
 
@@ -138,6 +182,8 @@ class OrderFulfillmentService {
                 const errMsg = 'variant_id / sku tidak ditemukan di order';
                 await supabase.from('orders').update({ status: 'FAILED', error_message: errMsg }).eq('id', orderId);
                 fulfillmentLog.error('variant_missing', { orderId, vendor: vendorName });
+
+                await this._refundIfBalance(order, `Refund otomatis: ${errMsg}`);
                 return { success: false, message: errMsg };
             }
 
@@ -157,6 +203,11 @@ class OrderFulfillmentService {
                         error_message: errMsg,
                     })
                     .eq('id', orderId);
+
+                await this._refundIfBalance(
+                    order,
+                    `Refund otomatis: transaksi vendor gagal untuk ${orderId}`
+                );
 
                 return { success: false, message: errMsg };
             }
@@ -193,6 +244,11 @@ class OrderFulfillmentService {
                 .from('orders')
                 .update({ status: 'FAILED', error_message: err.message })
                 .eq('id', orderId);
+
+            await this._refundIfBalance(
+                order,
+                `Refund otomatis: fulfillment error untuk ${orderId}`
+            );
 
             return { success: false, message: err.message };
         }

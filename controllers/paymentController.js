@@ -13,6 +13,10 @@ const { withReadRetry, isTransientError } = require('../utils/dbRetry');
 const { logger } = require('../utils/logger');
 const { normalizePhoneNumber, normalizeNotePhoneNumber } = require('../utils/phoneUtils');
 const { isMandatoryValidationEnabled } = require('../utils/settingFlags');
+const { getActivePaymentGateway } = require('../services/paymentSettings');
+const orderStatusService = require('../services/orderStatusService');
+const { isAvailableForChannel } = require('../utils/channel');
+const { sanitizeAccountDetails } = require('../utils/orderPresenter');
 
 // ══════════════════════════════════════════════════════════════════════════
 // HELPERS
@@ -22,6 +26,18 @@ function generateOrderId() {
     const ts = Date.now().toString(36).toUpperCase();
     const rand = Math.random().toString(36).substr(2, 5).toUpperCase();
     return `NX-${ts}-${rand}`;
+}
+
+/**
+ * Normalize the order target that is stored in account_details.
+ *
+ * Meter / customer numbers (PLN token) are digits only and must never be
+ * phone-normalized, because a meter ID may start with 62 or 8.
+ */
+function buildAccountTarget(note, matchedVariant) {
+    if (!note) return null;
+    const isMeterTarget = matchedVariant?.provider_meta?.target_type === 'meter';
+    return isMeterTarget ? String(note).replace(/\D/g, '') : normalizeNotePhoneNumber(note);
 }
 
 /**
@@ -87,56 +103,6 @@ async function generateUniqueCode() {
     }
 
     return code;
-}
-
-/**
- * Read active payment gateway setting from Supabase.
- *
- * DYQRIS is the safe default. FinCloud may still be selected explicitly for
- * historical compatibility, but missing/invalid configuration must never
- * silently reactivate the legacy provider.
- *
- * Returns 'dyqris' (default) | 'sekalipay' | 'fincloud'.
- */
-const DEFAULT_PAYMENT_GATEWAY = 'dyqris';
-
-async function getActivePaymentGateway() {
-    try {
-        const { data, error } = await supabase
-            .from('settings')
-            .select('value')
-            .eq('key', 'payment_gateway')
-            .maybeSingle();
-
-        if (error || !data || !data.value) return DEFAULT_PAYMENT_GATEWAY;
-        let val = data.value;
-        if (typeof val === 'string') {
-            try { val = JSON.parse(val); } catch (e) {}
-        }
-        if (typeof val === 'object' && val !== null) {
-            val = val.provider || val.value || val.gateway || DEFAULT_PAYMENT_GATEWAY;
-        }
-        const strVal = String(val).toLowerCase().trim();
-        if (strVal === 'sekalipay') return 'sekalipay';
-        if (strVal === 'dyqris') return 'dyqris';
-        if (strVal === 'fincloud') {
-            // Never create new FinCloud invoices while its webhook is
-            // disabled: confirmations would be ignored and payments could be
-            // lost. Historical FinCloud orders are still handled by polling.
-            if (process.env.FINCLOUD_WEBHOOK_ENABLED === 'true') return 'fincloud';
-            logger.sampled(
-                'warn',
-                'fincloud_gateway_disabled_fallback',
-                60000,
-                'fincloud_gateway_disabled_fallback',
-                { fallback: DEFAULT_PAYMENT_GATEWAY }
-            );
-            return DEFAULT_PAYMENT_GATEWAY;
-        }
-        return DEFAULT_PAYMENT_GATEWAY;
-    } catch {
-        return DEFAULT_PAYMENT_GATEWAY;
-    }
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -264,6 +230,19 @@ async function createPayment(req, res) {
 
         if (!dbProduct || dbProduct.is_active === false) {
             return res.status(404).json({ error: 'Produk tidak ditemukan atau sedang tidak aktif' });
+        }
+
+        // App-only products must never be purchasable through the web route,
+        // even if someone knows the product ID and bypasses the catalog.
+        if (!isAvailableForChannel(dbProduct, 'web')) {
+            return res.status(404).json({ error: 'Produk tidak ditemukan atau sedang tidak aktif' });
+        }
+
+        // Bill products require the inquiry -> quote -> order flow. Never let
+        // them fall through the generic prepaid checkout, even if an admin
+        // accidentally enables the web channel.
+        if (dbProduct.product_type === 'postpaid') {
+            return res.status(400).json({ error: 'Produk tagihan hanya dapat dibeli melalui aplikasi.' });
         }
 
         // Tentukan vendor sebenarnya dari produk di database
@@ -477,6 +456,8 @@ async function createPayment(req, res) {
                     user_id: req.user.id,
                     order_access_token: orderAccessToken,
                     status: 'PENDING',
+                    channel: 'web',
+                    order_type: 'prepaid',
                     pg_provider: 'balance',
                     vendor: actualVendor,
                     vendor_variant_id: variantIdForOrder,
@@ -485,8 +466,13 @@ async function createPayment(req, res) {
                     account_details: (() => {
                         const rawZoneId = zone_id || (req.body.fieldData && req.body.fieldData.zone_id);
                         const rawUserId = customer_id || user_id || (req.body.fieldData && req.body.fieldData.customer_id);
+                        const isMeterTarget = matchedVariant?.provider_meta?.target_type === 'meter';
+                        const accountTarget = buildAccountTarget(note, matchedVariant);
                         let finalZoneId = rawZoneId ? String(rawZoneId).trim() : null;
                         let finalUserId = rawUserId ? String(rawUserId).trim() : null;
+                        if (isMeterTarget && finalUserId) {
+                            finalUserId = finalUserId.replace(/\D/g, '');
+                        }
                         if (!finalZoneId && note && typeof note === 'string') {
                             const match = note.match(/^([^\(\)]+)\(([^\(\)]+)\)$/);
                             if (match) {
@@ -496,12 +482,13 @@ async function createPayment(req, res) {
                         }
                         return {
                             vendor: actualVendor,
-                            note: note ? normalizeNotePhoneNumber(note) : null,
-                            target: note ? normalizeNotePhoneNumber(note) : null,
+                            note: accountTarget,
+                            target: accountTarget,
                             customer_id: finalUserId,
                             user_id: finalUserId,
                             zone_id: finalZoneId,
                             provider_qty: provider_qty ? parseInt(provider_qty) : undefined,
+                            ...(isMeterTarget ? { target_type: 'meter' } : {}),
                         };
                     })(),
                     timestamp: new Date().toISOString(),
@@ -638,6 +625,8 @@ async function createPayment(req, res) {
                 user_id: req.user ? req.user.id : null,
                 order_access_token: orderAccessToken,
                 status: 'PENDING',
+                channel: 'web',
+                order_type: 'prepaid',
 
                 // PG fields
                 pg_provider: pgProvider,
@@ -661,9 +650,15 @@ async function createPayment(req, res) {
                 account_details: (() => {
                     const rawZoneId = zone_id || (req.body.fieldData && req.body.fieldData.zone_id);
                     const rawUserId = customer_id || user_id || (req.body.fieldData && req.body.fieldData.customer_id);
+                    const isMeterTarget = matchedVariant?.provider_meta?.target_type === 'meter';
+                    const accountTarget = buildAccountTarget(note, matchedVariant);
 
                     let finalZoneId = rawZoneId ? String(rawZoneId).trim() : null;
                     let finalUserId = rawUserId ? String(rawUserId).trim() : null;
+
+                    if (isMeterTarget && finalUserId) {
+                        finalUserId = finalUserId.replace(/\D/g, '');
+                    }
 
                     if (!finalZoneId && note && typeof note === 'string') {
                         const match = note.match(/^([^\(\)]+)\(([^\(\)]+)\)$/);
@@ -675,12 +670,13 @@ async function createPayment(req, res) {
 
                     return {
                         vendor: actualVendor,
-                        note: note ? normalizeNotePhoneNumber(note) : null,
-                        target: note ? normalizeNotePhoneNumber(note) : null,
+                        note: accountTarget,
+                        target: accountTarget,
                         customer_id: finalUserId,
                         user_id: finalUserId,
                         zone_id: finalZoneId,
                         provider_qty: provider_qty ? parseInt(provider_qty) : undefined,
+                        ...(isMeterTarget ? { target_type: 'meter' } : {}),
                     };
                 })(),
 
@@ -762,6 +758,7 @@ const ORDER_STATUS_FIELDS = [
 function toSafeOrderResponse(order, { slim }) {
     const out = { ...order };
     delete out.order_access_token;
+    out.account_details = sanitizeAccountDetails(out.account_details);
 
     if (slim) {
         delete out.user_id;
@@ -786,7 +783,7 @@ async function getPaymentStatus(req, res) {
 
         res.set('Cache-Control', 'no-store');
 
-        const { data, error } = await withReadRetry(async () => {
+        let { data, error } = await withReadRetry(async () => {
             const result = await supabase
                 .from('orders')
                 .select(columns)
@@ -847,6 +844,15 @@ async function getPaymentStatus(req, res) {
             }
         }
 
+        // Balance orders (including postpaid bills) have no PG invoice to
+        // poll. Ask the vendor for the latest status, throttled by
+        // orderStatusService. This makes app polling work without FCM.
+        if (!slim && data.payment_type === 'balance' &&
+            ['PENDING', 'PROCESSING', 'PROCESSING_LOCK'].includes(data.status)) {
+            const refreshed = await orderStatusService.refreshIfStale(data, { force });
+            if (refreshed) data = refreshed;
+        }
+
         return res.json({ data: toSafeOrderResponse(data, { slim }) });
     } catch (err) {
         logger.error('order_status_failed', { orderId: req.params.orderId, error: err });
@@ -865,7 +871,7 @@ async function cancelPayment(req, res) {
 
         const { data: order, error: fetchError } = await supabase
             .from('orders')
-            .select('id, status, pg_provider, user_id, order_access_token')
+            .select('id, status, payment_type, price, pg_provider, user_id, order_access_token')
             .eq('id', order_id)
             .single();
 
@@ -878,6 +884,48 @@ async function cancelPayment(req, res) {
 
         if (order.status !== 'PENDING') {
             return res.status(400).json({ error: `Order tidak bisa dibatalkan (status: ${order.status})` });
+        }
+
+        // Balance orders were paid at creation time. Claim before refunding so
+        // fulfillment cannot consume the order in between.
+        if (order.payment_type === 'balance' && order.user_id) {
+            const { data: claimed, error: claimError } = await supabase
+                .from('orders')
+                .update({
+                    status: 'REFUND_PENDING',
+                    error_message: 'Dibatalkan oleh pengguna; refund diproses',
+                })
+                .eq('id', order.id)
+                .eq('status', 'PENDING')
+                .select('id');
+
+            if (claimError) throw claimError;
+            if (!claimed || claimed.length === 0) {
+                return res.status(409).json({ error: 'Order sudah diproses dan tidak bisa dibatalkan' });
+            }
+
+            try {
+                await balanceService.refundBalance(
+                    order.user_id,
+                    order.price,
+                    order.id,
+                    'Refund otomatis: pesanan dibatalkan oleh pengguna'
+                );
+            } catch (refundErr) {
+                logger.error('payment_cancel_refund_failed', {
+                    orderId: order.id,
+                    message: refundErr.message,
+                });
+                return res.status(500).json({ error: 'Refund gagal diproses. Silakan hubungi CS.' });
+            }
+
+            await supabase
+                .from('orders')
+                .update({ status: 'CANCELLED' })
+                .eq('id', order.id)
+                .eq('status', 'REFUND_PENDING');
+
+            return res.json({ success: true, message: 'Invoice berhasil dibatalkan dan saldo dikembalikan' });
         }
 
         if (order.pg_provider !== 'sekalipay' && order.pg_provider !== 'dyqris') {

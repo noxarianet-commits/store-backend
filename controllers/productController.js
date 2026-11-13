@@ -8,42 +8,8 @@ const { findProductByAnyId, findVariantByPublicId, findVariantInProduct } = requ
 const { toBigIntId } = require('../utils/dbIds');
 const { isMandatoryValidationEnabled } = require('../utils/settingFlags');
 const { logger } = require('../utils/logger');
-
-/**
- * Format a product row and its variants for public display.
- * Hides base_price and markup; maps sell_price to price.
- */
-function toPublicProduct(product) {
-    const variants = (product.product_variants || [])
-        .filter(v => v.is_active !== false && !v.is_hidden)
-        .map(v => ({
-            id: v.vendor_variant_id,
-            db_id: v.id,
-            sku: v.metadata?.sku || v.vendor_variant_id,
-            name: v.name,
-            price: v.sell_price,
-            stock: v.stock,
-            order_process: v.order_process,
-            required_fields: v.required_fields || [],
-            validation: v.validation || {},
-            provider_meta: v.provider_meta || {},
-            note: v.note || '',
-        }));
-
-    return {
-        id: product.id,
-        vendor: product.vendor,
-        external_id: product.external_id,
-        category: product.category,
-        name: product.name,
-        brand: product.brand,
-        icon: product.icon,
-        image: product.image,
-        is_active: product.is_active,
-        is_featured: product.is_featured,
-        variants,
-    };
-}
+const { toPublicProduct } = require('../utils/publicProduct');
+const { channelFromRequest, isAvailableForChannel } = require('../utils/channel');
 
 /**
  * GET /api/products
@@ -52,6 +18,7 @@ function toPublicProduct(product) {
 async function list(req, res) {
     try {
         const { vendor, category, search, page = 1, per_page = 50 } = req.query;
+        const channel = channelFromRequest(req);
         const limit = Math.min(parseInt(per_page) || 50, 200);
         const offset = (Math.max(parseInt(page) || 1, 1) - 1) * limit;
 
@@ -59,8 +26,13 @@ async function list(req, res) {
             .from('products')
             .select(PUBLIC_PRODUCT_SELECT, { count: 'exact' })
             .eq('is_active', true)
+            .contains('available_channels', [channel])
             .order('category', { ascending: true })
             .order('name', { ascending: true });
+
+        if (channel === 'web') {
+            query = query.eq('product_type', 'prepaid');
+        }
 
         if (vendor && vendor !== 'all') {
             query = query.eq('vendor', vendor);
@@ -116,10 +88,16 @@ async function list(req, res) {
 async function getCategories(req, res) {
     try {
         const { vendor } = req.query;
+        const channel = channelFromRequest(req);
         let query = supabase
             .from('products')
             .select('category')
-            .eq('is_active', true);
+            .eq('is_active', true)
+            .contains('available_channels', [channel]);
+
+        if (channel === 'web') {
+            query = query.eq('product_type', 'prepaid');
+        }
 
         if (vendor && vendor !== 'all') {
             query = query.eq('vendor', vendor);
@@ -143,6 +121,7 @@ async function getCategories(req, res) {
 async function getById(req, res) {
     try {
         const { id } = req.params;
+        const channel = channelFromRequest(req);
 
         // 1. Fetch the primary target product. Numeric values are tried as the
         // internal BIGINT id first; non-numeric values only query external_id.
@@ -156,7 +135,9 @@ async function getById(req, res) {
             logger.error('product_detail_lookup_failed', { productId: id, code: error.code });
             return res.status(500).json({ error: 'Gagal memuat produk' });
         }
-        if (!primary || primary.is_active === false) {
+        if (!primary || primary.is_active === false ||
+            !isAvailableForChannel(primary, channel) ||
+            (channel === 'web' && primary.product_type === 'postpaid')) {
             return res.status(404).json({ error: 'Produk tidak ditemukan' });
         }
 
@@ -164,7 +145,7 @@ async function getById(req, res) {
         // an unbounded per-request query that fetched every variant in the
         // category.
         const targetCanonicalKey = getCanonicalKey(primary.name);
-        const catalog = await getActiveCatalog();
+        const catalog = await getActiveCatalog(channel);
         const peerProducts = catalog.filter(p =>
             String(p.id) !== String(primary.id) &&
             p.category === primary.category &&
@@ -203,7 +184,7 @@ async function validate(req, res) {
             const { data, error } = await findProductByAnyId(
                 supabase,
                 product_id,
-                'id, name, brand, category, vendor'
+                'id, name, brand, category, vendor, product_type, available_channels'
             );
             if (error) {
                 logger.warn('product_validate_lookup_failed', {
@@ -212,6 +193,9 @@ async function validate(req, res) {
                 });
             }
             if (data) {
+                if (!isAvailableForChannel(data, channelFromRequest(req))) {
+                    return res.status(404).json({ error: 'Produk tidak ditemukan' });
+                }
                 dbProduct = data;
                 if (!resolvedVendor) resolvedVendor = data.vendor;
             }
@@ -219,7 +203,7 @@ async function validate(req, res) {
 
         let variantValidation = null;
         if (targetVariantId) {
-            const columns = 'id, product_id, vendor_variant_id, validation, products(id, name, brand, category, vendor)';
+            const columns = 'id, product_id, vendor_variant_id, validation, products(id, name, brand, category, vendor, product_type, available_channels)';
             const { data: vRow, error: variantError } = dbProduct?.id
                 ? await findVariantInProduct(supabase, dbProduct.id, targetVariantId, columns)
                 : await findVariantByPublicId(supabase, targetVariantId, columns);
@@ -236,10 +220,19 @@ async function validate(req, res) {
                 // Prefer the product already resolved from product_id. Only use
                 // the joined product when product_id was not supplied.
                 if (!dbProduct && vRow.products) {
+                    if (!isAvailableForChannel(vRow.products, channelFromRequest(req))) {
+                        return res.status(404).json({ error: 'Produk tidak ditemukan' });
+                    }
                     dbProduct = vRow.products;
                     if (!resolvedVendor) resolvedVendor = vRow.products.vendor;
                 }
             }
+        }
+
+        if (dbProduct?.product_type === 'postpaid') {
+            return res.status(400).json({
+                error: 'Produk tagihan harus dicek melalui alur inquiry tagihan.',
+            });
         }
 
         // Jika produk / varian tidak memerlukan validasi akun (validation.available === false)

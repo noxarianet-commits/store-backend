@@ -11,6 +11,8 @@ async function list(req, res) {
         const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 100);
         const search = req.query.search ? req.query.search.trim() : '';
         const status = req.query.status ? req.query.status.trim().toUpperCase() : '';
+        const channel = req.query.channel ? req.query.channel.trim().toLowerCase() : '';
+        const orderType = req.query.order_type ? req.query.order_type.trim().toLowerCase() : '';
 
         const from = (page - 1) * limit;
         const to = from + limit - 1;
@@ -25,6 +27,12 @@ async function list(req, res) {
 
         if (status && status !== 'ALL') {
             query = query.eq('status', status);
+        }
+        if (channel && channel !== 'all') {
+            query = query.eq('channel', channel);
+        }
+        if (orderType && orderType !== 'all') {
+            query = query.eq('order_type', orderType);
         }
 
         query = query

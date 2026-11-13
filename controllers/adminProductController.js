@@ -3,6 +3,7 @@ const vendorRegistry = require('../services/vendors/vendorRegistry');
 const productSyncService = require('../services/productSyncService');
 const cacheService = require('../services/cacheService');
 const { toBigIntId } = require('../utils/dbIds');
+const { normalizeChannels } = require('../utils/channel');
 const { findVariantByPublicId, findVariantInProduct } = require('../utils/productLookup');
 const { logger } = require('../utils/logger');
 
@@ -18,11 +19,11 @@ const { logger } = require('../utils/logger');
  */
 async function sync(req, res) {
     try {
-        const { vendor = 'sekalipay', type = 'full' } = req.body;
-        const result = await productSyncService.syncVendor(vendor, { type });
+        const { vendor = 'sekalipay', type = 'full', product_type: productType = 'prepaid' } = req.body;
+        const result = await productSyncService.syncVendor(vendor, { type, productType });
         res.json({
             success: true,
-            message: `Sinkronisasi ${vendor} (${type}) berhasil`,
+            message: `Sinkronisasi ${vendor} ${productType} (${type}) berhasil`,
             ...result,
         });
     } catch (err) {
@@ -36,9 +37,10 @@ async function sync(req, res) {
  */
 async function syncStatus(req, res) {
     try {
-        const { vendor = 'sekalipay' } = req.query;
-        const lastSync = await productSyncService.getLastSyncTime(vendor);
-        res.json({ success: true, vendor, lastSync });
+        const { vendor = 'sekalipay', product_type: productType = 'prepaid' } = req.query;
+        const key = productType === 'postpaid' ? `${vendor}_postpaid` : vendor;
+        const lastSync = await productSyncService.getLastSyncTime(key);
+        res.json({ success: true, vendor, product_type: productType, lastSync });
     } catch (err) {
         res.status(500).json({ success: false, error: err.message });
     }
@@ -70,7 +72,7 @@ async function getBalance(req, res) {
  */
 async function getProducts(req, res) {
     try {
-        const { vendor, category, search } = req.query;
+        const { vendor, category, search, product_type: productType } = req.query;
 
         let query = supabase
             .from('products')
@@ -83,6 +85,9 @@ async function getProducts(req, res) {
         }
         if (category) {
             query = query.eq('category', category);
+        }
+        if (productType && productType !== 'all') {
+            query = query.eq('product_type', productType);
         }
         if (search) {
             query = query.or(`name.ilike.%${search}%,category.ilike.%${search}%,brand.ilike.%${search}%`);
@@ -222,6 +227,42 @@ async function toggleFeatured(req, res) {
         res.json({ success: true, is_featured: newFeatured });
     } catch (err) {
         res.status(500).json({ error: err.message });
+    }
+}
+
+/**
+ * PATCH /api/admin/products/products/:id/channels
+ * Body: { channels: ['web','app'] }
+ */
+async function updateChannels(req, res) {
+    try {
+        const productId = toBigIntId(req.params.id);
+        if (!productId) {
+            return res.status(400).json({ error: 'ID produk tidak valid' });
+        }
+
+        const channels = normalizeChannels(req.body?.channels);
+        if (!channels) {
+            return res.status(400).json({
+                error: 'channels harus berisi minimal satu dari: web, app',
+            });
+        }
+
+        const { error } = await supabase
+            .from('products')
+            .update({ available_channels: channels })
+            .eq('id', productId);
+
+        if (error) throw error;
+
+        cacheService.invalidateHome();
+        res.json({ success: true, available_channels: channels });
+    } catch (err) {
+        logger.error('admin_product_channels_update_failed', {
+            productId: req.params.id,
+            error: err,
+        });
+        res.status(500).json({ error: 'Gagal memperbarui channel produk' });
     }
 }
 
@@ -448,6 +489,7 @@ module.exports = {
     updateMarkup,
     toggleActive,
     toggleFeatured,
+    updateChannels,
     getFeatured,
     getFeaturedOptions,
     toggleVariantHidden,

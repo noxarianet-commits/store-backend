@@ -40,7 +40,7 @@ async function getHomePage(req, res) {
     try {
         const responseData = await cacheService.getOrSet(
             cacheService.KEYS.HOME_PAGE,
-            () => fetchHomePageData(),
+            () => fetchHomePageData('web'),
             300
         );
 
@@ -55,15 +55,19 @@ async function getHomePage(req, res) {
  * Fetch all home page data from Supabase.
  * @returns {Promise<object>} Home page response data
  */
-async function fetchHomePageData() {
-    // Fetch all data in parallel
+async function fetchHomePageData(channel = 'web') {
+    // Fetch all data in parallel. Services are a web/manual-WA flow, so the
+    // app never receives them through this endpoint.
+    const includeServices = channel === 'web';
     const [products, servicesResult, testimonialsResult, settingsResult] = await Promise.all([
-        getActiveCatalog(),
-        supabase
-            .from('services')
-            .select('id, category, name, icon, image, subtitle, features, variants, is_active, created_at')
-            .eq('is_active', true)
-            .order('created_at', { ascending: true }),
+        getActiveCatalog(channel),
+        includeServices
+            ? supabase
+                .from('services')
+                .select('id, category, name, icon, image, subtitle, features, variants, is_active, created_at')
+                .eq('is_active', true)
+                .order('created_at', { ascending: true })
+            : Promise.resolve({ data: [], error: null }),
         supabase
             .from('testimonials')
             .select('id, name, rating, text, created_at')
@@ -74,7 +78,7 @@ async function fetchHomePageData() {
             .select('key, value'),
     ]);
 
-    if (servicesResult.error) throw servicesResult.error;
+    if (includeServices && servicesResult?.error) throw servicesResult.error;
     if (testimonialsResult.error) throw testimonialsResult.error;
     if (settingsResult.error) throw settingsResult.error;
 
@@ -106,7 +110,7 @@ async function fetchHomePageData() {
     }
 
     // Add services as a category
-    const services = servicesResult.data || [];
+    const services = includeServices ? (servicesResult?.data || []) : [];
     if (services.length > 0) {
         categoryMap['Layanan Jasa & Bot'] = {
             slug: 'layanan-jasa-bot',
@@ -174,7 +178,7 @@ async function getCategoryProducts(req, res) {
         }
 
         // Regular product category — find by matching slug in the cached public catalog.
-        const allProducts = await getActiveCatalog();
+        const allProducts = await getActiveCatalog('web');
 
         // Find products whose category slugifies to the requested slug
         const matchingProducts = (allProducts || []).filter(

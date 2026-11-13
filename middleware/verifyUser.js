@@ -22,7 +22,14 @@ const verifyUser = (req, res, next) => {
              return res.status(403).json({ error: 'Token tidak valid untuk user.' });
         }
         
-        req.user = { id: decoded.id, email: decoded.email, display_name: decoded.display_name };
+        req.user = {
+            id: decoded.id,
+            email: decoded.email,
+            display_name: decoded.display_name,
+            // Tokens issued before the mobile app existed have no client claim.
+            // Treat them as web so existing sessions keep working.
+            client: decoded.client || 'web',
+        };
         next();
     } catch (err) {
         if (err.name === 'TokenExpiredError') {

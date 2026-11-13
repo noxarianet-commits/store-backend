@@ -13,7 +13,12 @@ const optionalUser = (req, res, next) => {
             const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : authHeader;
             const decoded = jwt.verify(token, JWT_SECRET);
             if (decoded.type === 'user') {
-                req.user = { id: decoded.id, email: decoded.email, display_name: decoded.display_name };
+                req.user = {
+                    id: decoded.id,
+                    email: decoded.email,
+                    display_name: decoded.display_name,
+                    client: decoded.client || 'web',
+                };
             }
         }
     } catch (err) {

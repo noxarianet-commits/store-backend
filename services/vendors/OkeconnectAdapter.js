@@ -4,8 +4,16 @@ const EventEmitter = require('events');
 const cacheService = require('../cacheService');
 const { normalizePhoneNumber } = require('../../utils/phoneUtils');
 const { logger } = require('../../utils/logger');
+const { parseBillInquiry } = require('../billInquiryParser');
 
 const okeLog = logger.child({ job: 'okeconnect' });
+
+/**
+ * Promise-based delay used for retry backoff.
+ */
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
 
 /**
  * Helper to slugify text for external_id generation.
@@ -151,6 +159,335 @@ const INQUIRY_CODE_MAP = {
 };
 
 
+// ── PLN prepaid token helpers ──────────────────────────────────────────────
+
+// The vendor sells prepaid electricity tokens (PLNxxx codes) in their own
+// price-list category. The same nominal is sold through several H2H routes at
+// different prices, so every route becomes a variant of one product.
+const PLN_TOKEN_CATEGORY = 'TOKEN PLN';
+const PLN_TOKEN_PRODUCT_ID = 'okc-token-pln';
+const PLN_TOKEN_PRODUCT_NAME = 'Token PLN (OkeConnect)';
+const PLN_TOKEN_CATEGORY_NAME = 'Token PLN';
+const PLN_TOKEN_BRAND = 'PLN';
+
+// Price-list slug of the token category, appended to the prepaid slug list.
+const PLN_PRICE_LIST_CATEGORY = 'token_pln';
+
+// Price-list slugs of the prepaid catalog: e-wallet, digital topups and the
+// PLN token category.
+const PRICE_LIST_CATEGORIES = `saldo_gojek,digital,${PLN_PRICE_LIST_CATEGORY}`;
+
+// Short route labels per vendor group. Unknown groups fall back to a cleaned
+// version of the group name.
+const PLN_TOKEN_ROUTE_LABELS = {
+    'Token PLN Prabayar': 'Reguler',
+    'H2H Token PLN Terbaik': 'H2H Terbaik',
+    'H2H Token PLN Promo': 'Promo',
+    'H2H Token PLN Full Reply': 'Full Reply',
+    'H2H PLN PRODUK DIRECT': 'Direct',
+    'H2H PLN RACIKAN': 'Racikan',
+};
+
+// Words that describe the route instead of the nominal.
+const PLN_TOKEN_NOISE_WORDS = [
+    'h2h', 'token', 'pln', 'promo', 'full', 'reply', 'terbaik',
+    'produk', 'direct', 'racikan', 'biller', 'baru',
+];
+
+// The buyer identifies the customer by meter / customer number, never by a
+// phone number. The value must reach the vendor exactly as typed, so it is
+// marked as a meter target and never phone-normalized.
+const PLN_TOKEN_REQUIRED_FIELDS = [
+    {
+        key: 'customer_id',
+        label: 'No. Meter / ID Pelanggan',
+        type: 'text',
+        required: true,
+        placeholder: 'Contoh: 51234567890',
+    },
+];
+
+/**
+ * Is this row part of the vendor token category?
+ */
+function isPlnTokenCategory(item) {
+    return String(item?.kategori || '').trim().toUpperCase() === PLN_TOKEN_CATEGORY;
+}
+
+/**
+ * Is this row an electricity token?
+ *
+ * The token category also holds e-money cards (Tapcash, BRIzzi, Flazz, Tol
+ * Mandiri). Only groups that mention PLN are electricity tokens.
+ */
+function isPlnTokenItem(item) {
+    if (!isPlnTokenCategory(item)) return false;
+    return /\bpln\b/i.test(String(item?.produk || ''));
+}
+
+/**
+ * Is this row an inquiry instead of a sellable token?
+ *
+ * The token group carries its own check product ("CPLN" - CEK NAMA ID
+ * PELANGGAN). It is used to look up the customer name, never sold.
+ */
+function isPlnInquiryRow(item) {
+    const description = String(item?.keterangan || '').trim();
+    const code = String(item?.kode || '').trim();
+
+    if (/^cek\b/i.test(description)) return true;
+    // Sellable token codes are all prefixed with PLN.
+    if (/^c/i.test(code)) return true;
+
+    return false;
+}
+
+/**
+ * Short route label of a token group, e.g. "H2H PLN RACIKAN" -> "Racikan".
+ */
+function plnRouteLabel(groupName) {
+    const raw = String(groupName || '').trim();
+    if (PLN_TOKEN_ROUTE_LABELS[raw]) return PLN_TOKEN_ROUTE_LABELS[raw];
+
+    const cleaned = raw
+        .replace(/^h2h\s+/i, '')
+        .replace(/\btoken\b/gi, '')
+        .replace(/\bpln\b/gi, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+
+    return cleaned || 'Token PLN';
+}
+
+/**
+ * Extract the nominal from a token description.
+ * "Token PLN 20.000" -> "20.000", "Promo Token PLN 20 Ribu" -> "20 Ribu".
+ */
+function plnDenomLabel(description) {
+    const words = String(description || '').trim().split(/\s+/).filter(Boolean);
+    const kept = words.filter(word => {
+        const clean = word.toLowerCase().replace(/[.,]/g, '');
+        return clean && !PLN_TOKEN_NOISE_WORDS.includes(clean);
+    });
+
+    return kept.join(' ').trim();
+}
+
+/**
+ * Numeric value of a nominal label, used to sort variants by denomination.
+ */
+function plnDenomValue(label) {
+    const text = String(label || '').trim().toLowerCase();
+    const match = text.match(/[\d][\d.,]*/);
+    if (!match) return 0;
+
+    const digits = match[0].replace(/[^\d]/g, '');
+    let value = digits ? parseInt(digits, 10) : 0;
+    if (!Number.isFinite(value)) return 0;
+
+    if (/\bjuta\b/.test(text)) value *= 1000000;
+    else if (/\bribu\b/.test(text)) value *= 1000;
+
+    return value;
+}
+
+/**
+ * Extract the customer name from a CEKPLN inquiry response.
+ * OkeConnect answers with a plain-text row, e.g.
+ * "51234567890 - BUDI SANTOSO / R1/1300VA".
+ */
+function extractPlnCustomerName(text, fallback = '') {
+    if (!text || typeof text !== 'string') return fallback;
+
+    const labeled = text.match(/(?:nama pelanggan|atas nama|a\/n|pelanggan|nama)\s*[:=.-]?\s*([^\n\r,/;|]+)/i);
+    if (labeled) {
+        const name = labeled[1].replace(/\s+/g, ' ').trim();
+        if (name) return name;
+    }
+
+    const line = text
+        .split(/[\n\r]/)
+        .map(l => l.trim())
+        .find(l => l && !/^SN:/i.test(l));
+    if (!line) return fallback;
+
+    const name = line
+        .replace(/^T#\S+\s*/i, '')
+        .replace(/^R#\S+\s*/i, '')
+        .replace(/^\d{6,20}\s*[-.:]?\s*/, '')
+        // Trailing tariff / daya block with its separator, e.g. " / R1/1300VA".
+        .replace(/\s*[\/|,]?\s*[A-Za-z]{1,2}\d{1,2}\s*\/\s*\d{2,5}\s*VA/gi, '')
+        .replace(/\b(tarif|daya|golongan|sewa)\b.*$/i, '')
+        .replace(/\b(SUKSES|GAGAL|SUCCESS|FAILED)\b/gi, '')
+        .replace(/[\/|,;.]+\s*$/, '')
+        .replace(/^[\s\-:.,|]+/, '')
+        .trim();
+
+    return name || fallback;
+}
+
+/**
+ * Extract the tariff/daya of a CEKPLN inquiry response, e.g. "R1/1300VA".
+ */
+function extractPlnTariff(text) {
+    const match = String(text || '').match(/([A-Za-z]{1,2}\d{1,2})\s*\/\s*(\d{2,5}\s*VA)/i);
+    if (!match) return null;
+    return `${match[1].toUpperCase()}/${match[2].replace(/\s+/g, '').toUpperCase()}`;
+}
+
+
+// ── Postpaid bill helpers ──────────────────────────────────────────────────
+
+const POSTPAID_GROUP_EXCLUDE = [
+    'token pln', 'prabayar', 'top up', 'topup', 'saldo', 'voucher',
+    'paket data', 'pulsa', 'masa aktif', 'kuota', 'bulk', 'cetak',
+];
+
+// Vendor categories that are always prepaid / topup products. Rows in these
+// categories must never land in the bill catalog even when their description
+// says "Bayar ..." (e.g. "Bayar Paket Combo Sakti Omni").
+const POSTPAID_CATEGORY_EXCLUDE = [
+    'kuota', 'bulk', 'sms', 'digital', 'nominal bebas',
+];
+
+const POSTPAID_MANUAL_PAIRS = {
+    BYRPGN: 'CEKPGN',
+    BYRGAS: 'CEKGAS',
+    PAYOMNITSEL: 'INQOMNITSEL',
+    BPLA: 'CPLA',
+};
+
+const POSTPAID_CATEGORY_RULES = [
+    { test: /pln|listrik/i, category: 'Tagihan Listrik' },
+    { test: /pdam|\bpam\b|air minum/i, category: 'Tagihan Air' },
+    { test: /bpjs/i, category: 'BPJS' },
+    { test: /gas|pgn|pertagas/i, category: 'Tagihan Gas' },
+    { test: /tv|vision|mnc|indovision|okevision|topas|transvision|yes/i, category: 'Tagihan TV' },
+    { test: /pbb|pajak|samsat|tilang|retribusi/i, category: 'Pajak & Retribusi' },
+    { test: /telkom|indihome|speedy|internet|pascabayar telepon|fren|telkomsel|indosat|smartfren|\btri\b|\bxl\b/i, category: 'Tagihan Telepon & Internet' },
+    { test: /finance|kredit|bpr|koperasi|asuransi|home credit|multifinance|cicilan/i, category: 'Tagihan Finansial' },
+];
+
+function isPostpaidPayItem(item) {
+    const group = String(item?.produk || '').toLowerCase();
+    const description = String(item?.keterangan || '').toLowerCase();
+    const category = String(item?.kategori || '').toLowerCase();
+
+    if (POSTPAID_GROUP_EXCLUDE.some(keyword => group.includes(keyword))) return false;
+    if (POSTPAID_GROUP_EXCLUDE.some(keyword => description.includes(keyword))) return false;
+    if (POSTPAID_CATEGORY_EXCLUDE.some(keyword => category.includes(keyword))) return false;
+
+    // Inquiry rows are the "Cek ..." half of the pair, never the payment row.
+    if (/^(cek|cek tagihan|cek pascabayar|inq)\b/i.test(description)) return false;
+
+    if (category.includes('tagihan') || category.includes('pascabayar')) return true;
+
+    // Only treat a "Bayar ..." row as postpaid when it belongs to a known
+    // biller family. This prevents prepaid rows such as "Bayar Paket Data"
+    // from leaking into the bill catalog.
+    return /tagihan|pascabayar|pdam|\bpam\b|\bpln\b|bpjs|pbb|samsat|tilang|gas pgn|pertagas|telkom|indihome|speedy|mnc|indovision|okevision|topas|transvision|yes tv|finance|kredit|bpr|koperasi|asuransi|home credit|multifinance|cicilan|listrik|air minum/i
+        .test(`${group} ${description}`);
+}
+
+function findPostpaidInquiryItem(payItem, rawItems, byCode) {
+    const code = String(payItem?.kode || '').toUpperCase();
+    if (!code) return null;
+
+    const candidates = [];
+    if (POSTPAID_MANUAL_PAIRS[code]) candidates.push(POSTPAID_MANUAL_PAIRS[code]);
+    if (code.startsWith('BYR')) candidates.push(`CEK${code.slice(3)}`);
+    if (code.startsWith('PAY')) candidates.push(`INQ${code.slice(3)}`);
+    candidates.push(`C${code.slice(1)}`);
+
+    for (const candidate of candidates) {
+        const found = byCode.get(candidate);
+        if (found) return found;
+    }
+
+    // Fallback: match by description suffix, e.g. "Cek PDAM Kota Batam" for
+    // "Bayar PDAM Kota Batam" when the code prefix is irregular.
+    const suffix = String(payItem.keterangan || '')
+        .replace(/^(bayar|pembayaran|tagihan|cicilan)\s+/i, '')
+        .trim()
+        .toLowerCase();
+
+    if (suffix) {
+        return rawItems.find(item => {
+            if (String(item.produk || '').toLowerCase() !== String(payItem.produk || '').toLowerCase()) {
+                return false;
+            }
+            const desc = String(item.keterangan || '').toLowerCase();
+            return /^(cek|cek tagihan|cek pascabayar|inq)\b/i.test(desc) && desc.includes(suffix);
+        }) || null;
+    }
+
+    return null;
+}
+
+/**
+ * Normalize common Indonesian biller wording for display.
+ * "Bayar Pdam Kabupaten Bandung" -> "PDAM Kabupaten Bandung".
+ */
+function normalizeBillerText(text) {
+    return String(text || '')
+        .replace(/\bpdam\b/gi, 'PDAM')
+        .replace(/\bpln\b/gi, 'PLN')
+        .replace(/\bbpjs\b/gi, 'BPJS')
+        .replace(/\bpbb\b/gi, 'PBB')
+        .replace(/\bpgn\b/gi, 'PGN')
+        .replace(/\bpertagas\b/gi, 'Pertagas')
+        .replace(/\bipl\b/gi, 'IPL')
+        .replace(/\bkabupaten\b/gi, 'Kabupaten')
+        .replace(/\bkota\b/gi, 'Kota')
+        .trim();
+}
+
+/**
+ * Clean an OkeConnect price-list group name into a product display name.
+ * "Tagihan PBB Sumatera" -> "PBB Sumatera", "Bayar PLN Bulanan" -> "PLN Bulanan".
+ */
+function cleanPostpaidGroupName(groupName) {
+    const raw = String(groupName || '').trim();
+    const cleaned = raw.replace(/^(tagihan|bayar|pembayaran|cicilan)\s+/i, '').trim();
+    return normalizeBillerText(cleaned || raw) || 'Tagihan';
+}
+
+function cleanPostpaidBillerName(payItem) {
+    let name = String(payItem?.keterangan || payItem?.kode || 'Tagihan')
+        .replace(/^(bayar|pembayaran|tagihan|cicilan)\s+/i, '')
+        .trim();
+
+    // Only the plain PLN bill collapses to the display alias. Every other PLN
+    // product ("PLN Non Tagihan Listrik", ...) must stay distinct so a grouped
+    // product keeps one variant per service.
+    if (/^tagihan listrik$/i.test(name)) return 'PLN Pascabayar';
+    if (/^bpjs kesehatan$/i.test(name)) return 'BPJS Kesehatan';
+
+    return normalizeBillerText(name) || String(payItem?.kode || 'Tagihan');
+}
+
+function postpaidCategoryFor(text) {
+    const haystack = String(text || '');
+    for (const rule of POSTPAID_CATEGORY_RULES) {
+        if (rule.test.test(haystack)) return rule.category;
+    }
+    return 'Tagihan & PPOB';
+}
+
+/**
+ * Resolve the display category for a whole biller group. The group name is the
+ * primary signal; biller names only fill in groups the rules cannot classify,
+ * so a single odd biller name can never reclassify the whole group.
+ */
+function resolvePostpaidCategory(rawGroup, candidates) {
+    const groupName = cleanPostpaidGroupName(rawGroup);
+    const direct = postpaidCategoryFor(`${rawGroup} ${groupName}`);
+    if (direct !== 'Tagihan & PPOB') return direct;
+
+    const billerText = candidates.map(candidate => candidate.billerName).join(' ');
+    return postpaidCategoryFor(`${rawGroup} ${groupName} ${billerText}`);
+}
+
 /**
  * Okeconnect H2H Vendor Adapter.
  * Handles GET-based query parameter authentication, plain-text response parsing,
@@ -170,6 +507,11 @@ class OkeconnectAdapter extends VendorAdapter {
         this.inquiryEmitter = new EventEmitter();
         this.inquiryEmitter.setMaxListeners(100);
 
+        // Bill inquiries use a separate emitter/prefix so they never collide
+        // with game/e-wallet account-validation callbacks.
+        this.billInquiryEmitter = new EventEmitter();
+        this.billInquiryEmitter.setMaxListeners(100);
+
         this.client = axios.create({
             baseURL: this.baseURL,
             timeout: 35000,
@@ -187,6 +529,14 @@ class OkeconnectAdapter extends VendorAdapter {
         this.inquiryEmitter.emit(refId, event);
     }
 
+    /**
+     * Dispatch an OkeConnect callback for a postpaid bill inquiry.
+     */
+    handleBillInquiryCallback(refId, event) {
+        if (!refId) return;
+        this.billInquiryEmitter.emit(refId, event);
+    }
+
 
     /**
      * Auth parameters required for all transaction / balance endpoints.
@@ -200,28 +550,88 @@ class OkeconnectAdapter extends VendorAdapter {
     }
 
     /**
+     * Fetch the OkeConnect JSON price list.
+     *
+     * The public price-list endpoint rate-limits aggressively (HTTP 429), so a
+     * single request can fail while the catalog itself is fine. Retry with a
+     * short backoff before giving up.
+     *
+     * @param {string} produk - Comma separated price-list category slugs
+     * @param {number} attempts - Maximum number of tries
+     */
+    async _fetchPriceList(produk, attempts = 3) {
+        let lastError = null;
+
+        for (let attempt = 1; attempt <= attempts; attempt++) {
+            try {
+                const res = await axios.get(this.priceListUrl, {
+                    params: {
+                        id: this.priceListId,
+                        produk,
+                    },
+                    timeout: 30000,
+                });
+
+                const items = Array.isArray(res.data) ? res.data : [];
+                if (items.length > 0) return items;
+
+                lastError = new Error('Respons harga OkeConnect kosong');
+            } catch (error) {
+                lastError = error;
+                const status = error.response?.status;
+                okeLog.warn('price_list_request_failed', {
+                    attempt,
+                    status: status || null,
+                    message: error.message,
+                });
+
+                // Client errors (other than rate limiting) will not heal.
+                if (status && status !== 429 && status < 500) break;
+            }
+
+            if (attempt < attempts) {
+                await sleep(1500 * attempt);
+            }
+        }
+
+        throw lastError || new Error('Gagal mengambil katalog harga OkeConnect');
+    }
+
+    /**
      * Fetch products catalog from OkeConnect JSON price list.
-     * Filters strictly for E-Wallet and Topup Game products.
+     * Filters strictly for E-Wallet and Topup Game products, plus the PLN
+     * prepaid token catalog.
      * Normalized into unified product hierarchy with `is_hidden = true` by default.
      * @param {Object} params - { type: 'full'|'delta' }
      */
     async fetchProducts(params = {}) {
         try {
             okeLog.debug('price_list_request', { priceListId: this.priceListId });
-            const res = await axios.get(this.priceListUrl, {
-                params: {
-                    id: this.priceListId,
-                    produk: 'saldo_gojek,digital',
-                },
-                timeout: 30000,
-            });
 
-            const rawItems = Array.isArray(res.data) ? res.data : [];
+            let rawItems = await this._fetchPriceList(PRICE_LIST_CATEGORIES);
+
             if (rawItems.length === 0) {
                 return {
                     success: false,
                     message: 'Katalog produk OkeConnect kosong atau format tidak valid',
                 };
+            }
+
+            // The token catalog must never depend on the e-wallet slug list.
+            // If the combined request did not return the token category, pull
+            // it on its own.
+            let plnFetchFailed = false;
+            if (!rawItems.some(isPlnTokenItem)) {
+                const plnItems = await this._fetchPriceList(PLN_PRICE_LIST_CATEGORY).catch(err => {
+                    okeLog.warn('price_list_pln_fetch_failed', { message: err.message });
+                    return [];
+                });
+
+                if (plnItems.length > 0) {
+                    rawItems = rawItems.concat(plnItems);
+                } else {
+                    plnFetchFailed = true;
+                }
             }
 
             const ewalletKeywords = [
@@ -239,10 +649,24 @@ class OkeconnectAdapter extends VendorAdapter {
             ];
 
             const grouped = {};
+            const plnItems = [];
 
             for (const item of rawItems) {
                 const groupName = (item.produk || 'Lainnya').trim();
                 const lowerGroup = groupName.toLowerCase();
+
+                // PLN prepaid tokens are merged into a single product below.
+                if (isPlnTokenItem(item)) {
+                    plnItems.push(item);
+                    continue;
+                }
+
+                // The token category also holds e-money cards (Tapcash, BRIzzi,
+                // Flazz, Tol Mandiri). They are not tokens and must never be
+                // picked up by the e-wallet keyword match below.
+                if (isPlnTokenCategory(item)) {
+                    continue;
+                }
 
                 // Explicit excludes: subscription, utility, hardware, shopping vouchers, inquiries
                 if (
@@ -389,7 +813,267 @@ class OkeconnectAdapter extends VendorAdapter {
                 });
             }
 
-            okeLog.info('price_list_parsed', { productGroups: normalizedProducts.length, variants: rawItems.length });
+            // PLN prepaid tokens: every route and nominal becomes one variant of
+            // a single app-only product.
+            if (plnItems.length > 0) {
+                const plnVariants = [];
+                const seenPlnCodes = new Set();
+
+                for (const item of plnItems) {
+                    const code = item.kode;
+                    if (!code || seenPlnCodes.has(code)) continue;
+                    // Inquiry rows (CPLN) are not sellable tokens.
+                    if (isPlnInquiryRow(item)) continue;
+                    seenPlnCodes.add(code);
+
+                    const isAvailable = item.status === '1';
+                    const basePrice = Math.ceil(parseInt(item.harga) || 0);
+                    const denom = plnDenomLabel(item.keterangan);
+                    const route = plnRouteLabel(item.produk);
+
+                    plnVariants.push({
+                        vendor_variant_id: code,
+                        name: `Token PLN ${denom} — ${route}`,
+                        base_price: basePrice,
+                        markup: 1000,
+                        sell_price: basePrice + 1000,
+                        stock: isAvailable ? 9999 : 0,
+                        order_process: 'auto',
+                        is_active: isAvailable,
+                        is_hidden: false,
+                        required_fields: PLN_TOKEN_REQUIRED_FIELDS,
+                        validation: { available: true, type: 'account_inquiry' },
+                        provider_meta: { target_type: 'meter' },
+                        metadata: {
+                            kode: code,
+                            kategori: item.kategori,
+                            produk: item.produk,
+                            route,
+                            nominal: denom,
+                            raw_status: item.status,
+                        },
+                    });
+                }
+
+                // Cheapest route per nominal first, so the app shows the most
+                // attractive denominations at the top.
+                plnVariants.sort((a, b) =>
+                    plnDenomValue(a.metadata.nominal) - plnDenomValue(b.metadata.nominal) ||
+                    a.base_price - b.base_price
+                );
+
+                normalizedProducts.push({
+                    vendor: 'okeconnect',
+                    external_id: PLN_TOKEN_PRODUCT_ID,
+                    category: PLN_TOKEN_CATEGORY_NAME,
+                    name: PLN_TOKEN_PRODUCT_NAME,
+                    brand: PLN_TOKEN_BRAND,
+                    icon: null,
+                    image: null,
+                    is_active: true,
+                    product_type: 'prepaid',
+                    available_channels: ['app'],
+                    metadata: {
+                        originalGroups: [...new Set(plnItems.map(item => item.produk))],
+                        vendor: 'okeconnect',
+                    },
+                    variants: plnVariants,
+                });
+            }
+
+            okeLog.info('price_list_parsed', {
+                productGroups: normalizedProducts.length,
+                variants: rawItems.length,
+                plnVariants: plnItems.length,
+            });
+
+            return {
+                success: true,
+                data: normalizedProducts,
+                preserve_external_ids: plnFetchFailed ? [PLN_TOKEN_PRODUCT_ID] : [],
+                serverTime: new Date().toISOString(),
+            };
+        } catch (error) {
+            okeLog.error('price_list_fetch_failed', { error });
+            return {
+                success: false,
+                message: error.message,
+            };
+        }
+    }
+
+    /**
+     * Fetch postpaid bill products (PLN, PDAM, BPJS, phone, TV, gas, PBB, ...).
+     *
+     * OkeConnect exposes paired codes: a "Cek ..." inquiry code and a "Bayar ..."
+     * payment code. One catalog product is created per OkeConnect price-list
+     * group (`item.produk`), and every biller/region inside that group becomes a
+     * variant. Example: the group "PDAM Jawa Barat dan Jakarta" becomes the
+     * product of the same name with the variants "PDAM Kota Jakarta Aetra",
+     * "PDAM Kota Bandung", ...
+     *
+     * When a biller has several commission tiers (e.g. PLN BPLA/BPLA4000/
+     * BPLA4500), the highest active commission is chosen so the customer is not
+     * asked to pick between indistinguishable options.
+     *
+     * These products are app-only by default; the web storefront must never see
+     * a bill product before the bill flow is explicitly enabled for it.
+     */
+    async fetchPostpaidProducts(params = {}) {
+        try {
+            okeLog.debug('postpaid_price_list_request', { priceListId: this.priceListId });
+
+            const res = await axios.get(this.priceListUrl, {
+                params: { id: this.priceListId },
+                timeout: 45000,
+            });
+
+            const rawItems = Array.isArray(res.data) ? res.data : [];
+            if (rawItems.length === 0) {
+                return {
+                    success: false,
+                    message: 'Katalog postpaid OkeConnect kosong atau format tidak valid',
+                };
+            }
+
+            const byCode = new Map();
+            for (const item of rawItems) {
+                if (item?.kode) byCode.set(String(item.kode).toUpperCase(), item);
+            }
+
+            // One entry per OkeConnect price-list group. Inside each group the
+            // key is the cleaned biller name so duplicate commission tiers for
+            // the same biller collapse into a single variant.
+            const groups = new Map();
+
+            for (const item of rawItems) {
+                if (!isPostpaidPayItem(item)) continue;
+
+                const inquiryItem = findPostpaidInquiryItem(item, rawItems, byCode);
+                if (!inquiryItem) continue;
+
+                const rawGroup = String(item.produk || '').trim() || 'Tagihan Lainnya';
+                const groupKey = rawGroup.toLowerCase();
+                const billerName = cleanPostpaidBillerName(item);
+                const billerKey = billerName.toLowerCase();
+
+                const price = parseInt(item.harga, 10) || 0;
+                const commission = Math.max(0, -price);
+                const vendorFee = Math.max(0, price);
+                const isActive = item.status === '1';
+
+                const candidate = {
+                    payItem: item,
+                    inquiryItem,
+                    billerName,
+                    commission,
+                    vendorFee,
+                    isActive,
+                };
+
+                let group = groups.get(groupKey);
+                if (!group) {
+                    group = { rawGroup, billers: new Map() };
+                    groups.set(groupKey, group);
+                }
+
+                const existing = group.billers.get(billerKey);
+                if (!existing) {
+                    group.billers.set(billerKey, candidate);
+                    continue;
+                }
+
+                // Prefer an active code. Among active codes, surface the one
+                // with the largest commission (lowest vendor cost for us).
+                const existingScore = (existing.isActive ? 1 : 0) * 1e9 + existing.commission;
+                const candidateScore = (candidate.isActive ? 1 : 0) * 1e9 + candidate.commission;
+                if (candidateScore > existingScore) {
+                    group.billers.set(billerKey, candidate);
+                }
+            }
+
+            const usedExternalIds = new Set();
+            const normalizedProducts = [];
+
+            for (const group of groups.values()) {
+                const candidates = [...group.billers.values()];
+                const groupName = cleanPostpaidGroupName(group.rawGroup);
+
+                const baseSlug = slugify(group.rawGroup) || 'group';
+                let externalId = `okc-bill-${baseSlug}`;
+                let suffix = 2;
+                while (usedExternalIds.has(externalId)) {
+                    externalId = `okc-bill-${baseSlug}-${suffix}`;
+                    suffix++;
+                }
+                usedExternalIds.add(externalId);
+
+                const variants = candidates
+                    .map(({ payItem, inquiryItem, billerName, commission, vendorFee, isActive }) => ({
+                        vendor_variant_id: payItem.kode,
+                        name: billerName,
+                        base_price: 0,
+                        markup: 0,
+                        sell_price: 0,
+                        stock: isActive ? 9999 : 0,
+                        order_process: 'auto',
+                        is_active: isActive,
+                        is_hidden: false,
+                        required_fields: [{
+                            key: 'customer_number',
+                            label: 'Nomor Pelanggan / ID Meter',
+                            type: 'text',
+                            required: true,
+                        }],
+                        validation: { available: true, type: 'bill_inquiry' },
+                        provider_meta: {
+                            postpaid: true,
+                            inquiry_code: inquiryItem.kode,
+                            payment_code: payItem.kode,
+                            commission,
+                            vendor_fee: vendorFee,
+                        },
+                        metadata: {
+                            kode: payItem.kode,
+                            inquiry_code: inquiryItem.kode,
+                            kategori: payItem.kategori,
+                            produk: group.rawGroup,
+                            biller: billerName,
+                            raw_status: payItem.status,
+                            commission,
+                            vendor_fee: vendorFee,
+                        },
+                    }))
+                    .sort((a, b) => a.name.localeCompare(b.name, 'id'));
+
+                normalizedProducts.push({
+                    vendor: 'okeconnect',
+                    external_id: externalId,
+                    category: resolvePostpaidCategory(group.rawGroup, candidates),
+                    name: groupName,
+                    brand: null,
+                    icon: null,
+                    image: null,
+                    // A group is sellable as long as one of its billers is.
+                    is_active: candidates.some(candidate => candidate.isActive),
+                    product_type: 'postpaid',
+                    available_channels: ['app'],
+                    metadata: {
+                        originalGroup: group.rawGroup,
+                        vendor: 'okeconnect',
+                    },
+                    variants,
+                });
+            }
+
+            const variantCount = normalizedProducts
+                .reduce((sum, product) => sum + product.variants.length, 0);
+
+            okeLog.info('postpaid_price_list_parsed', {
+                products: normalizedProducts.length,
+                variants: variantCount,
+                rawItems: rawItems.length,
+            });
 
             return {
                 success: true,
@@ -397,7 +1081,7 @@ class OkeconnectAdapter extends VendorAdapter {
                 serverTime: new Date().toISOString(),
             };
         } catch (error) {
-            okeLog.error('price_list_fetch_failed', { error });
+            okeLog.error('postpaid_price_list_fetch_failed', { error });
             return {
                 success: false,
                 message: error.message,
@@ -579,6 +1263,14 @@ class OkeconnectAdapter extends VendorAdapter {
             if (!/^\d{6,14}$/.test(customerId)) {
                 return { success: false, valid: false, message: 'User ID Free Fire harus berupa 6-14 digit angka (tanpa huruf).' };
             }
+        } else if (inqCode === 'CEKPLN') {
+            // PLN meter / customer numbers are plain digit strings. They may
+            // start with 62 or 8, so they must never be phone-normalized.
+            const digits = customerId.replace(/\D/g, '');
+            if (!digits || digits.length < 6 || digits.length > 20) {
+                return { success: false, valid: false, message: 'No. Meter / ID Pelanggan PLN harus berupa 6-20 digit angka.' };
+            }
+            customerId = digits;
         } else if (!zoneId && /^[0-9\s\-\+\(\)]+$/.test(customerId)) {
             const normalized = normalizePhoneNumber(customerId);
             if (normalized && normalized.startsWith('08')) {
@@ -664,6 +1356,42 @@ class OkeconnectAdapter extends VendorAdapter {
             }
 
             // Check if result is NOT success
+            if (inqCode === 'CEKPLN') {
+                // CEKPLN answers with a plain-text customer row (number, name,
+                // tariff) instead of the "SUKSES" keyword the other inquiries
+                // use. Only an explicit error marks the meter as invalid.
+                const plnError = /GAGAL|TIDAK DITEMUKAN|Tidak Ditemukan|TIDAK VALID|Tidak Valid|TIDAK ADA|\bSalah\b/i.test(finalText);
+                const hasCustomerRow = finalText.includes(customerId) || /\d{6,20}/.test(finalText);
+
+                if (plnError || !hasCustomerRow) {
+                    const message = plnError
+                        ? extractErrorMessage(finalText)
+                        : 'No. Meter / ID Pelanggan tidak ditemukan atau tidak valid';
+                    return { success: false, valid: false, message };
+                }
+
+                const name = extractPlnCustomerName(finalText, customerId);
+                const tariff = extractPlnTariff(finalText);
+                const accountName = tariff ? `${name} (${tariff})` : name;
+
+                const result = {
+                    success: true,
+                    valid: true,
+                    data: {
+                        account_name: accountName,
+                        display_name: accountName,
+                        customer_id: customerId,
+                        sn: finalSn,
+                        raw: finalText,
+                    },
+                };
+
+                // Cache successful validation result for 30 minutes
+                cacheService.set(cacheKey, result, 1800);
+
+                return result;
+            }
+
             const isSuccess = (finalStatus === 'success' || /status\s+Sukses/i.test(finalText) || /\bSUKSES\b/i.test(finalText)) &&
                               !/GAGAL|Salah|Tidak Ditemukan|TIDAK ADA|tidak terdaftar/i.test(finalText);
 
@@ -709,6 +1437,130 @@ class OkeconnectAdapter extends VendorAdapter {
 
 
     /**
+     * Ask OkeConnect for a postpaid bill quote.
+     *
+     * @param {Object} params
+     * @param {string} params.inquiryCode - vendor "Cek ..." product code
+     * @param {string} params.customerId - customer number / meter ID
+     * @param {string} [params.productName]
+     * @returns {Promise<{success: boolean, data?: object, message?: string}>}
+     */
+    async inquireBill(params = {}) {
+        const inquiryCode = params.inquiryCode || params.inquiry_code;
+        const customerId = String(
+            params.customerId || params.customer_id || params.customerNumber || ''
+        ).trim();
+
+        if (!inquiryCode) {
+            return { success: false, message: 'Kode inquiry tagihan tidak tersedia.' };
+        }
+        if (!customerId) {
+            return { success: false, message: 'Nomor pelanggan wajib diisi.' };
+        }
+        if (!this.memberID || !this.pin || !this.password) {
+            return { success: false, message: 'Kredensial OkeConnect belum dikonfigurasi di .env' };
+        }
+
+        const refId = `BILLINQ${Date.now().toString(36).toUpperCase()}${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
+
+        let timeoutHandle = null;
+        let onCallback = null;
+
+        const waitForCallback = new Promise((resolve) => {
+            onCallback = (event) => resolve(event);
+            this.billInquiryEmitter.once(refId, onCallback);
+            timeoutHandle = setTimeout(() => {
+                this.billInquiryEmitter.removeListener(refId, onCallback);
+                resolve(null);
+            }, 8000);
+        });
+
+        const cleanup = () => {
+            if (timeoutHandle) clearTimeout(timeoutHandle);
+            if (onCallback) this.billInquiryEmitter.removeListener(refId, onCallback);
+        };
+
+        try {
+            okeLog.info('bill_inquiry_started', { refId, inquiryCode });
+
+            const res = await this.client.get('/trx', {
+                params: {
+                    ...this._getAuthParams(),
+                    product: inquiryCode,
+                    dest: customerId,
+                    refID: refId,
+                },
+            });
+
+            let text = String(res.data || '').trim();
+            let parsed = parseBillInquiry(text);
+
+            const looksPending = /akan diproses|menunggu jawaban|\bpending\b/i.test(text);
+
+            // A clear vendor failure does not need to wait for a callback.
+            if (!parsed.success && !looksPending) {
+                cleanup();
+                okeLog.warn('bill_inquiry_vendor_rejected', { refId, inquiryCode });
+                return {
+                    success: false,
+                    message: text.slice(0, 300) || 'Tagihan tidak ditemukan.',
+                    data: { raw: text, inquiry_ref: refId },
+                };
+            }
+
+            if (!parsed.success || looksPending) {
+                okeLog.debug('bill_inquiry_waiting_callback', { refId });
+                const callbackEvent = await waitForCallback;
+
+                if (callbackEvent?.message) {
+                    text = callbackEvent.message;
+                    parsed = parseBillInquiry(text);
+                }
+
+                if (!parsed.success) {
+                    const statusCheck = await this.checkOrderStatus(refId, {
+                        product: inquiryCode,
+                        dest: customerId,
+                    });
+
+                    if (statusCheck.success && statusCheck.data?.raw) {
+                        text = statusCheck.data.raw;
+                        parsed = parseBillInquiry(text);
+                    }
+                }
+            }
+
+            cleanup();
+
+            if (!parsed.success) {
+                okeLog.warn('bill_inquiry_parse_failed', { refId, inquiryCode });
+                return {
+                    success: false,
+                    message: parsed.message || 'Tagihan tidak ditemukan atau respons vendor tidak dapat dibaca.',
+                    data: { raw: text, inquiry_ref: refId },
+                };
+            }
+
+            return {
+                success: true,
+                data: {
+                    ...parsed.data,
+                    inquiry_ref: refId,
+                    vendor_ref: parsed.data.vendor_ref || refId,
+                    raw: text,
+                },
+            };
+        } catch (error) {
+            cleanup();
+            okeLog.error('bill_inquiry_failed', { refId, inquiryCode, error });
+            return {
+                success: false,
+                message: error.message || 'Gagal mengecek tagihan ke OkeConnect.',
+            };
+        }
+    }
+
+    /**
      * Create order / transaction on OkeConnect.
      * @param {string} refId - Unique order ID (NX-...)
      * @param {Object} orderData - { variantId / sku, target, zoneId, qty, accountDetails }
@@ -727,11 +1579,21 @@ class OkeconnectAdapter extends VendorAdapter {
             let dest = orderData.target || orderData.accountDetails?.target || orderData.accountDetails?.note || '';
             const zoneId = orderData.zoneId || orderData.accountDetails?.zone_id;
             const customerId = orderData.accountDetails?.customer_id;
+            const isPostpaid = orderData.accountDetails?.type === 'postpaid' ||
+                orderData.accountDetails?.postpaid === true;
+            // Meter / customer numbers (PLN token) are not phone numbers and
+            // must be passed through exactly as entered.
+            const isMeterTarget = orderData.accountDetails?.target_type === 'meter';
 
             if (customerId && zoneId && !dest.includes('(')) {
                 dest = `${customerId}(${zoneId})`;
-            } else if (!zoneId && dest) {
-                // Normalize e-wallet / phone number to 08xxx format
+            } else if (isMeterTarget && dest) {
+                // Meter / customer numbers are digits only.
+                dest = String(dest).replace(/\D/g, '');
+            } else if (!zoneId && dest && !isPostpaid && !isMeterTarget) {
+                // Normalize e-wallet / phone number to 08xxx format. Bill
+                // customer numbers must be passed through exactly as entered;
+                // leading zeros and separators are significant for PDAM/PBB.
                 const normalized = normalizePhoneNumber(dest);
                 if (normalized && normalized.startsWith('08')) {
                     dest = normalized;
@@ -742,11 +1604,20 @@ class OkeconnectAdapter extends VendorAdapter {
                 throw new Error('Nomor tujuan / User ID tujuan tidak boleh kosong');
             }
 
+            // Some H2H billers require the payment to reuse the inquiry refID.
+            // Keep this behind an env flag until the vendor confirms the rule.
+            const useInquiryRef = isPostpaid &&
+                orderData.accountDetails?.use_inquiry_ref === true &&
+                orderData.accountDetails?.vendor_ref;
+            const effectiveRefId = useInquiryRef
+                ? orderData.accountDetails.vendor_ref
+                : refId;
+
             const params = {
                 ...this._getAuthParams(),
                 product,
                 dest,
-                refID: refId,
+                refID: effectiveRefId,
             };
 
             const qty = orderData.qty || orderData.accountDetails?.provider_qty;
@@ -765,7 +1636,8 @@ class OkeconnectAdapter extends VendorAdapter {
                              text.includes('Pin Salah') ||
                              text.includes('tidak mencukupi') ||
                              text.includes('Cut Off') ||
-                             text.includes('Gangguan');
+                             text.includes('Gangguan') ||
+                             (isPostpaid && /TIDAK ADA TAGIHAN|SUDAH BAYAR|SUDAH LUNAS|TIDAK DITEMUKAN/i.test(text));
 
             // Extract Transaction ID (T#123456789)
             const trxMatch = text.match(/T#([0-9A-Za-z]+)/);
@@ -773,7 +1645,7 @@ class OkeconnectAdapter extends VendorAdapter {
 
             // Extract Ref ID (R#12345)
             const refMatch = text.match(/R#([0-9A-Za-z\-]+)/);
-            const extractedRefId = refMatch ? refMatch[1] : refId;
+            const extractedRefId = refMatch ? refMatch[1] : effectiveRefId;
 
             // Extract SN if already provided
             const sn = extractSN(text);
@@ -790,7 +1662,7 @@ class OkeconnectAdapter extends VendorAdapter {
 
             return {
                 success: true,
-                vendorOrderId: transactionId || extractedRefId || refId,
+                vendorOrderId: transactionId || extractedRefId || effectiveRefId,
                 invoice: sn || transactionId || null,
                 sn,
                 data: {
@@ -907,3 +1779,13 @@ class OkeconnectAdapter extends VendorAdapter {
 }
 
 module.exports = OkeconnectAdapter;
+
+module.exports.__test = {
+    isPlnTokenItem,
+    isPlnTokenCategory,
+    plnRouteLabel,
+    plnDenomLabel,
+    plnDenomValue,
+    extractPlnCustomerName,
+    extractPlnTariff,
+};

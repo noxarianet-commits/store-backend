@@ -2,6 +2,36 @@ const VendorAdapter = require('./VendorAdapter');
 const axios = require('axios');
 const crypto = require('crypto');
 
+// Same sentinel used by the rest of the catalog for stockless vendors.
+const UNLIMITED_STOCK = 9999;
+
+/**
+ * Sekalipay reports `stock: 0` for host-to-host (h2h) items even when they are
+ * orderable, because the provider sources them on demand (e.g. Free Fire
+ * diamonds). Treat h2h stock as unlimited so sync, the storefront, and the
+ * pre-checkout stock check never mark it as sold out.
+ */
+function normalizeVariantStock(variant) {
+    if (variant && String(variant.order_process || '').toLowerCase() === 'h2h') {
+        variant.stock = UNLIMITED_STOCK;
+    }
+    return variant;
+}
+
+function normalizeItemGroups(items) {
+    if (!Array.isArray(items)) return items;
+
+    for (const item of items) {
+        for (const product of (item?.products || [])) {
+            for (const variant of (product?.variants || [])) {
+                normalizeVariantStock(variant);
+            }
+        }
+    }
+
+    return items;
+}
+
 /**
  * Sekalipay Reseller API Adapter.
  * Integrates directly with Sekalipay Reseller API v1 endpoints.
@@ -101,7 +131,7 @@ class SekalipayAdapter extends VendorAdapter {
             });
             return {
                 success: true,
-                data: res.data.data,
+                data: normalizeItemGroups(res.data.data),
                 serverTime: res.data.server_time,
                 meta: res.data.meta,
             };
@@ -124,7 +154,7 @@ class SekalipayAdapter extends VendorAdapter {
             });
             return {
                 success: true,
-                data: res.data.data,
+                data: normalizeItemGroups(res.data.data),
                 serverTime: res.data.server_time,
                 meta: res.data.meta,
             };
@@ -139,7 +169,7 @@ class SekalipayAdapter extends VendorAdapter {
     async fetchProductDetail(variantId) {
         try {
             const res = await this.client.get(`/v1/item/${variantId}`);
-            return { success: true, data: res.data.data };
+            return { success: true, data: normalizeVariantStock(res.data.data) };
         } catch (error) {
             return this._handleError(error, `fetchProductDetail(${variantId})`);
         }
@@ -147,6 +177,7 @@ class SekalipayAdapter extends VendorAdapter {
 
     /**
      * Real-time stock check for Sekalipay variant.
+     * h2h variants are normalized to unlimited stock before this check.
      */
     async checkStock(variantId) {
         const detailRes = await this.fetchProductDetail(variantId);
@@ -159,7 +190,9 @@ class SekalipayAdapter extends VendorAdapter {
             };
         }
 
-        const liveStock = detailRes.data.stock !== undefined ? detailRes.data.stock : 9999;
+        const liveStock = (detailRes.data.stock !== undefined && detailRes.data.stock !== null)
+            ? detailRes.data.stock
+            : UNLIMITED_STOCK;
         return {
             success: true,
             available: liveStock > 0,

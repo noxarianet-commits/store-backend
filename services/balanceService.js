@@ -1,4 +1,5 @@
 const supabase = require('../supabase');
+const pushService = require('./pushService');
 
 class BalanceService {
     async creditBalance(userId, amount, type, referenceId, description) {
@@ -42,6 +43,17 @@ class BalanceService {
         if (!data?.success) {
             throw new Error(data?.error || 'Gagal kredit saldo top-up');
         }
+
+        // Saldo baru saja masuk — beritahu lewat push notification. Ini satu-
+        // satunya titik kredit top-up (Sekalipay, Dyqris, polling, webhook),
+        // jadi satu hook di sini menutupi semua gateway. Pagar dedupe
+        // `topup:{reference_id}:credited` mencegah notifikasi dobel bila
+        // webhook dan cron sama-sama memproses top-up yang sama.
+        await pushService.notifyTopupCredited({
+            userId: tx.user_id,
+            amount: tx.amount,
+            referenceId: tx.reference_id,
+        });
 
         return data;
     }

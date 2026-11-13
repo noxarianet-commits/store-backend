@@ -1,5 +1,6 @@
 const supabase = require('../supabase');
 const balanceService = require('./balanceService');
+const pushService = require('./pushService');
 const vendorRegistry = require('./vendors/vendorRegistry');
 const { logger } = require('../utils/logger');
 
@@ -154,6 +155,16 @@ async function markCompleted(order, statusResult) {
     }
 
     logger.info('order_completed_via_status_refresh', { orderId: order.id });
+
+    // Push notification ke aplikasi. Tidak boleh menggagalkan alur order —
+    // pushService menelan error sendiri dan dibatasi waktunya.
+    await pushService.notifyOrderCompleted({
+        ...order,
+        status: 'COMPLETED',
+        account_details: accountDetails,
+        vendor_invoice: sn,
+    });
+
     return { ...order, status: 'COMPLETED', account_details: accountDetails, vendor_invoice: sn };
 }
 
@@ -186,6 +197,9 @@ async function markFailed(order, statusResult) {
             .eq('id', order.id);
 
         logger.warn('order_failed_refund_pending', { orderId: order.id });
+
+        await pushService.notifyOrderFailed({ ...order, status: 'REFUND_PENDING', error_message: message });
+
         return { ...order, status: 'REFUND_PENDING', error_message: message };
     }
 
@@ -193,6 +207,8 @@ async function markFailed(order, statusResult) {
         orderId: order.id,
         refunded: refund.refunded,
     });
+
+    await pushService.notifyOrderFailed({ ...order, status: 'FAILED', error_message: message });
 
     return { ...order, status: 'FAILED', error_message: message };
 }

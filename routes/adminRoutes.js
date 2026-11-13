@@ -3,6 +3,7 @@ const rateLimit = require('express-rate-limit');
 const router = express.Router();
 const adminController = require('../controllers/adminController');
 const settingsController = require('../controllers/settingsController');
+const pushController = require('../controllers/pushController');
 const verifyAdmin = require('../middleware/verifyAdmin');
 
 // Login rate limiter: only 5 attempts per 15 minutes
@@ -30,6 +31,20 @@ router.patch('/users/:id/status', verifyAdmin, adminController.toggleStatus);
 // Balance Transactions Routes — protected
 router.get('/balance-transactions', verifyAdmin, adminController.getBalanceTransactions);
 router.get('/balance-transactions/stats', verifyAdmin, adminController.getBalanceTransactionStats);
+
+// Push Notification Routes — protected
+// Broadcast mengirim ke SEMUA perangkat aktif, jadi dibatasi ketat.
+const broadcastLimiter = rateLimit({
+    windowMs: 10 * 60 * 1000,
+    max: 5,
+    message: { success: false, code: 'RATE_LIMITED', error: 'Terlalu banyak broadcast. Coba lagi dalam 10 menit.' },
+    standardHeaders: true,
+    legacyHeaders: false,
+});
+
+router.post('/push/broadcast', verifyAdmin, broadcastLimiter, pushController.broadcast);
+router.get('/push/history', verifyAdmin, pushController.history);
+router.get('/push/stats', verifyAdmin, pushController.stats);
 
 module.exports = router;
 

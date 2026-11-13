@@ -17,10 +17,11 @@ ilustratif.
 5. [Katalog](#5-katalog)
 6. [Cek tagihan](#6-cek-tagihan)
 7. [Order](#7-order)
-8. [Error codes](#8-error-codes)
-9. [Admin terkait](#9-admin-terkait)
-10. [Deployment note](#10-deployment-note)
-11. [Catatan implementasi Android](#11-catatan-implementasi-android)
+8. [Push notification (perangkat)](#8-push-notification-perangkat)
+9. [Error codes](#9-error-codes)
+10. [Admin terkait](#10-admin-terkait)
+11. [Deployment note](#11-deployment-note)
+12. [Catatan implementasi Android](#12-catatan-implementasi-android)
 
 ---
 
@@ -2451,7 +2452,148 @@ dinormalisasi menjadi nomor HP). Nomor token listrik ada di `sn` /
 
 ---
 
-## 8. Error codes
+## 8. Push notification (perangkat)
+
+Aplikasi mendaftarkan **Expo Push Token** miliknya ke backend, lalu backend
+mengirim notifikasi lewat [Expo Push Service](https://docs.expo.dev/push-notifications/sending-notifications.md)
+yang meneruskannya ke FCM. Semua endpoint di bawah membutuhkan token app
+(`verifyAppUser`).
+
+Notifikasi yang dikirim backend:
+
+| Event | Deep link (`data.url`) |
+|---|---|
+| Order selesai (`COMPLETED`) | `/pesanan/{orderId}` |
+| Order gagal (`FAILED` / `REFUND_PENDING`) | `/pesanan/{orderId}` |
+| Top-up saldo masuk | `/saldo/riwayat` |
+| Broadcast admin | path opsional dari admin |
+
+Payload `data` yang diterima aplikasi:
+
+```json
+{
+  "type": "order_status",
+  "order_id": "NX-20261112-XXXX",
+  "status": "COMPLETED",
+  "url": "/pesanan/NX-20261112-XXXX"
+}
+```
+
+`type` bernilai `order_status` | `topup` | `broadcast`. Aplikasi memakai `type`
+untuk menentukan layar tujuan, dan `url` sebagai cadangan untuk broadcast.
+
+### `POST /devices`
+
+Daftarkan atau perbarui push token milik user yang login. Aplikasi memanggilnya
+sekali per sesi, dan lagi saat token di-rotasi oleh FCM.
+
+**Request**
+
+```json
+{
+  "push_token": "ExponentPushToken[xxxxxxxxxxxxxxxxxxxxxx]",
+  "platform": "android",
+  "app_version": "1.0.0"
+}
+```
+
+| Field | Tipe | Wajib | Keterangan |
+|---|---|---|---|
+| `push_token` | string | ✅ | Expo Push Token, 10–512 karakter |
+| `platform` | string | ❌ | `android` \| `ios` \| `web`, default `android` |
+| `app_version` | string | ❌ | Versi aplikasi, untuk diagnosa |
+
+**Response `200`**
+
+```json
+{ "success": true, "data": { "registered": true } }
+```
+
+Token bersifat **upsert by `push_token`**: satu token hanya tercatat untuk satu
+user. Bila user lain login di perangkat yang sama, kepemilikan token berpindah
+ke user tersebut (dan notifikasi user lama berhenti).
+
+**Error**
+
+| Status | `code` | Keterangan |
+|---|---|---|
+| 400 | `VALIDATION_ERROR` | `push_token` kosong / tidak valid |
+| 429 | `RATE_LIMITED` | 30 request / 10 menit per user |
+| 500 | `DEVICE_REGISTER_FAILED` | Gagal menyimpan ke database |
+
+### `DELETE /devices`
+
+Nonaktifkan push token (dipanggil saat logout). Token dikirim lewat **query
+string** karena sebagian proxy membuang body pada request `DELETE`.
+
+```
+DELETE /api/mobile/devices?push_token=ExponentPushToken%5Bxxx%5D
+```
+
+**Response `200`** (selalu 200, logout tidak boleh gagal karena notifikasi)
+
+```json
+{ "success": true, "data": { "unregistered": true } }
+```
+
+Tanpa `push_token`, endpoint tetap mengembalikan `200` dengan
+`unregistered: false`.
+
+### `GET /devices`
+
+Daftar perangkat terdaftar milik user yang login. **Isi `push_token` tidak
+pernah dikembalikan** — hanya metadata.
+
+**Response `200`**
+
+```json
+{
+  "success": true,
+  "data": {
+    "devices": [
+      {
+        "id": "0b6f4a1c-…",
+        "platform": "android",
+        "app_version": "1.0.0",
+        "active": true,
+        "last_seen_at": "2026-11-12T10:00:00.000Z",
+        "created_at": "2026-11-01T08:00:00.000Z"
+      }
+    ]
+  }
+}
+```
+
+### Perilaku pengiriman (server-side)
+
+- Notifikasi **idempoten**: satu transisi status hanya menghasilkan satu
+  notifikasi, walau dipicu bersamaan oleh webhook vendor, cron reconcile, dan
+  polling aplikasi. Pagar anti-duplikatnya ada di `push_notifications.dedupe_key`
+  (migration `024`).
+- Bila Expo melaporkan `DeviceNotRegistered`, token otomatis ditandai
+  `active = false` dan tidak dikirimi lagi.
+- Kegagalan **transien** (jaringan / 429 / 5xx) menghapus catatan pengiriman
+  supaya bisa dicoba ulang; kegagalan **permanen** (payload / kredensial salah)
+  dicatat sebagai `failed` dan tidak diulang.
+- Pengiriman dibatasi ~2,5 detik per permintaan supaya alur order tidak
+  tertahan.
+
+### Catatan implementasi untuk aplikasi
+
+1. Minta izin notifikasi dan buat channel Android **sebelum** meminta push
+   token. Nama channel harus sama dengan `PUSH_CHANNEL_ID` backend
+   (`noxarianet_transaksi`) — kalau channel belum ada di perangkat, notifikasi
+   **tidak tampil sama sekali**.
+2. Daftarkan ulang token saat login dan saat `addPushTokenListener` berbunyi
+   (token bisa di-rotasi).
+3. Saat menerima push di foreground, jangan buat notifikasi sistem kedua —
+   sistem sudah menampilkan bannernya.
+4. Handle tap notifikasi untuk membuka layar terkait, termasuk saat aplikasi
+   dibuka dari notifikasi (cold start).
+
+---
+
+## 9. Error codes
 
 ### Auth & akses
 
@@ -2550,7 +2692,7 @@ dinormalisasi menjadi nomor HP). Nomor token listrik ada di `sn` /
 
 ---
 
-## 9. Admin terkait
+## 10. Admin terkait
 
 Endpoint admin memakai token admin, bukan token app:
 
@@ -2777,7 +2919,7 @@ Authorization: Bearer <admin-token>
 
 ---
 
-## 10. Deployment note
+## 11. Deployment note
 
 Jalankan migration `023_mobile_app.sql` **sebelum** men-deploy kode ini. Kode
 channel dan `create_bill_order` membutuhkan kolom/tabel baru.
@@ -2807,7 +2949,7 @@ Catatan deployment:
 
 ---
 
-## 11. Catatan implementasi Android
+## 12. Catatan implementasi Android
 
 - Simpan `token` di secure storage (EncryptedSharedPreferences/Keystore), bukan
   log biasa.

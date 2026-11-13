@@ -6,6 +6,7 @@ const dyqrisGatewayService = require('../services/dyqrisGatewayService');
 const emailService = require('../services/emailService');
 const orderFulfillmentService = require('../services/orderFulfillmentService');
 const orderStatusService = require('../services/orderStatusService');
+const pushService = require('../services/pushService');
 const vendorRegistry = require('../services/vendors/vendorRegistry');
 const { logger } = require('../utils/logger');
 
@@ -270,6 +271,13 @@ async function handleSekalipayWebhook(req, res) {
                 account_details: accountDetails,
                 vendor_invoice: invoice,
             }).catch(err => console.error(`[Webhook/Sekalipay] Email completed gagal:`, err.message));
+
+            await pushService.notifyOrderCompleted({
+                ...order,
+                status: 'COMPLETED',
+                account_details: accountDetails,
+                vendor_invoice: invoice,
+            });
         }
 
         return res.sendStatus(200);
@@ -303,6 +311,8 @@ async function handleSekalipayWebhook(req, res) {
         console.log(`[Webhook/Sekalipay] Order ${order.id} ${event}.`);
         emailService.sendOrderFailedEmail(order)
             .catch(err => console.error(`[Webhook/Sekalipay] Email failed gagal:`, err.message));
+
+        await pushService.notifyOrderFailed({ ...order, status: 'FAILED', error_message: errorMsg });
 
         return res.sendStatus(200);
     }
@@ -670,8 +680,16 @@ async function handleOkeconnectWebhook(req, res) {
                     account_details: accountDetails,
                     vendor_invoice: sn,
                 }).catch(err => console.error(`[Webhook/OkeConnect] Email completed gagal:`, err.message));
+
+                await pushService.notifyOrderCompleted({
+                    ...order,
+                    status: 'COMPLETED',
+                    account_details: accountDetails,
+                    vendor_invoice: sn,
+                });
             }
         } else if (event.status === 'failed') {
+            let finalStatus = 'FAILED';
             await supabase
                 .from('orders')
                 .update({
@@ -680,13 +698,14 @@ async function handleOkeconnectWebhook(req, res) {
                     vendor_status: 'failed',
                 })
                 .eq('id', order.id);
-                
+
             if (order.payment_type === 'balance' && order.user_id) {
                 const balanceService = require('../services/balanceService');
                 try {
                     await balanceService.refundBalance(order.user_id, order.price, order.id, `Refund otomatis: Transaksi gagal di OkeConnect`);
                 } catch (err) {
                     console.error(`[Webhook/Okeconnect] Auto-refund gagal untuk ${order.id}:`, err.message);
+                    finalStatus = 'REFUND_PENDING';
                     await supabase
                         .from('orders')
                         .update({ status: 'REFUND_PENDING', error_message: `Refund gagal otomatis: ${err.message}` })
@@ -697,6 +716,12 @@ async function handleOkeconnectWebhook(req, res) {
             console.log(`[Webhook/OkeConnect] Order ${order.id} FAILED.`);
             emailService.sendOrderFailedEmail(order)
                 .catch(err => console.error(`[Webhook/OkeConnect] Email failed gagal:`, err.message));
+
+            await pushService.notifyOrderFailed({
+                ...order,
+                status: finalStatus,
+                error_message: message || 'Transaksi gagal di OkeConnect',
+            });
         }
 
         return res.status(200).json({ refid: refId, message: message || 'OK' });

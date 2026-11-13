@@ -7,6 +7,7 @@ const authController = require('../controllers/authController');
 const mobileCatalogController = require('../controllers/mobileCatalogController');
 const mobileOrderController = require('../controllers/mobileOrderController');
 const mobileBillController = require('../controllers/mobileBillController');
+const pushController = require('../controllers/pushController');
 const verifyAppUser = require('../middleware/verifyAppUser');
 
 function setAppAuthContext(req, res, next) {
@@ -91,6 +92,21 @@ const orderDetailLimiter = rateLimit({
     legacyHeaders: false,
 });
 
+// Registrasi push token — aplikasi memanggil sekali per sesi + saat token
+// di-rotasi FCM, jadi batasnya longgar tapi tetap ada.
+const deviceLimiter = rateLimit({
+    windowMs: 10 * 60 * 1000,
+    max: 30,
+    keyGenerator: (req) => req.user?.id || ipKeyGenerator(req.ip),
+    message: {
+        success: false,
+        code: 'RATE_LIMITED',
+        error: 'Terlalu banyak permintaan perangkat. Coba lagi nanti.',
+    },
+    standardHeaders: true,
+    legacyHeaders: false,
+});
+
 // ── Public: config and authentication ──────────────────────────────────────
 router.get('/config', mobileCatalogController.getConfig);
 
@@ -120,5 +136,10 @@ router.post('/orders', orderLimiter, mobileOrderController.create);
 router.get('/orders', mobileOrderController.list);
 router.get('/orders/:id', orderDetailLimiter, mobileOrderController.getById);
 router.post('/orders/:id/cancel', mobileOrderController.cancel);
+
+// ── Push notification devices ───────────────────────────────────────────────
+router.post('/devices', deviceLimiter, pushController.registerDevice);
+router.delete('/devices', deviceLimiter, pushController.unregisterDevice);
+router.get('/devices', deviceLimiter, pushController.listDevices);
 
 module.exports = router;

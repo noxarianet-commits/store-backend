@@ -6,6 +6,7 @@ const { toPublicProduct } = require('../utils/publicProduct');
 const { findProductByAnyId } = require('../utils/productLookup');
 const { buildPublicSettings } = require('../utils/publicSettings');
 const { isAvailableForChannel } = require('../utils/channel');
+const { isMandatoryValidationEnabled } = require('../utils/settingFlags');
 const { logger } = require('../utils/logger');
 
 const DEFAULT_MOBILE_CONFIG = {
@@ -31,10 +32,13 @@ function slugify(text) {
 
 async function getConfig(req, res) {
     try {
-        const { data, error } = await supabase
-            .from('settings')
-            .select('key, value')
-            .in('key', ['mobile_app_config', 'shop_status']);
+        const [{ data, error }, mandatoryValidation] = await Promise.all([
+            supabase
+                .from('settings')
+                .select('key, value')
+                .in('key', ['mobile_app_config', 'shop_status']),
+            isMandatoryValidationEnabled('app'),
+        ]);
 
         if (error) throw error;
 
@@ -54,6 +58,9 @@ async function getConfig(req, res) {
             success: true,
             data: {
                 ...config,
+                // Flag efektif channel app (master + override mandatory_validation_app).
+                // Dipakai aplikasi untuk menampilkan/menyembunyikan cek ID.
+                mandatory_validation: mandatoryValidation,
                 shop_status: map.get('shop_status') || { isOpen: true, message: 'Selamat datang!' },
             },
         });

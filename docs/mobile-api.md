@@ -205,6 +205,7 @@ GET /api/mobile/config
       "tickets": true
     },
     "payment_methods": ["balance", "qris"],
+    "mandatory_validation": true,
     "shop_status": {
       "isOpen": true,
       "message": "Selamat datang!"
@@ -224,12 +225,19 @@ GET /api/mobile/config
 | `features.topup` | boolean | Tampilkan menu top-up saldo |
 | `features.tickets` | boolean | Tampilkan menu bantuan/CS |
 | `payment_methods` | string[] | `balance` dan `qris` (label UI). Di order, `qris` dikirim sebagai `payment_type: "gateway"` |
+| `mandatory_validation` | boolean | Flag efektif "Wajib Validasi Akun" untuk channel app. `false` = cek ID ke penyedia dilewati |
 | `shop_status.isOpen` | boolean | Toko buka/tutup |
 | `shop_status.message` | string | Pesan yang ditampilkan saat toko tutup |
 
 Nilai default dapat dioverride oleh setting `mobile_app_config` di tabel
 `settings`. Key `features` digabung dengan default, jadi menambahkan satu flag
 tidak menghilangkan flag lain.
+
+`mandatory_validation` **tidak** berasal dari `mobile_app_config`; nilainya
+dihitung server dari setting `mandatory_validation` (master) dan
+`mandatory_validation_app` (override channel app) dengan aturan yang sama
+seperti validasi di `POST /orders`. Nilai hilang atau gagal dibaca berarti
+`true` (fail-safe). Aplikasi lama yang belum membaca field ini tetap aman.
 
 **Response `500`**
 

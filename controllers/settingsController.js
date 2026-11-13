@@ -7,6 +7,8 @@ const PUBLIC_SETTINGS_DEFAULTS = {
     shop_status: { isOpen: true, message: 'Selamat datang!' },
     wa_group_link: 'https://chat.whatsapp.com/HQDNahAemv6GfmZqYZjSSD?s=sw&p=a&ilr=4&amv=3',
     mandatory_validation: true,
+    // null = belum ada override, channel web ikut saklar master.
+    mandatory_validation_web: null,
 };
 
 /**

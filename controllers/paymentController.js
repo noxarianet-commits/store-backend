@@ -327,9 +327,10 @@ async function createPayment(req, res) {
         }
 
         // 6. Validasi Akun Wajib (Khusus OkeConnect / Varian dengan validasi)
-        // Dilewati total saat settings `mandatory_validation` nonaktif (endpoint
-        // validasi provider sedang gangguan) — transaksi tetap berjalan.
-        const mandatoryValidation = await isMandatoryValidationEnabled();
+        // Dilewati total saat settings `mandatory_validation` nonaktif atau
+        // override channel web (`mandatory_validation_web`) dimatikan admin
+        // (endpoint validasi provider sedang gangguan) — transaksi tetap berjalan.
+        const mandatoryValidation = await isMandatoryValidationEnabled('web');
         const isValidationNeeded = Boolean(matchedVariant.validation?.available);
         if (isValidationNeeded && !mandatoryValidation) {
             logger.info('account_validation_bypassed', {

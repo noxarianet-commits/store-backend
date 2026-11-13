@@ -52,6 +52,24 @@ Admin (`Authorization: Bearer <admin token>`; `POST /api/admin/login` untuk mend
 - `PUT /api/settings/:key` — update setting
 - `/api/admin/*` — manajemen produk, user, saldo, tiket, statistik
 
+## Setting: Wajib Validasi Akun
+
+Saklar di dashboard admin → **Wajib Validasi Akun**. Kalau endpoint validasi provider
+sedang gangguan, matikan agar transaksi tetap jalan.
+
+| Key | Arti |
+|---|---|
+| `mandatory_validation` | Saklar master, berlaku untuk semua channel (default `true`) |
+| `mandatory_validation_web` | Override channel web (`false` = web tidak wajib cek ID) |
+| `mandatory_validation_app` | Override channel app (`false` = app tidak wajib cek ID) |
+
+Aturan efektif per channel: master harus ON **dan** override channel (bila ada) tidak boleh OFF.
+Override yang belum diisi = ikut master. Nilai rusak/gagal dibaca = validasi tetap wajib (fail-safe).
+
+Contoh "disable wajib validasi id untuk web": `mandatory_validation=true` +
+`mandatory_validation_web=false` → website tidak mewajibkan cek ID, aplikasi Android tetap mewajibkannya.
+Nomor tujuan dan formatnya tetap divalidasi lokal di semua channel.
+
 ## Database
 
 - Migrasi SQL bernomor ada di `migrations/` (sampai `023_mobile_app.sql`).

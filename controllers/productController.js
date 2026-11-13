@@ -275,7 +275,8 @@ async function validate(req, res) {
 
         // Fitur "Wajib Validasi" dinonaktifkan admin (mis. endpoint validasi
         // provider sedang gangguan): jangan panggil provider sama sekali.
-        if (!(await isMandatoryValidationEnabled())) {
+        // Saklar bisa dimatikan per channel (web / app) lewat settings.
+        if (!(await isMandatoryValidationEnabled(channelFromRequest(req)))) {
             return res.json({
                 valid: true,
                 validation_available: false,

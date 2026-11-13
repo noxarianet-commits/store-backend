@@ -14,6 +14,7 @@ const PUBLIC_SETTING_KEYS = new Set([
     'info_modal_image',
     'payment_gateway',
     'mandatory_validation',
+    'mandatory_validation_web',
 ]);
 
 /**

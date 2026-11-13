@@ -5,6 +5,7 @@ const sekalipayGatewayService = require('../services/sekalipayGatewayService');
 const dyqrisGatewayService = require('../services/dyqrisGatewayService');
 const emailService = require('../services/emailService');
 const orderFulfillmentService = require('../services/orderFulfillmentService');
+const orderStatusService = require('../services/orderStatusService');
 const vendorRegistry = require('../services/vendors/vendorRegistry');
 const { logger } = require('../utils/logger');
 
@@ -605,7 +606,37 @@ async function handleOkeconnectWebhook(req, res) {
         }
 
 
-        if (order.status === 'COMPLETED' || order.status === 'FAILED') {
+        if (order.status === 'COMPLETED') {
+            return res.status(200).json({ refid: refId, message, status: 'already_processed' });
+        }
+
+        // Order yang sempat ditandai FAILED (mis. karena check status memakai
+        // refID yang salah) tidak boleh menutupi callback sukses dari vendor.
+        // Rekonsiliasi: tandai COMPLETED dan batalkan refund otomatisnya.
+        const orderWasFailed = ['FAILED', 'REFUND_PENDING'].includes(String(order.status || '').toUpperCase());
+
+        if (event.status === 'success' && orderWasFailed) {
+            try {
+                const reconciled = await orderStatusService.markCompleted(order, {
+                    sn: event.sn || null,
+                    data: { raw: message },
+                });
+
+                console.log(`[Webhook/OkeConnect] Order ${order.id} direkonsiliasi ke COMPLETED (sebelumnya ${order.status}).`);
+                emailService.sendOrderCompletedEmail({
+                    ...reconciled,
+                    account_details: reconciled.account_details,
+                    vendor_invoice: reconciled.vendor_invoice,
+                }).catch(err => console.error(`[Webhook/OkeConnect] Email completed gagal:`, err.message));
+
+                return res.status(200).json({ refid: refId, message, status: 'reconciled' });
+            } catch (reconcileErr) {
+                console.error(`[Webhook/OkeConnect] Rekonsiliasi order ${order.id} gagal:`, reconcileErr.message);
+                return res.status(500).json({ error: reconcileErr.message });
+            }
+        }
+
+        if (orderWasFailed) {
             return res.status(200).json({ refid: refId, message, status: 'already_processed' });
         }
 

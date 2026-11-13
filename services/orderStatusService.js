@@ -53,8 +53,61 @@ function shouldThrottle(orderId, force) {
     return false;
 }
 
+/**
+ * Batalkan refund otomatis ketika order ternyata sukses di vendor.
+ *
+ * Skenario: order sempat ditandai FAILED (mis. karena check status memakai
+ * refID yang salah), saldo otomatis dikembalikan, lalu vendor mengirim
+ * callback sukses. Tanpa pembatalan refund, pembeli mendapat produk gratis.
+ *
+ * Hanya order balance yang punya refund; order gateway tidak pernah di-debit
+ * dari saldo.
+ */
+async function reverseAutoRefund(order) {
+    if (!order || order.payment_type !== 'balance' || !order.user_id) {
+        return { reversed: false, reason: 'not_balance_order' };
+    }
+
+    const { data: refunds, error } = await supabase
+        .from('balance_transactions')
+        .select('id, amount')
+        .eq('user_id', order.user_id)
+        .eq('reference_id', order.id)
+        .eq('type', 'refund')
+        .eq('status', 'completed')
+        .limit(1);
+
+    if (error) {
+        return { reversed: false, error: error.message };
+    }
+
+    if (!refunds || !refunds.length) {
+        return { reversed: false, reason: 'no_refund' };
+    }
+
+    const amount = order.price || refunds[0].amount;
+
+    try {
+        await balanceService.debitBalance(
+            order.user_id,
+            amount,
+            order.id,
+            `Penyesuaian saldo: transaksi vendor sukses untuk ${order.id}`
+        );
+        return { reversed: true, amount };
+    } catch (err) {
+        return { reversed: false, error: err.message };
+    }
+}
+
 async function markCompleted(order, statusResult) {
     const sn = statusResult.sn || order.vendor_invoice || null;
+    const wasFailed = ['FAILED', 'REFUND_PENDING'].includes(String(order.status || '').toUpperCase());
+
+    // Kalau order sempat gagal dan saldonya sudah dikembalikan, kembalikan
+    // lagi penyeimbangannya sebelum order ditandai COMPLETED.
+    const refundState = wasFailed ? await reverseAutoRefund(order) : null;
+
     const accountDetails = {
         ...(order.account_details || {}),
         sn,
@@ -64,17 +117,41 @@ async function markCompleted(order, statusResult) {
         completed_at: new Date().toISOString(),
     };
 
+    if (refundState) {
+        accountDetails.refund_reversed = refundState.reversed === true;
+        if (refundState.reversed) {
+            accountDetails.refund_reversed_at = new Date().toISOString();
+        } else if (refundState.error) {
+            // Saldo tidak bisa dikembalikan (mis. sudah dipakai pembeli).
+            // Tandai supaya bisa ditangani manual oleh admin.
+            accountDetails.balance_reconcile_pending = refundState.error;
+        }
+    }
+
     const { error } = await supabase
         .from('orders')
         .update({
             status: 'COMPLETED',
             vendor_status: 'success',
             vendor_invoice: sn,
+            error_message: null,
             account_details: accountDetails,
         })
         .eq('id', order.id);
 
     if (error) throw error;
+
+    if (refundState?.reversed) {
+        logger.info('order_refund_reversed_after_vendor_success', {
+            orderId: order.id,
+            amount: refundState.amount,
+        });
+    } else if (refundState?.error) {
+        logger.warn('order_refund_reversal_failed', {
+            orderId: order.id,
+            message: refundState.error,
+        });
+    }
 
     logger.info('order_completed_via_status_refresh', { orderId: order.id });
     return { ...order, status: 'COMPLETED', account_details: accountDetails, vendor_invoice: sn };
@@ -169,6 +246,9 @@ async function refreshIfStale(order, { force = false } = {}) {
             {
                 product: order.vendor_variant_id,
                 dest: target,
+                // Order lama bisa menyimpan ID transaksi vendor (bukan refID),
+                // jadi adapter boleh mencoba lagi dengan id order kita.
+                fallbackRefId: order.id,
             }
         );
 
@@ -232,6 +312,8 @@ module.exports = {
     refreshIfStale,
     reconcileProcessingOrders,
     refundBalanceOrder,
+    markCompleted,
+    reverseAutoRefund,
     isFinalStatus,
     __test: {
         shouldThrottle,

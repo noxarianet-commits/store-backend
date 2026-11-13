@@ -275,12 +275,15 @@ async function checkVendorAvailability({ adapter, actualVendor, matchedVariant, 
     return { requiredVendorCost };
 }
 
-async function validateAccount({ adapter, actualVendor, dbProduct, matchedVariant, targetVariantId, target, zone, fallbackName }) {
+async function validateAccount({ adapter, actualVendor, dbProduct, matchedVariant, targetVariantId, target, zone, fallbackName, mandatoryValidation: mandatoryValidationOverride }) {
     let resolvedCustomerName = fallbackName;
     let resolvedTarget = target;
 
-    // Saklar admin "Wajib Validasi Akun" (channel app).
-    const mandatoryValidation = await isMandatoryValidationEnabled('app');
+    // Saklar admin "Wajib Validasi Akun" (channel app). Nilai bisa di-inject
+    // supaya unit test tidak bergantung pada setting produksi.
+    const mandatoryValidation = typeof mandatoryValidationOverride === 'boolean'
+        ? mandatoryValidationOverride
+        : await isMandatoryValidationEnabled('app');
 
     if (actualVendor === 'okeconnect') {
         const isEwallet = dbProduct?.category?.toLowerCase().includes('wallet') ||

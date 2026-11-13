@@ -95,8 +95,14 @@ function parseStatusAndSn(text) {
     let status = 'pending';
     if (/status\s+Sukses/i.test(trimmed) || /\bSUKSES\b/i.test(trimmed)) {
         status = 'success';
-    } else if (/status\s+Gagal/i.test(trimmed) || /\bGAGAL\b/i.test(trimmed) || /TIDAK ADA transaksi/i.test(trimmed)) {
+    } else if (/status\s+Gagal/i.test(trimmed) || /\bGAGAL\b/i.test(trimmed)) {
         status = 'failed';
+    } else if (/TIDAK ADA transaksi/i.test(trimmed)) {
+        // "TIDAK ADA transaksi Tujuan X pada tgl Y. Tidak ada data." artinya
+        // vendor tidak menemukan transaksi untuk refID yang ditanyakan —
+        // BUKAN bukti transaksi gagal. Menandainya failed/refund akan salah
+        // membatalkan transaksi yang sebenarnya berhasil.
+        status = 'pending';
     } else if (/Menunggu Jawaban/i.test(trimmed) || /akan diproses/i.test(trimmed) || /\bPENDING\b/i.test(trimmed)) {
         status = 'pending';
     }
@@ -1662,8 +1668,12 @@ class OkeconnectAdapter extends VendorAdapter {
 
             return {
                 success: true,
-                vendorOrderId: transactionId || extractedRefId || effectiveRefId,
-                invoice: sn || transactionId || null,
+                // PENTING: OkeConnect hanya mengenali refID yang kita kirim
+                // saat membuat transaksi. ID transaksi (T#xxx) TIDAK bisa
+                // dipakai untuk check status — kalau dipakai, vendor membalas
+                // "TIDAK ADA transaksi" dan order bisa salah ditandai gagal.
+                vendorOrderId: extractedRefId || effectiveRefId,
+                invoice: sn || null,
                 sn,
                 data: {
                     transactionId,
@@ -1684,7 +1694,7 @@ class OkeconnectAdapter extends VendorAdapter {
     /**
      * Check transaction status on OkeConnect.
      * @param {string} refId
-     * @param {Object} options - { product, dest, qty }
+     * @param {Object} options - { product, dest, qty, fallbackRefId }
      */
     async checkOrderStatus(refId, options = {}) {
         try {
@@ -1706,6 +1716,36 @@ class OkeconnectAdapter extends VendorAdapter {
             const text = String(res.data || '').trim();
 
             const parsed = parseStatusAndSn(text);
+
+            // Order lama bisa menyimpan ID transaksi (T#xxx) di vendor_order_id.
+            // ID itu tidak dikenali vendor saat check status, sehingga jawabannya
+            // "TIDAK ADA transaksi". Coba lagi dengan refID asli (id order).
+            if (
+                parsed.status === 'pending' &&
+                /TIDAK ADA transaksi/i.test(text) &&
+                options.fallbackRefId &&
+                options.fallbackRefId !== refId
+            ) {
+                const retryRes = await this.client.get('/trx', {
+                    params: { ...params, refID: options.fallbackRefId },
+                });
+                const retryText = String(retryRes.data || '').trim();
+                const retryParsed = parseStatusAndSn(retryText);
+
+                if (retryParsed.status !== 'pending') {
+                    return {
+                        success: true,
+                        status: retryParsed.status,
+                        sn: retryParsed.sn,
+                        data: {
+                            raw: retryText,
+                            status: retryParsed.status,
+                            sn: retryParsed.sn,
+                            refId: options.fallbackRefId,
+                        },
+                    };
+                }
+            }
 
             return {
                 success: true,
@@ -1788,4 +1828,6 @@ module.exports.__test = {
     plnDenomValue,
     extractPlnCustomerName,
     extractPlnTariff,
+    parseStatusAndSn,
+    extractSN,
 };

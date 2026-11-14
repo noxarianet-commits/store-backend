@@ -115,38 +115,37 @@ val idempotencyKey = java.util.UUID.randomUUID().toString()
 
 | Endpoint | Limit |
 |---|---|
-| `POST /auth/login` | 15 request / 15 menit / IP |
-| `POST /auth/register`, `/auth/register/resend`, `/auth/forgot-password`, `/auth/forgot-password/resend` | 10 request / jam / IP |
-| `POST /auth/register/verify`, `/auth/forgot-password/verify` | 20 request / 15 menit / IP |
+| `POST /auth/login` | 15 request / 15 menit / email + 200 request / 15 menit / IP |
+| `POST /auth/register`, `/auth/register/resend`, `/auth/forgot-password`, `/auth/forgot-password/resend` | 5 request / jam / email + 100 request / jam / IP |
+| `POST /auth/register/verify`, `/auth/forgot-password/verify` | 20 request / 15 menit / email + 100 request / 15 menit / IP |
 | `POST /orders` | 30 request / jam / user (fallback IP) |
 | `POST /bills/inquiry` | 12 request / menit / user (fallback IP) |
 | `GET /orders/:id` | 120 request / menit / user (fallback IP) |
-| `GET /api/payments/status/:orderId` | 120 request / menit / IP |
-| Global API | 600 request / 10 menit / IP |
+| `GET /api/payments/status/:orderId` | 240 request / menit / user, fallback IP |
+| Global API | 1200 request / 10 menit / identitas user/admin, fallback IP |
 
 Global limiter **dilewati** untuk:
 
+- `GET /api/mobile/config` (punya limiter per-IP 3000/10 menit)
 - `GET /api/payments/status/*`
 - `GET /api/mobile/orders/:id`
+- `GET /api/balance/topup/*/status`
 - semua path yang berakhiran `/stream`
+- semua `/api/webhooks/*`
 
-Respons `429` dari limiter route mobile:
+Semua respons `429` memakai bentuk yang sama:
 
 ```json
 {
   "success": false,
   "code": "RATE_LIMITED",
-  "error": "Terlalu banyak pembuatan pesanan. Coba lagi nanti."
+  "error": "Terlalu banyak request, silakan coba lagi nanti.",
+  "retry_after": 42,
+  "request_id": "..."
 }
 ```
 
-Respons `429` dari limiter global hanya berisi:
-
-```json
-{
-  "error": "Terlalu banyak request, silakan coba lagi nanti."
-}
-```
+`retry_after` juga dikirim sebagai header `Retry-After`.
 
 ### HTTP status yang dipakai
 
@@ -2400,7 +2399,7 @@ Authorization: Bearer <app-token>
 |---|---|---|
 | `404` | `{ "error": "Order tidak ditemukan" }` | Order tidak ada / bukan milik user |
 | `500` | `{ "error": "Gagal memeriksa status pesanan" }` | Kesalahan server |
-| `429` | `{ "error": "Terlalu banyak request pengecekan status. Harap tunggu sebentar." }` | Limiter 120/menit/IP |
+| `429` | `{ "success": false, "code": "RATE_LIMITED", "error": "Terlalu banyak request pengecekan status. Harap tunggu sebentar.", "retry_after": 42 }` | Limiter 240/menit/user (fallback IP) |
 
 ### Status order
 
@@ -2512,6 +2511,17 @@ sekali per sesi, dan lagi saat token di-rotasi oleh FCM.
 Token bersifat **upsert by `push_token`**: satu token hanya tercatat untuk satu
 user. Bila user lain login di perangkat yang sama, kepemilikan token berpindah
 ke user tersebut (dan notifikasi user lama berhenti).
+
+**"Sesi hantu"** — token JWT yang masih berlaku untuk akun yang sudah dihapus.
+Endpoint ini adalah best-effort, jadi kasus itu dibalas `200` dengan
+`registered: false`, bukan `500`:
+
+```json
+{ "success": true, "data": { "registered": false, "reason": "user_not_found" } }
+```
+
+Aplikasi seharusnya tidak sampai ke tahap ini: `GET /me` mengembalikan `404`
+untuk akun yang sudah hilang, dan aplikasi memakai itu untuk mengeluarkan sesi.
 
 **Error**
 

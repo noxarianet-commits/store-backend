@@ -110,6 +110,15 @@ async function registerDevice({ userId, pushToken, platform, appVersion }) {
         }], { onConflict: 'push_token' });
 
     if (error) {
+        // 23503 = foreign key violation: baris user_profiles untuk user ini sudah
+        // tidak ada. Tokennya masih valid secara kriptografis (masa berlaku 30
+        // hari) tapi akunnya sudah dihapus — "sesi hantu". Ini bukan kesalahan
+        // sistem, jadi jangan log sebagai ERROR dan jangan balas 500.
+        if (error.code === '23503') {
+            pushLog.warn('push_device_register_unknown_user', { userId });
+            return { success: false, reason: 'user_not_found' };
+        }
+
         pushLog.error('push_device_register_failed', { userId, message: error.message });
         return { success: false, error: error.message };
     }

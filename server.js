@@ -7,6 +7,7 @@ require('dotenv').config();
 
 const { logger } = require('./utils/logger');
 const { requestContext } = require('./middleware/requestContext');
+const { globalKey, rateLimitHandler } = require('./utils/rateLimit');
 
 // Initialize Unified Product Sync Service
 const productSyncService = require('./services/productSyncService');
@@ -44,20 +45,38 @@ const verifyUser = require('./middleware/verifyUser');
 // ══════════════════════════════════════════════════════════════════════════
 
 const app = express();
+// Deployment: Cloudflare -> Nginx (VPS) -> Express. `1` mempercayai Nginx
+// sebagai hop pertama. Key rate limit memakai helpers/clientIp untuk mengambil
+// CF-Connecting-IP saat Nginx belum mengembalikan IP pengunjung asli.
 app.set('trust proxy', 1);
 const PORT = process.env.PORT || 3000;
 
 // Rate Limiters
+// Store default express-rate-limit adalah in-memory, jadi batas berlaku per
+// proses. Di PM2 cluster, limit efektif = max x jumlah worker; pindahkan ke
+// Redis store kalau butuh batas yang benar-benar global.
 const globalLimiter = rateLimit({
     windowMs: 10 * 60 * 1000,
-    max: 600,
+    // Dihitung per identitas JWT (user/admin), bukan per IP. Pengguna seluler
+    // berada di belakang CGNAT: satu IP publik dipakai banyak akun sekaligus.
+    max: 1200,
+    keyGenerator: globalKey,
+    handler: rateLimitHandler,
     // SSE stream tiket berumur panjang dan otomatis reconnect — jangan
     // sampai koneksi itu menghabiskan kuota request halaman lain.
     // Path pelanggan mengandung nomor tiket (mis. /api/tickets/TK-.../stream),
     // jadi cocokkan suffix '/stream', bukan '/tickets/stream'.
-    skip: (req) => req.path.includes('/payments/status') ||
+    skip: (req) => req.path.startsWith('/api/webhooks') ||
+        req.path.includes('/payments/status') ||
+        // Config publik punya limiter per-IP sendiri yang lebih longgar.
+        (req.method === 'GET' && req.path === '/api/mobile/config') ||
         req.path.endsWith('/stream') ||
-        (req.method === 'GET' && /\/mobile\/orders\/[^/]+$/.test(req.path)),
+        (req.method === 'GET' && /\/mobile\/orders\/[^/]+$/.test(req.path)) ||
+        // Polling top-up punya limiter per user sendiri. Jangan hitung dua kali
+        // supaya kuota global tetap tersedia untuk request lain.
+        (req.method === 'GET' &&
+            req.path.includes('/balance/topup/') &&
+            req.path.endsWith('/status')),
     message: { error: 'Terlalu banyak request, silakan coba lagi nanti.' },
     standardHeaders: true,
     legacyHeaders: false,
@@ -69,6 +88,8 @@ app.use(cors({
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization', 'x-admin-token', 'x-order-token', 'x-ticket-token', 'idempotency-key', 'x-signature', 'x-event', 'x-webhook-signature', 'x-callback-secret', '*'],
+    // Biarkan frontend membaca header backoff saat menerima 429.
+    exposedHeaders: ['Retry-After', 'RateLimit-Reset', 'RateLimit-Limit'],
     optionsSuccessStatus: 200
 }));
 
@@ -337,7 +358,9 @@ app.use((err, req, res, next) => {
 
 module.exports = app;
 
-if (process.env.NODE_ENV !== 'production') {
+// VPS/PM2 menjalankan proses Node sendiri, jadi listen di semua environment
+// selain Vercel. Di Vercel, platform yang memanggil app yang diekspor.
+if (!process.env.VERCEL) {
     app.listen(PORT, () => {
         logger.info('server_started', { port: PORT });
     });

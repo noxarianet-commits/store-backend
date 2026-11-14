@@ -6,7 +6,8 @@ Entry point: `server.js`.
 ## Ringkasan Cara Kerja
 
 - `server.js` merangkai middleware, route, cron job, dan error handler.
-  Saat `NODE_ENV=production` (mis. Vercel) app hanya di-`export`, tidak `listen()`.
+  Di Vercel app hanya di-`export` (platform yang memanggil); di VPS/PM2 app
+  memanggil `app.listen()` sendiri.
 - Semua data (produk, order, testimonial, settings, user) disimpan di Supabase.
 - Alur order: `POST /api/payments/create` → pembayaran QRIS → webhook/polling
   konfirmasi pembayaran → fulfillment otomatis ke vendor → status order berubah.
@@ -87,6 +88,16 @@ Nomor tujuan dan formatnya tetap divalidasi lokal di semua channel.
 
 ## Deploy
 
-- Vercel (`vercel.json` → semua route ke `server.js`). **Cron tidak jalan di Vercel**
-  (hanya PM2 instance 0 yang menjalankan node-cron; matikan dengan `CRON_ENABLED=false`).
-  Untuk production serverless, scheduler eksternal diperlukan untuk payment polling.
+- **Production sekarang di VPS**: Cloudflare → Nginx → PM2 (`npm start`).
+  Pastikan Nginx mengembalikan IP pengunjung asli (`real_ip_header CF-Connecting-IP`
+  + `set_real_ip_from` range Cloudflare) dan origin hanya menerima koneksi dari
+  Cloudflare/Nginx.
+- Hanya PM2 instance 0 yang menjalankan node-cron; matikan dengan `CRON_ENABLED=false`.
+  Rate limit `express-rate-limit` memakai store in-memory per proses — kalau PM2
+  cluster, batas efektif dikali jumlah worker (gunakan Redis store bila perlu).
+- `vercel.json` masih ada untuk deploy serverless legacy. **Cron tidak jalan di
+  Vercel**; scheduler eksternal diperlukan untuk payment polling.
+- Cache edge (opsional, sangat membantu saat traffic ramai): cache GET publik
+  `/api/mobile/config`, `/api/mobile/home`, `/api/mobile/products*`,
+  `/api/products*`, `/api/home` selama 30–60 detik. **Jangan** cache
+  `/api/mobile/me`, `/orders`, `/balance`, `/devices`, `/payments`, `/tickets`.

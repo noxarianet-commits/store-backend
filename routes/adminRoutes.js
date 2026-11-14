@@ -5,16 +5,33 @@ const adminController = require('../controllers/adminController');
 const settingsController = require('../controllers/settingsController');
 const pushController = require('../controllers/pushController');
 const verifyAdmin = require('../middleware/verifyAdmin');
+const { accountKey, ipKey, rateLimitHandler } = require('../utils/rateLimit');
 
-// Login rate limiter: only 5 attempts per 15 minutes
-const loginLimiter = rateLimit({
+// Login admin: 5 percobaan per username per 15 menit, plus pagar per-IP yang
+// longgar supaya admin di jaringan bersama tidak terkunci oleh percobaan
+// orang lain.
+const loginAccountLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
     max: 5,
+    keyGenerator: accountKey,
+    handler: rateLimitHandler,
+    standardHeaders: true,
+    legacyHeaders: false,
     message: { error: 'Terlalu banyak percobaan login, coba lagi dalam 15 menit.' },
 });
 
+const loginIpLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 20,
+    keyGenerator: ipKey,
+    handler: rateLimitHandler,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: 'Terlalu banyak percobaan login dari jaringan ini, coba lagi nanti.' },
+});
+
 // POST /api/admin/login — rate limited
-router.post('/login', loginLimiter, adminController.login);
+router.post('/login', loginIpLimiter, loginAccountLimiter, adminController.login);
 
 // PUT /api/admin/password — protected
 router.put('/password', verifyAdmin, adminController.changePassword);
@@ -37,6 +54,7 @@ router.get('/balance-transactions/stats', verifyAdmin, adminController.getBalanc
 const broadcastLimiter = rateLimit({
     windowMs: 10 * 60 * 1000,
     max: 5,
+    handler: rateLimitHandler,
     message: { success: false, code: 'RATE_LIMITED', error: 'Terlalu banyak broadcast. Coba lagi dalam 10 menit.' },
     standardHeaders: true,
     legacyHeaders: false,

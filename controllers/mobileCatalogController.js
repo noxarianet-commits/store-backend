@@ -9,6 +9,11 @@ const { isAvailableForChannel } = require('../utils/channel');
 const { isMandatoryValidationEnabled } = require('../utils/settingFlags');
 const { logger } = require('../utils/logger');
 
+// Konten katalog bersifat publik dan tidak bergantung pada user. Header ini
+// memberi tahu Cloudflare/Nginx bahwa respons aman di-cache sebentar; tanpa
+// cache rule di edge, header ini tidak berefek.
+const PUBLIC_CACHE_HEADER = 'public, max-age=30, stale-while-revalidate=60';
+
 const DEFAULT_MOBILE_CONFIG = {
     min_version: '1.0.0',
     latest_version: '1.0.0',
@@ -115,6 +120,7 @@ async function getHome(req, res) {
             if (product.is_featured && featured.length < 12) featured.push(product);
         }
 
+        res.set('Cache-Control', PUBLIC_CACHE_HEADER);
         res.json({
             success: true,
             data: {
@@ -214,6 +220,7 @@ async function listProducts(req, res) {
         const { data, error, count } = await query.range(offset, offset + limit - 1);
         if (error) throw error;
 
+        res.set('Cache-Control', PUBLIC_CACHE_HEADER);
         res.json({
             success: true,
             data: (data || []).map(toPublicProduct),
@@ -251,6 +258,7 @@ async function getProductById(req, res) {
         // Bill products are standalone; do not merge peer products across
         // billers whose display names happen to normalize to the same key.
         if (primary.product_type === 'postpaid') {
+            res.set('Cache-Control', PUBLIC_CACHE_HEADER);
             return res.json({ success: true, data: toPublicProduct(primary) });
         }
 
@@ -264,6 +272,7 @@ async function getProductById(req, res) {
             getCanonicalKey(product.name) === targetCanonicalKey
         );
 
+        res.set('Cache-Control', PUBLIC_CACHE_HEADER);
         res.json({
             success: true,
             data: buildMultiServerProduct(primary, peers),

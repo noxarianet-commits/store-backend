@@ -38,6 +38,16 @@ async function registerDevice(req, res) {
         });
 
         if (!result.success) {
+            // Sesi untuk akun yang sudah dihapus ("sesi hantu"): token JWT masih
+            // valid tapi user_profiles-nya sudah tidak ada. Endpoint ini best-
+            // effort, jadi balas 200 dengan registered:false — jangan 500.
+            if (result.reason === 'user_not_found') {
+                return res.json({
+                    success: true,
+                    data: { registered: false, reason: 'user_not_found' },
+                });
+            }
+
             return res.status(500).json({
                 success: false,
                 code: 'DEVICE_REGISTER_FAILED',

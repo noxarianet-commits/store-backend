@@ -115,13 +115,14 @@ val idempotencyKey = java.util.UUID.randomUUID().toString()
 
 | Endpoint | Limit |
 |---|---|
-| `POST /auth/login` | 15 request / 15 menit / email + 200 request / 15 menit / IP |
+| `POST /auth/login` | 15 percobaan gagal / 15 menit / email + 200 percobaan gagal / 15 menit / IP |
 | `POST /auth/register`, `/auth/register/resend`, `/auth/forgot-password`, `/auth/forgot-password/resend` | 5 request / jam / email + 100 request / jam / IP |
 | `POST /auth/register/verify`, `/auth/forgot-password/verify` | 20 request / 15 menit / email + 100 request / 15 menit / IP |
 | `POST /orders` | 30 request / jam / user (fallback IP) |
 | `POST /bills/inquiry` | 12 request / menit / user (fallback IP) |
 | `GET /orders/:id` | 120 request / menit / user (fallback IP) |
 | `GET /api/payments/status/:orderId` | 240 request / menit / user, fallback IP |
+| `POST/DELETE/GET /devices` | 120 request / 10 menit / user |
 | Global API | 1200 request / 10 menit / identitas user/admin, fallback IP |
 
 Global limiter **dilewati** untuk:
@@ -2512,6 +2513,10 @@ Token bersifat **upsert by `push_token`**: satu token hanya tercatat untuk satu
 user. Bila user lain login di perangkat yang sama, kepemilikan token berpindah
 ke user tersebut (dan notifikasi user lama berhenti).
 
+> Aplikasi melakukan dedupe registrasi per user (60 detik) sebelum memanggil
+> endpoint ini, karena `addPushTokenListener` Expo bisa berbunyi berulang.
+> Jangan panggil register setiap render/foreground.
+
 **"Sesi hantu"** — token JWT yang masih berlaku untuk akun yang sudah dihapus.
 Endpoint ini adalah best-effort, jadi kasus itu dibalas `200` dengan
 `registered: false`, bukan `500`:
@@ -2528,7 +2533,7 @@ untuk akun yang sudah hilang, dan aplikasi memakai itu untuk mengeluarkan sesi.
 | Status | `code` | Keterangan |
 |---|---|---|
 | 400 | `VALIDATION_ERROR` | `push_token` kosong / tidak valid |
-| 429 | `RATE_LIMITED` | 30 request / 10 menit per user |
+| 429 | `RATE_LIMITED` | 120 request / 10 menit per user |
 | 500 | `DEVICE_REGISTER_FAILED` | Gagal menyimpan ke database |
 
 ### `DELETE /devices`

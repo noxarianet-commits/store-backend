@@ -24,6 +24,9 @@ const loginIpLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
     max: 200,
     keyGenerator: ipKey,
+    // Login yang berhasil tidak dihitung; hanya percobaan gagal yang
+    // menghabiskan kuota brute-force.
+    skipSuccessfulRequests: true,
     handler: rateLimitHandler,
     message: {
         success: false,
@@ -38,6 +41,7 @@ const loginEmailLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
     max: 15,
     keyGenerator: emailKey,
+    skipSuccessfulRequests: true,
     handler: rateLimitHandler,
     message: {
         success: false,
@@ -147,10 +151,11 @@ const orderDetailLimiter = rateLimit({
 });
 
 // Registrasi push token — aplikasi memanggil sekali per sesi + saat token
-// di-rotasi FCM, jadi batasnya longgar tapi tetap ada.
+// di-rotasi FCM. Endpoint ini idempotent (upsert), jadi batasnya dibuat longgar;
+// app juga punya dedupe/cooldown agar listener FCM tidak menjadi loop.
 const deviceLimiter = rateLimit({
     windowMs: 10 * 60 * 1000,
-    max: 30,
+    max: 120,
     keyGenerator: userKey,
     handler: rateLimitHandler,
     message: {

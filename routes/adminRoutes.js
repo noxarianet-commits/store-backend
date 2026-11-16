@@ -14,6 +14,8 @@ const loginAccountLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
     max: 5,
     keyGenerator: accountKey,
+    // Login admin yang berhasil tidak dihitung.
+    skipSuccessfulRequests: true,
     handler: rateLimitHandler,
     standardHeaders: true,
     legacyHeaders: false,
@@ -24,6 +26,7 @@ const loginIpLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
     max: 20,
     keyGenerator: ipKey,
+    skipSuccessfulRequests: true,
     handler: rateLimitHandler,
     standardHeaders: true,
     legacyHeaders: false,

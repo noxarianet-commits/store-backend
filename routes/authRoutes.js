@@ -20,6 +20,8 @@ const loginEmailLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
     max: 10,
     keyGenerator: emailKey,
+    // Login yang berhasil tidak dihitung; hanya percobaan gagal.
+    skipSuccessfulRequests: true,
     handler: rateLimitHandler,
     message: {
         success: false,
@@ -33,6 +35,7 @@ const loginIpLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
     max: 200,
     keyGenerator: ipKey,
+    skipSuccessfulRequests: true,
     handler: rateLimitHandler,
     message: {
         success: false,

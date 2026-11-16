@@ -107,17 +107,28 @@ function rateLimitHandler(req, res, next, options) {
     // tidak menyimpan email atau identitas pengguna.
     const key = String(req.rateLimit?.key || '');
     const keyType = key.includes(':') ? key.slice(0, key.indexOf(':')) : 'unknown';
+    const used = Number(req.rateLimit?.used || 0);
+    const limit = Number(req.rateLimit?.limit || 0);
 
-    logger.warn('rate_limited', {
-        method: req.method,
-        path: req.path,
-        keyType,
-        // IP hasil resolusi key (bukan header mentah) berguna untuk memastikan
-        // Nginx/Cloudflare meneruskan IP pengunjung yang benar.
-        ip: getClientIp(req),
-        retryAfter,
-        requestId: req.id,
-    });
+    // Jangan spam log untuk klien yang terus retry: catat blokir pertama dan
+    // setiap kelipatan 10 setelahnya.
+    const firstBlocked = limit > 0 && used === limit + 1;
+    const sampled = limit > 0 && used > limit + 1 && used % 10 === 0;
+
+    if (!limit || firstBlocked || sampled) {
+        logger.warn('rate_limited', {
+            method: req.method,
+            path: req.path,
+            keyType,
+            limit,
+            used,
+            // IP hasil resolusi key (bukan header mentah) berguna untuk memastikan
+            // Nginx/Cloudflare meneruskan IP pengunjung yang benar.
+            ip: getClientIp(req),
+            retryAfter,
+            requestId: req.id,
+        });
+    }
 
     res.set('Retry-After', String(retryAfter));
     res.status(options?.statusCode || 429).json({

@@ -1,6 +1,7 @@
 const supabase = require('../supabase');
 const cacheService = require('../services/cacheService');
 const { buildPublicSettings } = require('../utils/publicSettings');
+const { normalizeMobileAppConfig } = require('../utils/mobileAppConfig');
 const { logger } = require('../utils/logger');
 
 const PUBLIC_SETTINGS_DEFAULTS = {
@@ -68,7 +69,26 @@ async function listAdmin(req, res) {
 async function update(req, res) {
     try {
         const { key } = req.params;
-        const { value } = req.body;
+        let value = req.body?.value;
+
+        // Config aplikasi punya aturan sendiri: versi harus valid, min tidak
+        // boleh melebihi latest, dan link unduhan hanya http(s). Merge dengan
+        // nilai lama agar update parsial tidak menghapus features/payment_methods.
+        if (key === 'mobile_app_config') {
+            const { data: existing, error: readError } = await supabase
+                .from('settings')
+                .select('value')
+                .eq('key', key)
+                .maybeSingle();
+
+            if (readError) throw readError;
+
+            const normalized = normalizeMobileAppConfig(value, existing?.value);
+            if (normalized.error) {
+                return res.status(400).json({ error: normalized.error });
+            }
+            value = normalized.config;
+        }
 
         const { error } = await supabase
             .from('settings')

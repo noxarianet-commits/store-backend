@@ -7,24 +7,16 @@ const { findProductByAnyId } = require('../utils/productLookup');
 const { buildPublicSettings } = require('../utils/publicSettings');
 const { isAvailableForChannel } = require('../utils/channel');
 const { isMandatoryValidationEnabled } = require('../utils/settingFlags');
+const {
+    DEFAULT_MOBILE_APP_CONFIG,
+    sanitizeMobileAppConfigForRead,
+} = require('../utils/mobileAppConfig');
 const { logger } = require('../utils/logger');
 
 // Konten katalog bersifat publik dan tidak bergantung pada user. Header ini
 // memberi tahu Cloudflare/Nginx bahwa respons aman di-cache sebentar; tanpa
 // cache rule di edge, header ini tidak berefek.
 const PUBLIC_CACHE_HEADER = 'public, max-age=30, stale-while-revalidate=60';
-
-const DEFAULT_MOBILE_CONFIG = {
-    min_version: '1.0.0',
-    latest_version: '1.0.0',
-    maintenance: false,
-    features: {
-        bills: true,
-        topup: true,
-        tickets: true,
-    },
-    payment_methods: ['balance', 'qris'],
-};
 
 function slugify(text) {
     return String(text || '')
@@ -48,15 +40,7 @@ async function getConfig(req, res) {
         if (error) throw error;
 
         const map = new Map((data || []).map(row => [row.key, row.value]));
-        const stored = map.get('mobile_app_config');
-        const config = {
-            ...DEFAULT_MOBILE_CONFIG,
-            ...(stored && typeof stored === 'object' ? stored : {}),
-            features: {
-                ...DEFAULT_MOBILE_CONFIG.features,
-                ...(stored?.features && typeof stored.features === 'object' ? stored.features : {}),
-            },
-        };
+        const config = sanitizeMobileAppConfigForRead(map.get('mobile_app_config'));
 
         res.set('Cache-Control', 'public, max-age=60');
         res.json({
@@ -294,5 +278,6 @@ module.exports = {
     listProducts,
     getProductById,
     validateProduct,
-    DEFAULT_MOBILE_CONFIG,
+    // Nama lama dipertahankan untuk pemanggil yang sudah ada.
+    DEFAULT_MOBILE_CONFIG: DEFAULT_MOBILE_APP_CONFIG,
 };

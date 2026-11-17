@@ -199,6 +199,8 @@ GET /api/mobile/config
   "data": {
     "min_version": "1.0.0",
     "latest_version": "1.0.0",
+    "download_url": "https://cdn.noxarianet.web.id/app/noxarianet-1.0.1.apk",
+    "release_notes": "Perbaikan bug checkout dan peningkatan performa.",
     "maintenance": false,
     "features": {
       "bills": true,
@@ -219,9 +221,11 @@ GET /api/mobile/config
 
 | Field | Tipe | Keterangan |
 |---|---|---|
-| `min_version` | string | Versi minimum yang masih didukung |
-| `latest_version` | string | Versi terbaru di store |
-| `maintenance` | boolean | Mode maintenance |
+| `min_version` | string | Versi minimum yang masih didukung. Versi terpasang di bawah nilai ini akan melihat layar force-update |
+| `latest_version` | string | Versi terbaru di store. Dipakai halaman download dan banner update opsional |
+| `download_url` | string | URL file APK langsung. Kosong berarti admin belum mengisinya |
+| `release_notes` | string | Catatan rilis opsional (maks. 2000 karakter) |
+| `maintenance` | boolean | Mode maintenance aplikasi Android. Website tidak terpengaruh |
 | `features.bills` | boolean | Tampilkan menu tagihan |
 | `features.topup` | boolean | Tampilkan menu top-up saldo |
 | `features.tickets` | boolean | Tampilkan menu bantuan/CS |
@@ -233,6 +237,12 @@ GET /api/mobile/config
 Nilai default dapat dioverride oleh setting `mobile_app_config` di tabel
 `settings`. Key `features` digabung dengan default, jadi menambahkan satu flag
 tidak menghilangkan flag lain.
+
+Admin mengubah `mobile_app_config` lewat `PUT /api/settings/mobile_app_config`.
+Server menolak versi yang tidak valid, `min_version` yang lebih tinggi dari
+`latest_version`, link unduhan selain http(s), dan nilai maintenance yang bukan
+boolean. Saat config lama dibaca, nilai yang rusak di-fallback ke default agar
+tidak mengunci pengguna secara tidak sengaja.
 
 `mandatory_validation` **tidak** berasal dari `mobile_app_config`; nilainya
 dihitung server dari setting `mandatory_validation` (master) dan

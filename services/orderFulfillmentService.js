@@ -1,6 +1,6 @@
 const supabase = require('../supabase');
 const vendorRegistry = require('./vendors/vendorRegistry');
-const balanceService = require('./balanceService');
+const orderStatusService = require('./orderStatusService');
 const { normalizeNotePhoneNumber } = require('../utils/phoneUtils');
 const { logger } = require('../utils/logger');
 
@@ -82,39 +82,31 @@ class OrderFulfillmentService {
     }
 
     /**
+     * Refund saldo untuk order yang gagal. Guest checkout (tanpa user_id)
+     * tidak punya saldo tujuan dan tetap dibiarkan FAILED.
+     *
+     * Order QRIS yang sudah dibayar ikut direfund sebesar pg_total; order
+     * saldo memakai price. Status akhir diurus settleFailedOrder
+     * (REFUNDED / REFUND_PENDING / FAILED).
+     */
+    async _refundIfEligible(order, message, reason) {
+        const settled = await orderStatusService.settleFailedOrder(order, message, reason);
+
+        if (settled.status === 'REFUND_PENDING') {
+            fulfillmentLog.error('auto_refund_failed', {
+                orderId: order.id,
+                message: settled.refund?.error || settled.refund?.reason || 'unknown',
+            });
+        }
+
+        return settled;
+    }
+
+    /**
      * Claims the order atomically and processes fulfillment to vendor.
      * @param {Object} order The order object from database
      * @returns {Promise<{success: boolean, skipped?: boolean, message?: string}>}
      */
-    async _refundIfBalance(order, reason) {
-        if (order?.payment_type !== 'balance' || !order?.user_id) return;
-
-        try {
-            await balanceService.refundBalance(
-                order.user_id,
-                order.price,
-                order.id,
-                reason
-            );
-        } catch (err) {
-            fulfillmentLog.error('auto_refund_failed', {
-                orderId: order.id,
-                message: err.message,
-            });
-
-            // Leave a marker the payment sweep can retry. Never leave a failed
-            // balance order without a refund attempt path.
-            await supabase
-                .from('orders')
-                .update({
-                    status: 'REFUND_PENDING',
-                    error_message: `Refund gagal otomatis: ${err.message}`,
-                })
-                .eq('id', order.id)
-                .neq('status', 'REFUND_PENDING');
-        }
-    }
-
     async fulfillOrder(order) {
         const orderId = order.id;
         const variantId = order.vendor_variant_id || null;
@@ -174,7 +166,11 @@ class OrderFulfillmentService {
                     .update({ status: 'FAILED', error_message: `Vendor ${vendorName} tidak didukung` })
                     .eq('id', orderId);
 
-                await this._refundIfBalance(order, `Refund otomatis: vendor ${vendorName} tidak didukung`);
+                await this._refundIfEligible(
+                    order,
+                    `Vendor ${vendorName} tidak didukung`,
+                    `Refund otomatis: vendor ${vendorName} tidak didukung`
+                );
                 return { success: false, message: 'Unsupported vendor' };
             }
 
@@ -183,7 +179,11 @@ class OrderFulfillmentService {
                 await supabase.from('orders').update({ status: 'FAILED', error_message: errMsg }).eq('id', orderId);
                 fulfillmentLog.error('variant_missing', { orderId, vendor: vendorName });
 
-                await this._refundIfBalance(order, `Refund otomatis: ${errMsg}`);
+                await this._refundIfEligible(
+                    order,
+                    errMsg,
+                    `Refund otomatis: ${errMsg}`
+                );
                 return { success: false, message: errMsg };
             }
 
@@ -204,8 +204,9 @@ class OrderFulfillmentService {
                     })
                     .eq('id', orderId);
 
-                await this._refundIfBalance(
+                await this._refundIfEligible(
                     order,
+                    errMsg,
                     `Refund otomatis: transaksi vendor gagal untuk ${orderId}`
                 );
 
@@ -245,8 +246,9 @@ class OrderFulfillmentService {
                 .update({ status: 'FAILED', error_message: err.message })
                 .eq('id', orderId);
 
-            await this._refundIfBalance(
+            await this._refundIfEligible(
                 order,
+                err.message,
                 `Refund otomatis: fulfillment error untuk ${orderId}`
             );
 

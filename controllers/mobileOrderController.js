@@ -116,7 +116,7 @@ async function getById(req, res) {
             return res.status(404).json({ success: false, code: 'ORDER_NOT_FOUND', error: 'Pesanan tidak ditemukan.' });
         }
 
-        if (!orderStatusService.isFinalStatus(order.status) && order.payment_type === 'balance') {
+        if (!orderStatusService.isFinalStatus(order.status)) {
             const refreshed = await orderStatusService.refreshIfStale(order, {
                 force: req.query.force === 'true',
             });
@@ -162,6 +162,10 @@ async function cancel(req, res) {
                 .update({
                     status: 'REFUND_PENDING',
                     error_message: 'Dibatalkan oleh pengguna; refund diproses',
+                    account_details: {
+                        ...(order.account_details || {}),
+                        refund_intent: 'cancelled',
+                    },
                 })
                 .eq('id', order.id)
                 .eq('status', 'PENDING')

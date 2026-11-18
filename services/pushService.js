@@ -373,11 +373,15 @@ async function notifyOrderCompleted(order) {
 
 async function notifyOrderFailed(order) {
     if (!order?.user_id) return { skipped: true, reason: 'no_user' };
-    const refunded = ['REFUNDED', 'REFUND_PENDING'].includes(String(order.status || '').toUpperCase());
+    const status = String(order.status || '').toUpperCase();
+    const refunded = ['REFUNDED', 'REFUND_PENDING'].includes(status);
+    const refundBody = status === 'REFUNDED'
+        ? `Pesanan ${orderLabel(order)} gagal diproses. Saldo sudah dikembalikan ke akunmu.`
+        : `Pesanan ${orderLabel(order)} gagal diproses. Saldo akan dikembalikan ke akunmu.`;
     return sendPushToUser(order.user_id, {
         title: 'Transaksi Gagal ❌',
         body: refunded
-            ? `Pesanan ${orderLabel(order)} gagal diproses. Saldo akan dikembalikan ke akunmu.`
+            ? refundBody
             : `Pesanan ${orderLabel(order)} gagal diproses. Tekan untuk melihat detail.`,
         data: {
             type: 'order_status',

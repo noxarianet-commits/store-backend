@@ -8,6 +8,7 @@ const vendorRegistry = require('./vendors/vendorRegistry');
 const emailService = require('./emailService');
 const { logger } = require('../utils/logger');
 const { withReadRetry, isTransientError } = require('../utils/dbRetry');
+const { isRefundEligible, refundOrder } = require('../utils/refundPolicy');
 
 const pollingLog = logger.child({ job: 'payment-polling' });
 
@@ -362,9 +363,13 @@ class PaymentPollingService {
 
             const { data: orders, error } = await supabase
                 .from('orders')
-                .select('id, payment_type, user_id, price, status')
+                .select('id, payment_type, user_id, price, status, account_details')
                 .eq('status', 'PENDING')
                 .lt('timestamp', expiredTime.toISOString())
+                // Order yang sudah dibayar tapi belum sempat difulfill tidak
+                // boleh dianggap kedaluwarsa (bisa menyebabkan uang masuk tanpa
+                // refund).
+                .is('pg_paid_at', null)
                 .order('timestamp', { ascending: true })
                 .limit(200);
 
@@ -393,6 +398,10 @@ class PaymentPollingService {
                         .update({
                             status: 'REFUND_PENDING',
                             error_message: 'Expired: refunding balance before cancellation',
+                            account_details: {
+                                ...(order.account_details || {}),
+                                refund_intent: 'cancelled',
+                            },
                         })
                         .eq('id', order.id)
                         .eq('status', 'PENDING')
@@ -464,15 +473,19 @@ class PaymentPollingService {
     }
 
     /**
-     * Retry balance refunds for orders left in REFUND_PENDING by a failed
-     * cancellation refund. refund_balance is idempotent, so this is safe to
-     * run on every payment sweep.
+     * Retry refunds for orders left in REFUND_PENDING by a failed
+     * cancellation or vendor failure. refund_balance is idempotent and guarded
+     * by an advisory lock, so this is safe to run on every payment sweep.
+     *
+     * `account_details.refund_intent` membedakan order yang dibatalkan
+     * pengguna (kembali ke CANCELLED) dari order yang gagal di vendor
+     * (menjadi REFUNDED).
      */
     async retryPendingRefunds() {
         try {
             const { data: orders, error } = await supabase
                 .from('orders')
-                .select('id, payment_type, user_id, price, status')
+                .select('id, payment_type, user_id, price, pg_total, status, account_details, error_message')
                 .eq('status', 'REFUND_PENDING')
                 .limit(200);
 
@@ -483,33 +496,48 @@ class PaymentPollingService {
 
             if (!orders || orders.length === 0) return { success: true, retried: 0 };
 
-            const balanceService = require('./balanceService');
             let completed = 0;
 
             for (const order of orders) {
-                if (order.payment_type !== 'balance' || !order.user_id) continue;
+                if (!isRefundEligible(order)) continue;
 
-                try {
-                    await balanceService.refundBalance(
-                        order.user_id,
-                        order.price,
-                        order.id,
-                        'Refund otomatis: pesanan kedaluwarsa sebelum diproses'
-                    );
+                const refund = await refundOrder(
+                    order,
+                    'Refund otomatis: percobaan ulang refund'
+                );
 
-                    await supabase
-                        .from('orders')
-                        .update({ status: 'CANCELLED' })
-                        .eq('id', order.id)
-                        .eq('status', 'REFUND_PENDING');
-
-                    completed++;
-                } catch (err) {
-                    pollingLog.error('refund_pending_retry_failed', {
-                        orderId: order.id,
-                        message: err.message,
-                    });
+                if (!refund.refunded) {
+                    if (refund.error) {
+                        pollingLog.error('refund_pending_retry_failed', {
+                            orderId: order.id,
+                            message: refund.error,
+                        });
+                    }
+                    continue;
                 }
+
+                const legacyCancellation = /dibatalkan|expired/i.test(order.error_message || '');
+                const intent = String(
+                    order.account_details?.refund_intent ||
+                    (legacyCancellation ? 'cancelled' : 'failed')
+                ).toLowerCase();
+                const finalStatus = intent === 'cancelled' ? 'CANCELLED' : 'REFUNDED';
+
+                const { error: updateError } = await supabase
+                    .from('orders')
+                    .update({ status: finalStatus })
+                    .eq('id', order.id)
+                    .eq('status', 'REFUND_PENDING');
+
+                if (updateError) {
+                    pollingLog.error('refund_pending_status_update_failed', {
+                        orderId: order.id,
+                        code: updateError.code,
+                    });
+                    continue;
+                }
+
+                completed++;
             }
 
             if (completed > 0) {

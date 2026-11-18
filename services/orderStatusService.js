@@ -3,6 +3,7 @@ const balanceService = require('./balanceService');
 const pushService = require('./pushService');
 const vendorRegistry = require('./vendors/vendorRegistry');
 const { logger } = require('../utils/logger');
+const { isRefundEligible, refundOrder } = require('../utils/refundPolicy');
 
 const REFRESH_THROTTLE_MS = 30 * 1000;
 const staleChecks = new Map();
@@ -21,26 +22,11 @@ function isFinalStatus(status) {
 }
 
 async function refundBalanceOrder(order, reason) {
-    if (!order || order.payment_type !== 'balance' || !order.user_id) {
-        return { refunded: false, reason: 'not_balance_order' };
+    if (!isRefundEligible(order)) {
+        return { refunded: false, reason: 'not_eligible' };
     }
 
-    try {
-        await balanceService.refundBalance(
-            order.user_id,
-            order.price,
-            order.id,
-            reason || `Refund otomatis untuk order ${order.id}`
-        );
-        return { refunded: true };
-    } catch (err) {
-        logger.error('order_auto_refund_failed', {
-            orderId: order.id,
-            userId: order.user_id,
-            message: err.message,
-        });
-        return { refunded: false, error: err.message };
-    }
+    return refundOrder(order, reason);
 }
 
 function shouldThrottle(orderId, force) {
@@ -61,12 +47,14 @@ function shouldThrottle(orderId, force) {
  * refID yang salah), saldo otomatis dikembalikan, lalu vendor mengirim
  * callback sukses. Tanpa pembatalan refund, pembeli mendapat produk gratis.
  *
- * Hanya order balance yang punya refund; order gateway tidak pernah di-debit
- * dari saldo.
+ * Berlaku untuk order saldo maupun QRIS: keduanya sama-sama dikreditkan ke
+ * saldo akun, jadi pembatalannya juga memakai jalur yang sama. Nominal selalu
+ * diambil dari ledger refund, bukan dari `order.price`, karena refund QRIS
+ * memakai `pg_total` (nominal yang benar-benar dibayar).
  */
 async function reverseAutoRefund(order) {
-    if (!order || order.payment_type !== 'balance' || !order.user_id) {
-        return { reversed: false, reason: 'not_balance_order' };
+    if (!order || !order.user_id) {
+        return { reversed: false, reason: 'no_user' };
     }
 
     const { data: refunds, error } = await supabase
@@ -86,7 +74,10 @@ async function reverseAutoRefund(order) {
         return { reversed: false, reason: 'no_refund' };
     }
 
-    const amount = order.price || refunds[0].amount;
+    const amount = Math.floor(Number(refunds[0].amount)) || Math.floor(Number(order.price)) || 0;
+    if (amount <= 0) {
+        return { reversed: false, reason: 'invalid_amount' };
+    }
 
     try {
         await balanceService.debitBalance(
@@ -101,9 +92,148 @@ async function reverseAutoRefund(order) {
     }
 }
 
+/**
+ * Setelah refund dikreditkan, pastikan order tidak keburu ditandai COMPLETED
+ * oleh callback sukses vendor yang datang bersamaan. Kalau sudah COMPLETED,
+ * tarik kembali saldo yang barusan dikembalikan supaya pembeli tidak mendapat
+ * produk gratis.
+ *
+ * @returns {Promise<{completed: boolean, reversal?: object}>}
+ */
+async function reverseRefundIfCompleted(order) {
+    if (!order?.id || !order?.user_id) return { completed: false };
+
+    const { data: latest, error } = await supabase
+        .from('orders')
+        .select('status, account_details')
+        .eq('id', order.id)
+        .maybeSingle();
+
+    if (error || !latest) return { completed: false };
+    if (String(latest.status || '').toUpperCase() !== 'COMPLETED') {
+        return { completed: false };
+    }
+
+    const reversal = await reverseAutoRefund({
+        ...order,
+        account_details: latest.account_details || order.account_details,
+    });
+
+    const accountDetails = {
+        ...(latest.account_details || order.account_details || {}),
+        refund_reversed: reversal.reversed === true,
+    };
+    if (reversal.reversed) {
+        accountDetails.refund_reversed_at = new Date().toISOString();
+    } else if (reversal.error) {
+        accountDetails.balance_reconcile_pending = reversal.error;
+    }
+
+    await supabase
+        .from('orders')
+        .update({ account_details: accountDetails })
+        .eq('id', order.id);
+
+    return { completed: true, reversal };
+}
+
+/**
+ * Tentukan status akhir setelah order dinyatakan gagal di vendor.
+ *
+ * - guest / order tanpa saldo tujuan -> FAILED (tidak ada yang direfund)
+ * - refund sukses                    -> REFUNDED
+ * - refund gagal                     -> REFUND_PENDING (cron mencoba ulang)
+ *
+ * Pemanggil sudah menulis status FAILED lebih dulu. `message` adalah pesan
+ * kegagalan asli yang disimpan ke error_message.
+ */
+async function settleFailedOrder(order, message, reason) {
+    if (!isRefundEligible(order)) {
+        return { status: 'FAILED' };
+    }
+
+    // Jangan pernah merefund order yang ternyata sudah sukses (callback
+    // vendor bisa datang bersamaan dengan cron rekonsiliasi).
+    const { data: current } = await supabase
+        .from('orders')
+        .select('status')
+        .eq('id', order.id)
+        .maybeSingle();
+
+    if (String(current?.status || '').toUpperCase() === 'COMPLETED') {
+        logger.warn('order_refund_skipped_already_completed', { orderId: order.id });
+        return { status: 'COMPLETED' };
+    }
+
+    const refund = await refundBalanceOrder(order, reason);
+
+    if (!refund.refunded) {
+        await supabase
+            .from('orders')
+            .update({
+                status: 'REFUND_PENDING',
+                error_message: `${message} | refund pending`,
+            })
+            .eq('id', order.id)
+            .neq('status', 'COMPLETED');
+
+        logger.warn('order_failed_refund_pending', {
+            orderId: order.id,
+            error: refund.error || refund.reason,
+        });
+
+        return { status: 'REFUND_PENDING', refund };
+    }
+
+    const race = await reverseRefundIfCompleted(order);
+    if (race.completed) {
+        logger.warn('order_refund_reversed_after_late_success', {
+            orderId: order.id,
+            reversed: race.reversal?.reversed === true,
+        });
+        return { status: 'COMPLETED', refund, reversal: race.reversal };
+    }
+
+    const { error: refundedError } = await supabase
+        .from('orders')
+        .update({
+            status: 'REFUNDED',
+            error_message: message,
+        })
+        .eq('id', order.id)
+        .neq('status', 'COMPLETED');
+
+    if (refundedError) {
+        // Saldo sudah dikreditkan; jangan tinggalkan order FAILED tanpa jalur
+        // retry. Cron akan melihat baris refund yang sudah ada dan langsung
+        // menyelesaikan statusnya.
+        logger.error('order_refund_status_update_failed', {
+            orderId: order.id,
+            code: refundedError.code,
+            message: refundedError.message,
+        });
+
+        await supabase
+            .from('orders')
+            .update({ status: 'REFUND_PENDING' })
+            .eq('id', order.id)
+            .neq('status', 'COMPLETED');
+
+        return { status: 'REFUND_PENDING', refund };
+    }
+
+    logger.info('order_refunded_after_vendor_failure', {
+        orderId: order.id,
+        amount: refund.amount,
+        paymentType: order.payment_type,
+    });
+
+    return { status: 'REFUNDED', refund };
+}
+
 async function markCompleted(order, statusResult) {
     const sn = statusResult.sn || order.vendor_invoice || null;
-    const wasFailed = ['FAILED', 'REFUND_PENDING'].includes(String(order.status || '').toUpperCase());
+    const wasFailed = ['FAILED', 'REFUND_PENDING', 'REFUNDED'].includes(String(order.status || '').toUpperCase());
 
     // Kalau order sempat gagal dan saldonya sudah dikembalikan, kembalikan
     // lagi penyeimbangannya sebelum order ditandai COMPLETED.
@@ -171,41 +301,58 @@ async function markCompleted(order, statusResult) {
 async function markFailed(order, statusResult) {
     const message = statusResult.data?.raw || statusResult.message || 'Transaksi gagal di vendor';
 
-    const { error } = await supabase
+    const { data: failedRows, error } = await supabase
         .from('orders')
         .update({
             status: 'FAILED',
             vendor_status: 'failed',
             error_message: message,
         })
-        .eq('id', order.id);
+        .eq('id', order.id)
+        .in('status', ['PROCESSING', 'PROCESSING_LOCK', 'FAILED', 'REFUND_PENDING'])
+        .select('id');
 
     if (error) throw error;
 
-    const refund = await refundBalanceOrder(
+    if (!failedRows || failedRows.length === 0) {
+        // Order sudah difinalkan jalur lain (mis. callback sukses vendor).
+        const { data: latest } = await supabase
+            .from('orders')
+            .select('*')
+            .eq('id', order.id)
+            .maybeSingle();
+
+        logger.warn('order_failed_transition_skipped', {
+            orderId: order.id,
+            status: latest?.status || order.status,
+        });
+
+        return latest || order;
+    }
+
+    const settled = await settleFailedOrder(
         order,
+        message,
         `Refund otomatis: transaksi vendor gagal untuk ${order.id}`
     );
 
-    if (!refund.refunded && order.payment_type === 'balance' && order.user_id) {
-        await supabase
-            .from('orders')
-            .update({
-                status: 'REFUND_PENDING',
-                error_message: `${message} | refund pending`,
-            })
-            .eq('id', order.id);
+    if (settled.status === 'COMPLETED') {
+        return { ...order, status: 'COMPLETED' };
+    }
 
-        logger.warn('order_failed_refund_pending', { orderId: order.id });
+    if (settled.status === 'REFUNDED' || settled.status === 'REFUND_PENDING') {
+        await pushService.notifyOrderFailed({
+            ...order,
+            status: settled.status,
+            error_message: message,
+        });
 
-        await pushService.notifyOrderFailed({ ...order, status: 'REFUND_PENDING', error_message: message });
-
-        return { ...order, status: 'REFUND_PENDING', error_message: message };
+        return { ...order, status: settled.status, error_message: message };
     }
 
     logger.warn('order_failed_via_status_refresh', {
         orderId: order.id,
-        refunded: refund.refunded,
+        refunded: false,
     });
 
     await pushService.notifyOrderFailed({ ...order, status: 'FAILED', error_message: message });
@@ -217,12 +364,12 @@ async function markFailed(order, statusResult) {
  * Refresh one order from the vendor. Used by the mobile status screen and by
  * the reconciliation cron.
  *
- * Only balance orders are handled here. Gateway PENDING orders keep using the
- * existing payment gateway polling path.
+ * Handles balance orders and paid gateway orders that already reached the
+ * vendor (PROCESSING / PROCESSING_LOCK). Unpaid gateway orders stay on the
+ * payment gateway polling path.
  */
 async function refreshIfStale(order, { force = false } = {}) {
     if (!order || isFinalStatus(order.status)) return order;
-    if (order.payment_type !== 'balance') return order;
 
     const status = String(order.status || '').toUpperCase();
 
@@ -328,8 +475,11 @@ module.exports = {
     refreshIfStale,
     reconcileProcessingOrders,
     refundBalanceOrder,
+    settleFailedOrder,
     markCompleted,
+    markFailed,
     reverseAutoRefund,
+    reverseRefundIfCompleted,
     isFinalStatus,
     __test: {
         shouldThrottle,

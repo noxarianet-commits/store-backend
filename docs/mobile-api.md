@@ -2340,8 +2340,9 @@ Authorization: Bearer <app-token>
 ```
 
 Endpoint ini sudah mengecek kepemilikan via JWT (atau `X-Order-Token`) dan tidak
-kena global rate limit. Untuk order saldo/tagihan, backend ikut menanyakan status
-ke vendor.
+kena global rate limit. Untuk order saldo/tagihan dan order QRIS yang sudah
+dibayar (`PROCESSING`), backend ikut menanyakan status terbaru ke vendor —
+kegagalan vendor akan memicu refund otomatis ke saldo.
 
 **Request**
 
@@ -2420,10 +2421,14 @@ Authorization: Bearer <app-token>
 | `PROCESSING_LOCK` | Order sudah di-claim fulfillment, sedang dikirim ke vendor |
 | `PROCESSING` | Order sedang diproses vendor |
 | `COMPLETED` | Order sukses |
-| `FAILED` | Order gagal di vendor |
+| `FAILED` | Order gagal di vendor (guest checkout / tidak ada saldo tujuan) |
 | `CANCELLED` | Order dibatalkan |
-| `REFUND_PENDING` | Refund sedang diproses |
-| `REFUNDED` | Saldo sudah dikembalikan |
+| `REFUND_PENDING` | Refund sedang diproses (dicoba ulang otomatis oleh cron) |
+| `REFUNDED` | Nominal sudah dikembalikan ke saldo akun |
+
+Refund otomatis berlaku untuk order milik user yang login (`user_id` ada), baik
+`payment_type='balance'` maupun QRIS (`gateway`). Nominal QRIS memakai
+`pg_total`. Guest checkout tidak direfund.
 
 ### Model order (respons mobile)
 

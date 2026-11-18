@@ -252,6 +252,21 @@ async function handleSekalipayWebhook(req, res) {
             completed_at: payload.timestamp || new Date().toISOString(),
         };
 
+        // Vendor sukses terlambat setelah order sempat FAILED + direfund:
+        // tarik kembali saldo refund supaya pembeli tidak gratis.
+        const wasFailed = ['FAILED', 'REFUND_PENDING', 'REFUNDED'].includes(
+            String(order.status || '').toUpperCase()
+        );
+        if (wasFailed) {
+            const reversal = await orderStatusService.reverseAutoRefund(order);
+            accountDetails.refund_reversed = reversal.reversed === true;
+            if (reversal.reversed) {
+                accountDetails.refund_reversed_at = new Date().toISOString();
+            } else if (reversal.error) {
+                accountDetails.balance_reconcile_pending = reversal.error;
+            }
+        }
+
         const { error: updateError } = await supabase
             .from('orders')
             .update({
@@ -289,7 +304,7 @@ async function handleSekalipayWebhook(req, res) {
             ? 'Nomor tujuan salah atau tidak valid (refund)'
             : 'Order dibatalkan oleh Sekalipay';
 
-        await supabase
+        const { data: failedRows, error: failedError } = await supabase
             .from('orders')
             .update({
                 status: 'FAILED',
@@ -297,22 +312,40 @@ async function handleSekalipayWebhook(req, res) {
                 vendor_status: 'failed',
                 vendor_invoice: invoice,
             })
-            .eq('id', order.id);
+            .eq('id', order.id)
+            .in('status', ['PROCESSING', 'PROCESSING_LOCK', 'FAILED', 'REFUND_PENDING'])
+            .select('id');
 
-        if (order.payment_type === 'balance' && order.user_id) {
-            const balanceService = require('../services/balanceService');
-            try {
-                await balanceService.refundBalance(order.user_id, order.price, order.id, `Refund otomatis: ${errorMsg}`);
-            } catch (err) {
-                console.error(`[Webhook/Sekalipay] Auto-refund gagal untuk ${order.id}:`, err.message);
-            }
+        if (failedError) {
+            console.error(`[Webhook/Sekalipay] Gagal menandai order ${order.id} FAILED:`, failedError.message);
+            return res.sendStatus(200);
         }
 
-        console.log(`[Webhook/Sekalipay] Order ${order.id} ${event}.`);
+        if (!failedRows || failedRows.length === 0) {
+            console.warn(`[Webhook/Sekalipay] Order ${order.id} sudah final (${order.status}), event ${event} dilewati.`);
+            return res.sendStatus(200);
+        }
+
+        const settled = await orderStatusService.settleFailedOrder(
+            order,
+            errorMsg,
+            `Refund otomatis: ${errorMsg}`
+        );
+
+        if (settled.status === 'COMPLETED') {
+            console.warn(`[Webhook/Sekalipay] Order ${order.id} sudah COMPLETED, notifikasi gagal dilewati.`);
+            return res.sendStatus(200);
+        }
+
+        console.log(`[Webhook/Sekalipay] Order ${order.id} ${event} (status: ${settled.status}).`);
         emailService.sendOrderFailedEmail(order)
             .catch(err => console.error(`[Webhook/Sekalipay] Email failed gagal:`, err.message));
 
-        await pushService.notifyOrderFailed({ ...order, status: 'FAILED', error_message: errorMsg });
+        await pushService.notifyOrderFailed({
+            ...order,
+            status: settled.status,
+            error_message: errorMsg,
+        });
 
         return res.sendStatus(200);
     }
@@ -623,7 +656,7 @@ async function handleOkeconnectWebhook(req, res) {
         // Order yang sempat ditandai FAILED (mis. karena check status memakai
         // refID yang salah) tidak boleh menutupi callback sukses dari vendor.
         // Rekonsiliasi: tandai COMPLETED dan batalkan refund otomatisnya.
-        const orderWasFailed = ['FAILED', 'REFUND_PENDING'].includes(String(order.status || '').toUpperCase());
+        const orderWasFailed = ['FAILED', 'REFUND_PENDING', 'REFUNDED'].includes(String(order.status || '').toUpperCase());
 
         if (event.status === 'success' && orderWasFailed) {
             try {
@@ -689,38 +722,48 @@ async function handleOkeconnectWebhook(req, res) {
                 });
             }
         } else if (event.status === 'failed') {
-            let finalStatus = 'FAILED';
-            await supabase
+            const errorMsg = message || 'Transaksi gagal di OkeConnect';
+
+            const { data: failedRows, error: failedError } = await supabase
                 .from('orders')
                 .update({
                     status: 'FAILED',
-                    error_message: message || 'Transaksi gagal di OkeConnect',
+                    error_message: errorMsg,
                     vendor_status: 'failed',
                 })
-                .eq('id', order.id);
+                .eq('id', order.id)
+                .in('status', ['PROCESSING', 'PROCESSING_LOCK', 'FAILED', 'REFUND_PENDING'])
+                .select('id');
 
-            if (order.payment_type === 'balance' && order.user_id) {
-                const balanceService = require('../services/balanceService');
-                try {
-                    await balanceService.refundBalance(order.user_id, order.price, order.id, `Refund otomatis: Transaksi gagal di OkeConnect`);
-                } catch (err) {
-                    console.error(`[Webhook/Okeconnect] Auto-refund gagal untuk ${order.id}:`, err.message);
-                    finalStatus = 'REFUND_PENDING';
-                    await supabase
-                        .from('orders')
-                        .update({ status: 'REFUND_PENDING', error_message: `Refund gagal otomatis: ${err.message}` })
-                        .eq('id', order.id);
-                }
+            if (failedError) {
+                console.error(`[Webhook/OkeConnect] Gagal menandai order ${order.id} FAILED:`, failedError.message);
+                return res.status(500).json({ error: failedError.message });
             }
 
-            console.log(`[Webhook/OkeConnect] Order ${order.id} FAILED.`);
+            if (!failedRows || failedRows.length === 0) {
+                console.warn(`[Webhook/OkeConnect] Order ${order.id} sudah final (${order.status}), callback gagal dilewati.`);
+                return res.status(200).json({ refid: refId, message: message || 'OK', status: 'already_processed' });
+            }
+
+            const settled = await orderStatusService.settleFailedOrder(
+                order,
+                errorMsg,
+                'Refund otomatis: Transaksi gagal di OkeConnect'
+            );
+
+            if (settled.status === 'COMPLETED') {
+                console.warn(`[Webhook/OkeConnect] Order ${order.id} sudah COMPLETED, notifikasi gagal dilewati.`);
+                return res.status(200).json({ refid: refId, message: message || 'OK' });
+            }
+
+            console.log(`[Webhook/OkeConnect] Order ${order.id} ${settled.status}.`);
             emailService.sendOrderFailedEmail(order)
                 .catch(err => console.error(`[Webhook/OkeConnect] Email failed gagal:`, err.message));
 
             await pushService.notifyOrderFailed({
                 ...order,
-                status: finalStatus,
-                error_message: message || 'Transaksi gagal di OkeConnect',
+                status: settled.status,
+                error_message: errorMsg,
             });
         }
 

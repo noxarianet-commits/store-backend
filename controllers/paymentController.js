@@ -845,11 +845,11 @@ async function getPaymentStatus(req, res) {
             }
         }
 
-        // Balance orders (including postpaid bills) have no PG invoice to
-        // poll. Ask the vendor for the latest status, throttled by
-        // orderStatusService. This makes app polling work without FCM.
-        if (!slim && data.payment_type === 'balance' &&
-            ['PENDING', 'PROCESSING', 'PROCESSING_LOCK'].includes(data.status)) {
+        // Orders that already reached the vendor have no PG invoice to poll
+        // anymore. Ask the vendor for the latest status (throttled), including
+        // paid QRIS orders, so a vendor-side failure triggers the automatic
+        // refund even when the failure webhook never arrives.
+        if (!slim && ['PROCESSING', 'PROCESSING_LOCK'].includes(data.status)) {
             const refreshed = await orderStatusService.refreshIfStale(data, { force });
             if (refreshed) data = refreshed;
         }
@@ -872,7 +872,7 @@ async function cancelPayment(req, res) {
 
         const { data: order, error: fetchError } = await supabase
             .from('orders')
-            .select('id, status, payment_type, price, pg_provider, user_id, order_access_token')
+            .select('id, status, payment_type, price, pg_provider, user_id, order_access_token, account_details')
             .eq('id', order_id)
             .single();
 
@@ -895,6 +895,10 @@ async function cancelPayment(req, res) {
                 .update({
                     status: 'REFUND_PENDING',
                     error_message: 'Dibatalkan oleh pengguna; refund diproses',
+                    account_details: {
+                        ...(order.account_details || {}),
+                        refund_intent: 'cancelled',
+                    },
                 })
                 .eq('id', order.id)
                 .eq('status', 'PENDING')

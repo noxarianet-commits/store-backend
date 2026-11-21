@@ -186,6 +186,181 @@ function isTransientStatus(status) {
     return n === 408 || n === 429 || n >= 500;
 }
 
+// Format token resmi Expo. Token di luar pola ini tidak akan pernah bisa
+// dikirim dan membuat SELURUH request ditolak Expo, jadi disaring lebih dulu.
+const EXPO_TOKEN_PATTERN = /^(Exponent|Expo)PushToken\[[^\]]+\]$/;
+
+function isValidExpoToken(token) {
+    return EXPO_TOKEN_PATTERN.test(String(token ?? '').trim());
+}
+
+/**
+ * Samarkan token di dalam teks error. Pesan ticket Expo menyertakan token
+ * mentah, sedangkan kolom `push_notifications.error` bisa dibaca admin.
+ */
+function maskPushTokens(text) {
+    return String(text ?? '').replace(/(Exponent|Expo)PushToken\[[^\]]*\]/g, '$1PushToken[...]');
+}
+
+/**
+ * Ambil detail dari respons error Expo Push Service (HTTP 4xx/5xx).
+ * Body-nya berbentuk { errors: [{ code, message, details }] }.
+ */
+function parseExpoError(err) {
+    const status = err.response?.status ?? null;
+    const body = err.response?.data;
+    const detail = Array.isArray(body?.errors) ? body.errors[0] : null;
+
+    return {
+        status,
+        code: detail?.code || (status ? String(status) : 'NETWORK'),
+        message: maskPushTokens(detail?.message || err.message || 'Gagal mengirim notifikasi'),
+        details: detail?.details || null,
+        transient: isTransientStatus(status),
+    };
+}
+
+/**
+ * Kelompokkan perangkat berdasarkan experience/project dari `details` pada
+ * error PUSH_TOO_MANY_EXPERIENCE_IDS: { "@owner/slug": [token, ...] }.
+ *
+ * Token yang tidak tercantum di details masuk grup "unknown" agar tetap
+ * dicoba terpisah, bukan mencampuri grup lain.
+ */
+function groupByExperience(chunk, details) {
+    if (!details || typeof details !== 'object') return [];
+
+    const experienceByToken = new Map();
+    for (const [experience, tokens] of Object.entries(details)) {
+        if (!Array.isArray(tokens)) continue;
+        for (const token of tokens) experienceByToken.set(String(token), experience);
+    }
+
+    if (experienceByToken.size === 0) return [];
+
+    const groups = new Map();
+    for (const device of chunk) {
+        const experience = experienceByToken.get(String(device.push_token)) || 'unknown';
+        if (!groups.has(experience)) groups.set(experience, []);
+        groups.get(experience).push(device);
+    }
+
+    return [...groups.entries()].map(([experience, devices]) => ({ experience, devices }));
+}
+
+async function deactivateDevices(deviceIds) {
+    const ids = [...new Set((deviceIds || []).filter(Boolean))];
+    if (ids.length === 0) return;
+
+    try {
+        await supabase
+            .from('push_devices')
+            .update({ active: false })
+            .in('id', ids);
+        pushLog.info('push_tokens_deactivated', { count: ids.length });
+    } catch (err) {
+        pushLog.warn('push_tokens_deactivate_failed', { message: err.message });
+    }
+}
+
+/**
+ * Kirim satu chunk (≤ MAX_TOKENS_PER_REQUEST) ke Expo Push Service.
+ *
+ * Bila Expo menolak karena isi request mencampur beberapa project Expo
+ * (PUSH_TOO_MANY_EXPERIENCE_IDS), chunk dipecah per project lalu dikirim
+ * ulang satu kali. Selama ini SELURUH request ditolak sehingga satu token
+ * dari project lama membuat semua perangkat lain ikut gagal.
+ */
+async function sendChunk(chunk, message, result, { allowSplit = true } = {}) {
+    const payload = chunk.map((t) => ({
+        to: t.push_token,
+        title: message.title,
+        body: message.body,
+        data: message.data || {},
+        // Wajib sama dengan channel yang dibuat aplikasi. Kalau channelId
+        // menunjuk channel yang belum ada di perangkat, notifikasi TIDAK
+        // tampil sama sekali.
+        channelId: message.channelId || channelId(),
+        sound: 'default',
+        priority: 'high',
+        ttl: message.ttl || 24 * 60 * 60,
+    }));
+
+    try {
+        const res = await axios.post(EXPO_PUSH_URL, payload, {
+            headers: expoHeaders(),
+            timeout: requestTimeoutMs(),
+        });
+
+        const tickets = res.data?.data || [];
+        tickets.forEach((ticket, idx) => {
+            const device = chunk[idx];
+            if (!device) return;
+
+            if (ticket.status === 'ok') {
+                result.sent++;
+                if (ticket.id) result.ticketIds.push(ticket.id);
+                return;
+            }
+
+            result.failed++;
+            result.errors.push({
+                message: maskPushTokens(ticket.message),
+                code: ticket.details?.error,
+            });
+
+            // Device sudah tidak terdaftar di FCM (app di-uninstall /
+            // izin dicabut) — jangan kirim lagi ke token ini.
+            if (ticket.details?.error === 'DeviceNotRegistered') {
+                result.deadTokenIds.push(device.id);
+            }
+        });
+
+        if (tickets.length < chunk.length) {
+            result.failed += chunk.length - tickets.length;
+            result.errors.push({
+                message: 'Sebagian notifikasi tidak mendapat ticket dari Expo',
+                code: 'MISSING_TICKET',
+            });
+        }
+    } catch (err) {
+        const failure = parseExpoError(err);
+        pushLog.warn('push_send_chunk_failed', {
+            chunkSize: chunk.length,
+            status: failure.status,
+            code: failure.code,
+            message: failure.message,
+        });
+
+        if (allowSplit && failure.code === 'PUSH_TOO_MANY_EXPERIENCE_IDS') {
+            const groups = groupByExperience(chunk, failure.details);
+            if (groups.length > 1) {
+                pushLog.warn('push_mixed_experiences', {
+                    experiences: groups.map((g) => ({
+                        experience: g.experience,
+                        devices: g.devices.length,
+                    })),
+                });
+
+                for (const group of groups) {
+                    await sendChunk(group.devices, message, result, { allowSplit: false });
+                }
+                return;
+            }
+        }
+
+        // Gagal di tingkat HTTP (network / 429 / 5xx) — seluruh chunk dihitung
+        // gagal. Bila semua kegagalan bersifat transien, pemanggil menghapus
+        // reservasi supaya notifikasi bisa dicoba lagi nanti.
+        result.failed += chunk.length;
+        result.errors.push({
+            message: failure.message,
+            code: failure.code,
+            transient: failure.transient,
+        });
+    }
+}
+
 /**
  * Kirim satu pesan ke daftar token, dibagi per MAX_TOKENS_PER_REQUEST.
  *
@@ -195,79 +370,29 @@ function isTransientStatus(status) {
  */
 async function deliverToTokens(tokens, message) {
     const result = { sent: 0, failed: 0, deadTokenIds: [], ticketIds: [], errors: [] };
+    const usable = [];
 
-    for (let i = 0; i < tokens.length; i += MAX_TOKENS_PER_REQUEST) {
-        const chunk = tokens.slice(i, i + MAX_TOKENS_PER_REQUEST);
-        const payload = chunk.map((t) => ({
-            to: t.push_token,
-            title: message.title,
-            body: message.body,
-            data: message.data || {},
-            // Wajib sama dengan channel yang dibuat aplikasi. Kalau channelId
-            // menunjuk channel yang belum ada di perangkat, notifikasi TIDAK
-            // tampil sama sekali.
-            channelId: message.channelId || channelId(),
-            sound: 'default',
-            priority: 'high',
-            ttl: message.ttl || 24 * 60 * 60,
-        }));
-
-        try {
-            const res = await axios.post(EXPO_PUSH_URL, payload, {
-                headers: expoHeaders(),
-                timeout: requestTimeoutMs(),
-            });
-
-            const tickets = res.data?.data || [];
-            tickets.forEach((ticket, idx) => {
-                const device = chunk[idx];
-                if (!device) return;
-
-                if (ticket.status === 'ok') {
-                    result.sent++;
-                    if (ticket.id) result.ticketIds.push(ticket.id);
-                    return;
-                }
-
-                result.failed++;
-                result.errors.push({ message: ticket.message, code: ticket.details?.error });
-
-                // Device sudah tidak terdaftar di FCM (app di-uninstall /
-                // izin dicabut) — jangan kirim lagi ke token ini.
-                if (ticket.details?.error === 'DeviceNotRegistered') {
-                    result.deadTokenIds.push(device.id);
-                }
-            });
-        } catch (err) {
-            // Gagal di tingkat HTTP (network / 429 / 5xx) — seluruh chunk dihitung
-            // gagal. Bila semua kegagalan bersifat transien, pemanggil menghapus
-            // reservasi supaya notifikasi bisa dicoba lagi nanti.
-            const status = err.response?.status ?? null;
-            result.failed += chunk.length;
-            result.errors.push({
-                message: err.message,
-                code: status ?? 'NETWORK',
-                transient: isTransientStatus(status),
-            });
-            pushLog.warn('push_send_chunk_failed', {
-                chunkSize: chunk.length,
-                status,
-                message: err.message,
-            });
+    for (const device of tokens) {
+        if (isValidExpoToken(device.push_token)) {
+            usable.push(device);
+            continue;
         }
+
+        // Token rusak / bukan token Expo: jangan pernah dikirim, langsung
+        // nonaktifkan supaya tidak memperbesar request berikutnya.
+        result.failed++;
+        result.errors.push({
+            message: 'Format push token tidak valid',
+            code: 'INVALID_TOKEN',
+        });
+        if (device.id) result.deadTokenIds.push(device.id);
     }
 
-    if (result.deadTokenIds.length > 0) {
-        try {
-            await supabase
-                .from('push_devices')
-                .update({ active: false })
-                .in('id', result.deadTokenIds);
-            pushLog.info('push_tokens_deactivated', { count: result.deadTokenIds.length });
-        } catch (err) {
-            pushLog.warn('push_tokens_deactivate_failed', { message: err.message });
-        }
+    for (let i = 0; i < usable.length; i += MAX_TOKENS_PER_REQUEST) {
+        await sendChunk(usable.slice(i, i + MAX_TOKENS_PER_REQUEST), message, result);
     }
+
+    await deactivateDevices(result.deadTokenIds);
 
     return result;
 }
@@ -459,6 +584,9 @@ async function broadcast({ title, body, url }) {
         sent: outcome.sent,
         failed: outcome.failed,
         skipped: 0,
+        // Alasan kegagalan (sudah disamarkan) supaya panel admin bisa
+        // menampilkan sebabnya, bukan sekadar "gagal".
+        error: outcome.errors[0]?.message || null,
     };
 }
 
@@ -493,7 +621,7 @@ async function getPushHistory(limit = 20) {
     const safeLimit = Math.min(Math.max(Number(limit) || 20, 1), 100);
     const { data, error } = await supabase
         .from('push_notifications')
-        .select('id, event, title, body, data, status, target_count, sent_count, failed_count, created_at')
+        .select('id, event, title, body, data, status, target_count, sent_count, failed_count, error, created_at')
         .order('created_at', { ascending: false })
         .limit(safeLimit);
 
@@ -552,6 +680,10 @@ module.exports = {
         orderLabel,
         reserveNotification,
         isTransientStatus,
+        isValidExpoToken,
+        maskPushTokens,
+        parseExpoError,
+        groupByExperience,
         MAX_TOKENS_PER_REQUEST,
         EXPO_PUSH_URL,
     },

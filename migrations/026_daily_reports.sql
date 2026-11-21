@@ -16,9 +16,10 @@
 --                      bila price 0/kosong (order gateway)
 --   refunded         — Σ amount order status 'CANCELLED' (nilai order yang
 --                      dibatalkan/kedaluwarsa; informasi, bukan pengurang)
---   total_profit     — estimasi laba: revenue − Σ base_price produk terkait
---                      (products.variants[0].base_price; 0 bila tidak cocok
---                      atau produk tidak ditemukan)
+--   total_profit     — estimasi laba: revenue − Σ base_price varian terkait
+--                      (tabel product_variants, dicocokkan lewat nama
+--                      produk+varian → vendor_variant_id → rata-rata produk;
+--                      0 bila produk tidak ditemukan)
 --   breakdown        — JSONB: by_status, by_payment_type, top_products,
 --                      base_cost_estimate
 --
@@ -57,7 +58,7 @@ COMMENT ON COLUMN daily_reports.revenue IS
 COMMENT ON COLUMN daily_reports.refunded IS
     'Σ amount order CANCELLED pada tanggal tersebut. Informasi saja, tidak dikurangkan dari revenue.';
 COMMENT ON COLUMN daily_reports.total_profit IS
-    'Estimasi laba = revenue − Σ base_price produk terkait (products.variants[0].base_price).';
+    'Estimasi laba = revenue − Σ base_price varian terkait (product_variants; match nama produk+varian, lalu vendor_variant_id, lalu rata-rata produk).';
 COMMENT ON COLUMN daily_reports.breakdown IS
     'Detail JSONB: { by_status, by_payment_type, top_products, base_cost_estimate }.';
 COMMENT ON COLUMN daily_reports.generated_by IS

@@ -6,6 +6,10 @@ const DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 const MAX_HISTORY_LIMIT = 90;
 const DEFAULT_HISTORY_LIMIT = 30;
 
+// Pemisah key internal untuk peta harga modal. NUL tidak mungkin muncul di
+// nama produk/varian, jadi aman dipakai sebagai delimiter.
+const KEY_SEP = '\u0000';
+
 const REPORT_COLUMNS = [
     'id',
     'report_date',
@@ -59,29 +63,90 @@ function orderAmount(order) {
     return Number(order?.pg_total) || 0;
 }
 
+function productKey(vendor, productName) {
+    return `${vendor || 'sekalipay'}${KEY_SEP}${productName}`;
+}
+
 /**
- * Peta nama produk → base_price varian pertama.
- * Dipakai sebagai estimasi modal (COGS) karena orders tidak menyimpan
- * harga modal per baris.
+ * Bangun indeks harga modal dari `products` + `product_variants`
+ * (migration 011 — kolom JSONB lama `products.variants` sudah tidak dipakai).
+ *
+ * Urutan pencocokan saat menghitung COGS:
+ *   1. nama produk + nama varian
+ *   2. nama produk + vendor_variant_id
+ *   3. rata-rata base_price seluruh varian produk tersebut
  */
-function buildBasePriceMap(products) {
-    const map = new Map();
+function buildBasePriceIndexes(products, variants) {
+    const productInfo = new Map(); // String(product.id) -> { name, vendor }
 
     for (const product of products || []) {
-        if (!product?.name) continue;
-        const variants = Array.isArray(product.variants) ? product.variants : [];
-        const firstVariant = variants[0] || {};
-        map.set(product.name, Number(firstVariant.base_price) || 0);
+        if (product?.id == null || !product?.name) continue;
+        productInfo.set(String(product.id), {
+            name: product.name,
+            vendor: product.vendor || 'sekalipay',
+        });
     }
 
-    return map;
+    const byVariantName = new Map();
+    const byVendorVariantId = new Map();
+    const productPrices = new Map(); // productKey -> { total, count }
+
+    for (const variant of variants || []) {
+        const info = productInfo.get(String(variant?.product_id));
+        if (!info) continue;
+
+        const basePrice = Number(variant.base_price) || 0;
+        const key = productKey(info.vendor, info.name);
+
+        if (variant.name) {
+            byVariantName.set(`${key}${KEY_SEP}${variant.name}`, basePrice);
+        }
+        if (variant.vendor_variant_id != null) {
+            byVendorVariantId.set(`${key}${KEY_SEP}${variant.vendor_variant_id}`, basePrice);
+        }
+
+        const stats = productPrices.get(key) || { total: 0, count: 0 };
+        stats.total += basePrice;
+        stats.count += 1;
+        productPrices.set(key, stats);
+    }
+
+    const productFallback = new Map();
+    for (const [key, stats] of productPrices) {
+        productFallback.set(key, Math.round(stats.total / stats.count));
+    }
+
+    return { byVariantName, byVendorVariantId, productFallback };
+}
+
+/**
+ * Estimasi harga modal (COGS) satu order. Selalu mengembalikan angka >= 0;
+ * 0 berarti produk/varian tidak ditemukan (laba akan tampak lebih besar).
+ */
+function resolveBasePrice(order, indexes) {
+    if (!order?.product || !indexes) return 0;
+
+    const key = productKey(order.vendor, order.product);
+    const variantName = order.variant;
+
+    if (variantName && variantName !== '-') {
+        const byName = indexes.byVariantName.get(`${key}${KEY_SEP}${variantName}`);
+        if (byName != null) return byName;
+    }
+
+    if (order.vendor_variant_id != null) {
+        const byVendorId = indexes.byVendorVariantId.get(`${key}${KEY_SEP}${order.vendor_variant_id}`);
+        if (byVendorId != null) return byVendorId;
+    }
+
+    return indexes.productFallback.get(key) || 0;
 }
 
 /**
  * Ringkas daftar order satu hari menjadi metrik laporan.
  * Pure function — sengaja tanpa akses DB supaya mudah diuji.
  */
-function summarize(orders, basePriceMap) {
+function summarize(orders, basePriceIndexes) {
     const byStatus = {};
     const byPaymentType = {};
     const productTotals = new Map();
@@ -105,13 +170,13 @@ function summarize(orders, basePriceMap) {
         if (status === 'COMPLETED') {
             completedOrders += 1;
             revenue += amount;
-            baseCostEstimate += basePriceMap.get(order.product) || 0;
+            baseCostEstimate += resolveBasePrice(order, basePriceIndexes);
 
-            const key = order.product || '(tidak dikenal)';
-            const entry = productTotals.get(key) || { name: key, count: 0, revenue: 0 };
+            const name = order.product || '(tidak dikenal)';
+            const entry = productTotals.get(name) || { name, count: 0, revenue: 0 };
             entry.count += 1;
             entry.revenue += amount;
-            productTotals.set(key, entry);
+            productTotals.set(name, entry);
         } else if (status === 'CANCELLED') {
             refunded += amount;
         }
@@ -142,7 +207,7 @@ async function fetchOrdersForDate(date) {
 
     const { data, error } = await supabase
         .from('orders')
-        .select('id, product, status, price, pg_total, payment_type, timestamp')
+        .select('id, product, variant, vendor, vendor_variant_id, status, price, pg_total, payment_type, timestamp')
         .gte('timestamp', start.toISOString())
         .lt('timestamp', end.toISOString());
 
@@ -150,24 +215,45 @@ async function fetchOrdersForDate(date) {
     return data || [];
 }
 
-async function fetchProductBasePrices() {
-    const { data, error } = await supabase
-        .from('products')
-        .select('name, variants');
+/**
+ * Ambil harga modal hanya untuk produk yang muncul di order hari itu.
+ * Jangan select seluruh katalog: PostgREST membatasi jumlah baris (default
+ * 1000), sedangkan product_variants bisa jauh lebih besar.
+ */
+async function fetchProductBasePrices(productNames) {
+    const names = [...new Set((productNames || []).filter(Boolean))];
+    if (names.length === 0) {
+        return buildBasePriceIndexes([], []);
+    }
 
-    if (error) throw error;
-    return buildBasePriceMap(data);
+    const { data: products, error: productsError } = await supabase
+        .from('products')
+        .select('id, name, vendor')
+        .in('name', names);
+
+    if (productsError) throw productsError;
+    if (!products || products.length === 0) {
+        return buildBasePriceIndexes([], []);
+    }
+
+    const productIds = products.map((product) => product.id);
+
+    const { data: variants, error: variantsError } = await supabase
+        .from('product_variants')
+        .select('product_id, vendor_variant_id, name, base_price')
+        .in('product_id', productIds);
+
+    if (variantsError) throw variantsError;
+
+    return buildBasePriceIndexes(products, variants || []);
 }
 
 async function computeStats(dateStr) {
     const date = normalizeDate(dateStr);
+    const orders = await fetchOrdersForDate(date);
+    const basePriceIndexes = await fetchProductBasePrices(orders.map((order) => order.product));
 
-    const [orders, basePriceMap] = await Promise.all([
-        fetchOrdersForDate(date),
-        fetchProductBasePrices(),
-    ]);
-
-    return summarize(orders, basePriceMap);
+    return summarize(orders, basePriceIndexes);
 }
 
 /**
@@ -262,7 +348,8 @@ module.exports = {
     InvalidDateError,
     normalizeDate,
     orderAmount,
-    buildBasePriceMap,
+    buildBasePriceIndexes,
+    resolveBasePrice,
     summarize,
     computeStats,
     getDailyReport,

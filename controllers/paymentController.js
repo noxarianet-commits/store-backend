@@ -17,6 +17,7 @@ const { getActivePaymentGateway } = require('../services/paymentSettings');
 const orderStatusService = require('../services/orderStatusService');
 const { isAvailableForChannel } = require('../utils/channel');
 const { sanitizeAccountDetails } = require('../utils/orderPresenter');
+const { resolveOrderBasePrice } = require('../utils/orderCost');
 
 // ══════════════════════════════════════════════════════════════════════════
 // HELPERS
@@ -449,6 +450,8 @@ async function createPayment(req, res) {
                     product: product_name || dbProduct.name,
                     variant: variant_name || matchedVariant.name || '-',
                     price: amount,
+                    // Modal internal untuk laporan harian — tidak pernah dikirim ke API.
+                    base_price: resolveOrderBasePrice(matchedVariant, provider_qty),
                     wa_number,
                     email,
                     customer_name: resolvedCustomerName,
@@ -618,6 +621,8 @@ async function createPayment(req, res) {
                 product: product_name || dbProduct.name,
                 variant: variant_name || matchedVariant.name || '-',
                 price: amount,
+                // Modal internal untuk laporan harian — tidak pernah dikirim ke API.
+                base_price: resolveOrderBasePrice(matchedVariant, provider_qty),
                 wa_number,
                 email,
                 customer_name: resolvedCustomerName,
@@ -759,6 +764,8 @@ const ORDER_STATUS_FIELDS = [
 function toSafeOrderResponse(order, { slim }) {
     const out = { ...order };
     delete out.order_access_token;
+    // Modal internal — hanya untuk laporan admin, tidak boleh bocor ke pembeli.
+    delete out.base_price;
     out.account_details = sanitizeAccountDetails(out.account_details);
 
     if (slim) {

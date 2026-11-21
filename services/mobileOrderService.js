@@ -13,6 +13,7 @@ const { isAvailableForChannel } = require('../utils/channel');
 const { isMandatoryValidationEnabled } = require('../utils/settingFlags');
 const { generateOrderId, generateOrderAccessToken, generateUniqueCode } = require('../utils/orderIds');
 const { logger } = require('../utils/logger');
+const { resolveOrderBasePrice } = require('../utils/orderCost');
 
 /**
  * Mobile prepaid order service.
@@ -510,6 +511,8 @@ async function createGatewayOrder({ orderId, orderAccessToken, amount, profile, 
         product: dbProduct.name,
         variant: matchedVariant.name || '-',
         price: amount,
+        // Modal internal untuk laporan harian — tidak pernah dikirim ke API.
+        base_price: resolveOrderBasePrice(matchedVariant, input.provider_qty),
         wa_number: profile.phone,
         email: profile.email,
         customer_name: resolvedCustomerName,
@@ -705,6 +708,8 @@ async function createPrepaidOrder({ user, input = {}, idempotencyKey }) {
                 product: dbProduct.name,
                 variant: matchedVariant.name || '-',
                 price: amount,
+                // Modal internal untuk laporan harian — tidak pernah dikirim ke API.
+                base_price: resolveOrderBasePrice(matchedVariant, input.provider_qty),
                 wa_number: profile.phone,
                 email: profile.email,
                 customer_name: validated.resolvedCustomerName,

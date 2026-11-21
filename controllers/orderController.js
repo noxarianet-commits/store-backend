@@ -42,8 +42,16 @@ async function list(req, res) {
         const { data, count, error } = await query;
         if (error) throw error;
 
+        // base_price adalah modal internal (dipakai laporan harian). Jangan
+        // pernah ikut ke response API, meskipun query memakai select('*').
+        const orders = (data || []).map((row) => {
+            const order = { ...row };
+            delete order.base_price;
+            return order;
+        });
+
         res.json({
-            orders: data || [],
+            orders,
             total: count || 0,
             page,
             limit,

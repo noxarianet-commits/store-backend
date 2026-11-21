@@ -120,11 +120,21 @@ function buildBasePriceIndexes(products, variants) {
 }
 
 /**
- * Estimasi harga modal (COGS) satu order. Selalu mengembalikan angka >= 0;
- * 0 berarti produk/varian tidak ditemukan (laba akan tampak lebih besar).
+ * Harga modal (COGS) satu order. Selalu mengembalikan angka >= 0.
+ *
+ * `orders.base_price` diisi saat checkout (utils/orderCost.js) dan menjadi
+ * sumber utama. Untuk order lama/manual yang kolomnya NULL, fallback ke
+ * estimasi katalog (product_variants); 0 berarti data tidak ditemukan.
  */
 function resolveBasePrice(order, indexes) {
-    if (!order?.product || !indexes) return 0;
+    if (!order) return 0;
+
+    if (order.base_price != null) {
+        const stored = Number(order.base_price);
+        if (Number.isFinite(stored)) return stored;
+    }
+
+    if (!order.product || !indexes) return 0;
 
     const key = productKey(order.vendor, order.product);
     const variantName = order.variant;
@@ -207,7 +217,7 @@ async function fetchOrdersForDate(date) {
 
     const { data, error } = await supabase
         .from('orders')
-        .select('id, product, variant, vendor, vendor_variant_id, status, price, pg_total, payment_type, timestamp')
+        .select('id, product, variant, vendor, vendor_variant_id, base_price, status, price, pg_total, payment_type, timestamp')
         .gte('timestamp', start.toISOString())
         .lt('timestamp', end.toISOString());
 
@@ -251,7 +261,16 @@ async function fetchProductBasePrices(productNames) {
 async function computeStats(dateStr) {
     const date = normalizeDate(dateStr);
     const orders = await fetchOrdersForDate(date);
-    const basePriceIndexes = await fetchProductBasePrices(orders.map((order) => order.product));
+
+    // Order baru sudah menyimpan modal di orders.base_price. Query katalog
+    // hanya diperlukan bila ada order COMPLETED lama yang kolomnya NULL.
+    const needsCatalogueFallback = orders.some(
+        (order) => String(order?.status || '').toUpperCase() === 'COMPLETED' && order.base_price == null
+    );
+
+    const basePriceIndexes = needsCatalogueFallback
+        ? await fetchProductBasePrices(orders.map((order) => order.product))
+        : null;
 
     return summarize(orders, basePriceIndexes);
 }

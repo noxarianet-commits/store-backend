@@ -36,6 +36,7 @@ const balanceRoutes = require('./routes/balanceRoutes');
 const ticketRoutes = require('./routes/ticketRoutes');
 const adminTicketRoutes = require('./routes/adminTicketRoutes');
 const mobileRoutes = require('./routes/mobileRoutes');
+const dailyReportRoutes = require('./routes/dailyReportRoutes');
 
 const verifyAdmin = require('./middleware/verifyAdmin');
 const verifyUser = require('./middleware/verifyUser');
@@ -131,6 +132,7 @@ app.use('/api/tickets', ticketRoutes);
 
 app.use('/api/admin/products', adminProductRoutes);
 app.use('/api/admin/tickets', adminTicketRoutes);
+app.use('/api/admin/reports/daily', dailyReportRoutes);
 app.use('/api/orders', verifyAdmin, orderRoutes);
 app.use('/api/admin', adminRoutes);
 
@@ -300,12 +302,33 @@ if (cronEnabled) {
         }
     });
 
+    // Laporan harian — dibuat untuk tanggal UTC kemarin tepat setelah tengah
+    // malam UTC. report_date memakai UTC (migration 026), jadi jadwal ini
+    // memakai timezone UTC dan tidak bergantung pada timezone VPS.
+    cron.schedule('5 0 * * *', async () => {
+        try {
+            const dailyReportService = require('./services/dailyReportService');
+            const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000);
+            const date = yesterday.toISOString().slice(0, 10);
+            const { report, regenerated } = await dailyReportService.generateDailyReport(date);
+
+            logger.info('daily_report_cron_completed', {
+                date,
+                reportId: report?.id,
+                regenerated,
+            });
+        } catch (err) {
+            logger.error('daily_report_cron_failed', { error: err });
+        }
+    }, { timezone: 'UTC' });
+
     logger.info('cron_scheduled', {
         paymentSchedule,
         productSync: 'sekalipay delta 1h/full 03:00, okeconnect full 04:00, okeconnect postpaid 04:30',
         orderReconciliation: 'every 5 minutes',
         billQuoteCleanup: 'every 10 minutes',
         otpCleanup: 'daily 05:15',
+        dailyReport: 'daily 00:05 UTC (yesterday)',
         pm2Instance: pm2Instance ?? null,
     });
 } else {
